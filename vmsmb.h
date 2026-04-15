@@ -11,6 +11,7 @@
 #include <linux/completion.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
+#include <linux/fs.h>
 
 /* VSMB class GUID: 4d12e519-17a0-4ae4-8eaa-5270fc6abdb7 */
 #define HV_VSMB_GUID \
@@ -132,7 +133,24 @@ struct vmsmb_file_info {
 	u32 attributes;		/* FILE_ATTRIBUTE_* */
 };
 
-/* vmsmb_transport.c */
+/*
+ * Superblock private data.
+ */
+struct vmsmb_sb_info {
+	struct vmsmb_session *sess;
+	char *share_name;
+	u32 tree_id;
+};
+
+/*
+ * Per-open-file private data.
+ */
+struct vmsmb_file_ctx {
+	struct vmsmb_fid fid;
+};
+
+/* Global session (one VSMB channel per VM) */
+extern struct vmsmb_session *vmsmb_global_session;
 int vmsmb_open_channel(struct vmsmb_session *sess);
 void vmsmb_close_channel(struct vmsmb_session *sess);
 int vmsmb_send_recv(struct vmsmb_session *sess,
@@ -157,5 +175,31 @@ int vmsmb_smb2_write(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 int vmsmb_smb2_query_dir(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 			 const char *pattern, void *buf, u32 buf_size,
 			 u32 *data_len);
+
+/* vmsmb_vfs.c */
+extern struct file_system_type vmsmb_fs_type;
+extern const struct inode_operations vmsmb_dir_inode_ops;
+extern const struct inode_operations vmsmb_file_inode_ops;
+extern const struct file_operations vmsmb_file_ops;
+extern const struct file_operations vmsmb_dir_ops;
+
+/* Windows FILETIME → Linux timespec64 conversion */
+static inline struct timespec64 vmsmb_time_to_ts(u64 filetime)
+{
+	struct timespec64 ts;
+
+	/* Windows FILETIME: 100ns intervals since 1601-01-01 */
+	/* Linux epoch: 1970-01-01 */
+	/* Difference: 11644473600 seconds */
+	if (filetime == 0) {
+		ts.tv_sec = 0;
+		ts.tv_nsec = 0;
+	} else {
+		filetime -= 116444736000000000ULL;
+		ts.tv_sec = filetime / 10000000;
+		ts.tv_nsec = (filetime % 10000000) * 100;
+	}
+	return ts;
+}
 
 #endif /* _VMSMB_H */
