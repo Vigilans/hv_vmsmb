@@ -12,6 +12,7 @@
 #include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/fs.h>
+#include <linux/netfs.h>
 
 /* VSMB class GUID: 4d12e519-17a0-4ae4-8eaa-5270fc6abdb7 */
 #define HV_VSMB_GUID \
@@ -78,6 +79,27 @@ struct vsmb_version_payload {
 #define VSMB_CAP_DIRECTMAP	1
 
 /*
+ * SMB2 file ID (128-bit opaque handle).
+ */
+struct vmsmb_fid {
+	u64 persistent;
+	u64 volatile_id;
+};
+
+/*
+ * Basic file info extracted from SMB2 responses.
+ */
+struct vmsmb_file_info {
+	u64 size;
+	u64 alloc_size;
+	u64 creation_time;	/* Windows FILETIME (100ns since 1601) */
+	u64 last_access_time;
+	u64 last_write_time;
+	u64 change_time;
+	u32 attributes;		/* FILE_ATTRIBUTE_* */
+};
+
+/*
  * Session state for one VSMB connection.
  */
 struct vmsmb_session {
@@ -113,27 +135,6 @@ struct vmsmb_session {
 };
 
 /*
- * SMB2 file ID (128-bit opaque handle).
- */
-struct vmsmb_fid {
-	u64 persistent;
-	u64 volatile_id;
-};
-
-/*
- * Basic file info extracted from SMB2 responses.
- */
-struct vmsmb_file_info {
-	u64 size;
-	u64 alloc_size;
-	u64 creation_time;	/* Windows FILETIME (100ns since 1601) */
-	u64 last_access_time;
-	u64 last_write_time;
-	u64 change_time;
-	u32 attributes;		/* FILE_ATTRIBUTE_* */
-};
-
-/*
  * Superblock private data.
  */
 struct vmsmb_sb_info {
@@ -149,8 +150,31 @@ struct vmsmb_file_ctx {
 	struct vmsmb_fid fid;
 };
 
+/*
+ * Per-inode private data — wraps struct netfs_inode.
+ * netfs_inode must be first so container_of works via netfs_inode().
+ */
+struct vmsmb_inode_info {
+	struct netfs_inode netfs;	/* Must be first — contains struct inode */
+	struct vmsmb_file_ctx *active_ctx; /* Open file context for writeback */
+};
+
+static inline struct vmsmb_inode_info *VMSMB_I(struct inode *inode)
+{
+	return container_of(inode, struct vmsmb_inode_info, netfs.inode);
+}
+
 /* Global session (one VSMB channel per VM) */
 extern struct vmsmb_session *vmsmb_global_session;
+
+/* Inode cache */
+extern struct kmem_cache *vmsmb_inode_cachep;
+
+/* netfs integration */
+extern const struct netfs_request_ops vmsmb_netfs_ops;
+extern const struct address_space_operations vmsmb_aops;
+
+/* vmsmb_transport.c */
 int vmsmb_open_channel(struct vmsmb_session *sess);
 void vmsmb_close_channel(struct vmsmb_session *sess);
 int vmsmb_send_recv(struct vmsmb_session *sess,

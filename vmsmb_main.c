@@ -115,26 +115,39 @@ static int __init vmsmb_init(void)
 
 	pr_info("loading\n");
 
+	vmsmb_inode_cachep = kmem_cache_create("vmsmb_inode_cache",
+					       sizeof(struct vmsmb_inode_info),
+					       0,
+					       SLAB_RECLAIM_ACCOUNT | SLAB_ACCOUNT,
+					       NULL);
+	if (!vmsmb_inode_cachep)
+		return -ENOMEM;
+
 	ret = vmbus_driver_register(&vmsmb_drv);
 	if (ret) {
 		pr_err("vmbus driver register failed: %d\n", ret);
-		return ret;
+		goto err_cache;
 	}
 
 	ret = register_filesystem(&vmsmb_fs_type);
 	if (ret) {
 		pr_err("register_filesystem failed: %d\n", ret);
 		vmbus_driver_unregister(&vmsmb_drv);
-		return ret;
+		goto err_cache;
 	}
 
 	return 0;
+
+err_cache:
+	kmem_cache_destroy(vmsmb_inode_cachep);
+	return ret;
 }
 
 static void __exit vmsmb_exit(void)
 {
 	unregister_filesystem(&vmsmb_fs_type);
 	vmbus_driver_unregister(&vmsmb_drv);
+	kmem_cache_destroy(vmsmb_inode_cachep);
 	pr_info("unloaded\n");
 }
 

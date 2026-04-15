@@ -16,6 +16,7 @@
 #include <linux/statfs.h>
 #include <linux/uio.h>
 #include <linux/namei.h>
+#include <linux/backing-dev.h>
 #include "vmsmb.h"
 #include "smb2pdu.h"
 #include "fscc.h"
@@ -43,6 +44,9 @@
 /* Inode number counter */
 static atomic64_t vmsmb_ino_counter = ATOMIC64_INIT(2);
 
+/* Inode cache */
+struct kmem_cache *vmsmb_inode_cachep;
+
 static inline struct vmsmb_sb_info *VMSMB_SB(struct super_block *sb)
 {
 	return sb->s_fs_info;
@@ -63,6 +67,7 @@ static void vmsmb_fill_inode(struct inode *inode,
 		inode->i_mode = S_IFREG | 0644;
 		inode->i_op = &vmsmb_file_inode_ops;
 		inode->i_fop = &vmsmb_file_ops;
+		inode->i_mapping->a_ops = &vmsmb_aops;
 		set_nlink(inode, 1);
 	}
 
@@ -319,6 +324,240 @@ const struct inode_operations vmsmb_file_inode_ops = {
 	.getattr	= vmsmb_getattr,
 };
 
+/* ---- Address space operations (netfs) ---- */
+
+const struct address_space_operations vmsmb_aops = {
+	.read_folio	= netfs_read_folio,
+	.readahead	= netfs_readahead,
+	.dirty_folio	= netfs_dirty_folio,
+	.writepages	= netfs_writepages,
+	.release_folio	= netfs_release_folio,
+	.invalidate_folio = netfs_invalidate_folio,
+	.direct_IO	= noop_direct_IO,
+};
+
+/* ---- netfs request operations ---- */
+
+/*
+ * Get dentry path from an inode (for handle-less readahead/writeback).
+ * Returns a kmalloc'd path or ERR_PTR. Caller must kfree.
+ */
+static char *vmsmb_inode_path(struct inode *inode)
+{
+	struct dentry *dentry;
+	char *path;
+
+	dentry = d_find_alias(inode);
+	if (!dentry)
+		return ERR_PTR(-ENOENT);
+
+	path = vmsmb_build_path(dentry);
+	dput(dentry);
+	return path;
+}
+
+static int vmsmb_init_request(struct netfs_io_request *rreq, struct file *file)
+{
+	if (file)
+		rreq->netfs_priv = file->private_data; /* vmsmb_file_ctx */
+	return 0;
+}
+
+static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
+{
+	struct netfs_io_request *rreq = subreq->rreq;
+	struct inode *inode = rreq->inode;
+	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
+	struct vmsmb_session *sess = sbi->sess;
+	struct vmsmb_file_ctx *ctx = rreq->netfs_priv;
+	struct vmsmb_fid temp_fid;
+	struct vmsmb_fid *fid;
+	bool temp_open = false;
+	void *buf;
+	size_t remain = subreq->len;
+	loff_t pos = subreq->start;
+	size_t total = 0;
+	int ret = 0;
+
+	/* Get file handle — use cached or open temporary */
+	if (ctx) {
+		fid = &ctx->fid;
+	} else {
+		char *path = vmsmb_inode_path(inode);
+
+		if (IS_ERR(path)) {
+			subreq->error = PTR_ERR(path);
+			goto out;
+		}
+		mutex_lock(&sess->transport_mutex);
+		ret = vmsmb_smb2_create(sess, path, VMSMB_READ_ACCESS,
+					VMSMB_FILE_OPEN, VMSMB_FILE_NON_DIRECTORY,
+					&temp_fid, NULL);
+		mutex_unlock(&sess->transport_mutex);
+		kfree(path);
+		if (ret) {
+			subreq->error = ret;
+			goto out;
+		}
+		fid = &temp_fid;
+		temp_open = true;
+	}
+
+	buf = kvmalloc(min_t(size_t, remain, sess->max_read_size), GFP_KERNEL);
+	if (!buf) {
+		subreq->error = -ENOMEM;
+		goto close;
+	}
+
+	while (remain > 0) {
+		u32 chunk = min_t(size_t, remain, sess->max_read_size);
+		u32 bytes_read = 0;
+
+		mutex_lock(&sess->transport_mutex);
+		ret = vmsmb_smb2_read(sess, fid, pos, chunk, buf, &bytes_read);
+		mutex_unlock(&sess->transport_mutex);
+
+		if (ret)
+			break;
+		if (bytes_read == 0)
+			break;
+
+		if (copy_to_iter(buf, bytes_read, &subreq->io_iter) != bytes_read) {
+			ret = -EFAULT;
+			break;
+		}
+
+		pos += bytes_read;
+		total += bytes_read;
+		remain -= bytes_read;
+
+		if (bytes_read < chunk)
+			break;
+	}
+
+	kvfree(buf);
+
+	if (ret)
+		subreq->error = ret;
+	subreq->transferred = total;
+
+close:
+	if (temp_open) {
+		mutex_lock(&sess->transport_mutex);
+		vmsmb_smb2_close(sess, &temp_fid);
+		mutex_unlock(&sess->transport_mutex);
+	}
+out:
+	netfs_read_subreq_terminated(subreq);
+}
+
+static void vmsmb_begin_writeback(struct netfs_io_request *wreq)
+{
+	struct inode *inode = wreq->inode;
+	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
+	struct vmsmb_inode_info *vi = VMSMB_I(inode);
+
+	/* Pass the active file handle to the write path */
+	if (vi->active_ctx)
+		wreq->netfs_priv = vi->active_ctx;
+
+	wreq->io_streams[0].avail = true;
+	wreq->io_streams[0].sreq_max_len = sbi->sess->max_write_size;
+}
+
+static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
+{
+	struct netfs_io_request *wreq = subreq->rreq;
+	struct inode *inode = wreq->inode;
+	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
+	struct vmsmb_session *sess = sbi->sess;
+	struct vmsmb_file_ctx *ctx = wreq->netfs_priv;
+	struct vmsmb_fid temp_fid;
+	struct vmsmb_fid *fid;
+	bool temp_open = false;
+	void *buf;
+	size_t remain = subreq->len;
+	loff_t pos = subreq->start;
+	size_t total = 0;
+	int ret = 0;
+
+	pr_debug("issue_write: pos=%lld len=%zu\n", pos, remain);
+
+	/* Get file handle — use cached or open temporary */
+	if (ctx) {
+		fid = &ctx->fid;
+	} else {
+		char *path = vmsmb_inode_path(inode);
+
+		if (IS_ERR(path)) {
+			ret = PTR_ERR(path);
+			goto fail;
+		}
+		mutex_lock(&sess->transport_mutex);
+		ret = vmsmb_smb2_create(sess, path, VMSMB_WRITE_ACCESS,
+					VMSMB_FILE_OPEN, VMSMB_FILE_NON_DIRECTORY,
+					&temp_fid, NULL);
+		mutex_unlock(&sess->transport_mutex);
+		kfree(path);
+		if (ret)
+			goto fail;
+		fid = &temp_fid;
+		temp_open = true;
+	}
+
+	buf = kvmalloc(min_t(size_t, remain, sess->max_write_size), GFP_KERNEL);
+	if (!buf) {
+		ret = -ENOMEM;
+		goto close;
+	}
+
+	while (remain > 0) {
+		u32 chunk = min_t(size_t, remain, sess->max_write_size);
+		u32 bytes_written = 0;
+		size_t copied;
+
+		copied = copy_from_iter(buf, chunk, &subreq->io_iter);
+		if (copied == 0) {
+			ret = -EFAULT;
+			break;
+		}
+
+		mutex_lock(&sess->transport_mutex);
+		ret = vmsmb_smb2_write(sess, fid, pos, buf, copied,
+				       &bytes_written);
+		mutex_unlock(&sess->transport_mutex);
+
+		if (ret)
+			break;
+
+		pos += bytes_written;
+		total += bytes_written;
+		remain -= bytes_written;
+
+		if (bytes_written < copied)
+			break;
+	}
+
+	kvfree(buf);
+
+close:
+	if (temp_open) {
+		mutex_lock(&sess->transport_mutex);
+		vmsmb_smb2_close(sess, &temp_fid);
+		mutex_unlock(&sess->transport_mutex);
+	}
+fail:
+	netfs_write_subrequest_terminated(subreq,
+					  ret ? ret : (ssize_t)total);
+}
+
+const struct netfs_request_ops vmsmb_netfs_ops = {
+	.init_request	= vmsmb_init_request,
+	.issue_read	= vmsmb_issue_read,
+	.begin_writeback = vmsmb_begin_writeback,
+	.issue_write	= vmsmb_issue_write,
+};
+
 /* ---- File operations ---- */
 
 static int vmsmb_file_open(struct inode *inode, struct file *file)
@@ -377,6 +616,7 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 	i_size_write(inode, info.size);
 
 	file->private_data = ctx;
+	VMSMB_I(inode)->active_ctx = ctx;
 	return 0;
 }
 
@@ -387,122 +627,15 @@ static int vmsmb_file_release(struct inode *inode, struct file *file)
 	struct vmsmb_file_ctx *ctx = file->private_data;
 
 	if (ctx) {
+		if (VMSMB_I(inode)->active_ctx == ctx)
+			VMSMB_I(inode)->active_ctx = NULL;
+
 		mutex_lock(&sess->transport_mutex);
 		vmsmb_smb2_close(sess, &ctx->fid);
 		mutex_unlock(&sess->transport_mutex);
 		kfree(ctx);
 	}
 	return 0;
-}
-
-static ssize_t vmsmb_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
-{
-	struct file *file = iocb->ki_filp;
-	struct inode *inode = file_inode(file);
-	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
-	struct vmsmb_session *sess = sbi->sess;
-	struct vmsmb_file_ctx *ctx = file->private_data;
-	loff_t pos = iocb->ki_pos;
-	size_t count = iov_iter_count(to);
-	ssize_t total = 0;
-	void *buf;
-	int ret;
-
-	if (pos >= i_size_read(inode))
-		return 0;
-
-	if (pos + count > i_size_read(inode))
-		count = i_size_read(inode) - pos;
-
-	buf = kvmalloc(min_t(size_t, count, sess->max_read_size), GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	while (count > 0) {
-		u32 chunk = min_t(size_t, count, sess->max_read_size);
-		u32 bytes_read = 0;
-
-		mutex_lock(&sess->transport_mutex);
-		ret = vmsmb_smb2_read(sess, &ctx->fid, pos, chunk,
-				      buf, &bytes_read);
-		mutex_unlock(&sess->transport_mutex);
-
-		if (ret)
-			break;
-		if (bytes_read == 0)
-			break;
-
-		if (copy_to_iter(buf, bytes_read, to) != bytes_read) {
-			ret = -EFAULT;
-			break;
-		}
-
-		pos += bytes_read;
-		total += bytes_read;
-		count -= bytes_read;
-
-		if (bytes_read < chunk)
-			break;
-	}
-
-	kvfree(buf);
-	iocb->ki_pos = pos;
-	return total > 0 ? total : ret;
-}
-
-static ssize_t vmsmb_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
-{
-	struct file *file = iocb->ki_filp;
-	struct inode *inode = file_inode(file);
-	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
-	struct vmsmb_session *sess = sbi->sess;
-	struct vmsmb_file_ctx *ctx = file->private_data;
-	loff_t pos = iocb->ki_pos;
-	size_t count = iov_iter_count(from);
-	ssize_t total = 0;
-	void *buf;
-	int ret = 0;
-
-	if (iocb->ki_flags & IOCB_APPEND)
-		pos = i_size_read(inode);
-
-	buf = kvmalloc(min_t(size_t, count, sess->max_write_size), GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	while (count > 0) {
-		u32 chunk = min_t(size_t, count, sess->max_write_size);
-		u32 bytes_written = 0;
-		size_t copied;
-
-		copied = copy_from_iter(buf, chunk, from);
-		if (copied == 0) {
-			ret = -EFAULT;
-			break;
-		}
-
-		mutex_lock(&sess->transport_mutex);
-		ret = vmsmb_smb2_write(sess, &ctx->fid, pos, buf,
-				       copied, &bytes_written);
-		mutex_unlock(&sess->transport_mutex);
-
-		if (ret)
-			break;
-
-		pos += bytes_written;
-		total += bytes_written;
-		count -= bytes_written;
-
-		if (pos > i_size_read(inode))
-			i_size_write(inode, pos);
-
-		if (bytes_written < copied)
-			break;
-	}
-
-	kvfree(buf);
-	iocb->ki_pos = pos;
-	return total > 0 ? total : ret;
 }
 
 static loff_t vmsmb_file_llseek(struct file *file, loff_t offset, int whence)
@@ -517,8 +650,8 @@ static loff_t vmsmb_file_llseek(struct file *file, loff_t offset, int whence)
 const struct file_operations vmsmb_file_ops = {
 	.open		= vmsmb_file_open,
 	.release	= vmsmb_file_release,
-	.read_iter	= vmsmb_file_read_iter,
-	.write_iter	= vmsmb_file_write_iter,
+	.read_iter	= netfs_file_read_iter,
+	.write_iter	= netfs_unbuffered_write_iter,
 	.llseek		= vmsmb_file_llseek,
 };
 
@@ -643,6 +776,23 @@ const struct file_operations vmsmb_dir_ops = {
 
 /* ---- Superblock operations ---- */
 
+static struct inode *vmsmb_alloc_inode(struct super_block *sb)
+{
+	struct vmsmb_inode_info *vi;
+
+	vi = alloc_inode_sb(sb, vmsmb_inode_cachep, GFP_KERNEL);
+	if (!vi)
+		return NULL;
+
+	netfs_inode_init(&vi->netfs, &vmsmb_netfs_ops, false);
+	return &vi->netfs.inode;
+}
+
+static void vmsmb_free_inode(struct inode *inode)
+{
+	kmem_cache_free(vmsmb_inode_cachep, VMSMB_I(inode));
+}
+
 static int vmsmb_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	buf->f_type = 0x564D5342; /* "VMSB" */
@@ -656,6 +806,8 @@ static int vmsmb_statfs(struct dentry *dentry, struct kstatfs *buf)
 }
 
 static const struct super_operations vmsmb_super_ops = {
+	.alloc_inode	= vmsmb_alloc_inode,
+	.free_inode	= vmsmb_free_inode,
 	.statfs		= vmsmb_statfs,
 };
 
@@ -674,6 +826,12 @@ static int vmsmb_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_op = &vmsmb_super_ops;
 	sb->s_time_gran = 100; /* 100ns Windows FILETIME granularity */
+
+	/* Set up writeback-capable BDI so netfs writepages works */
+	ret = super_setup_bdi(sb);
+	if (ret)
+		return ret;
+	sb->s_flags |= SB_ACTIVE;
 
 	/* Query root directory attributes — empty path = share root */
 	mutex_lock(&sess->transport_mutex);
