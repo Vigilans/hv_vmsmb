@@ -111,6 +111,27 @@ struct vmsmb_session {
 	spinlock_t recv_lock;
 };
 
+/*
+ * SMB2 file ID (128-bit opaque handle).
+ */
+struct vmsmb_fid {
+	u64 persistent;
+	u64 volatile_id;
+};
+
+/*
+ * Basic file info extracted from SMB2 responses.
+ */
+struct vmsmb_file_info {
+	u64 size;
+	u64 alloc_size;
+	u64 creation_time;	/* Windows FILETIME (100ns since 1601) */
+	u64 last_access_time;
+	u64 last_write_time;
+	u64 change_time;
+	u32 attributes;		/* FILE_ATTRIBUTE_* */
+};
+
 /* vmsmb_transport.c */
 int vmsmb_open_channel(struct vmsmb_session *sess);
 void vmsmb_close_channel(struct vmsmb_session *sess);
@@ -119,5 +140,22 @@ int vmsmb_send_recv(struct vmsmb_session *sess,
 		    void *recv_buf, u32 recv_buf_size,
 		    u32 *recv_len);
 int vmsmb_negotiate_version(struct vmsmb_session *sess);
+
+/* vmsmb_smb2.c */
+int vmsmb_smb2_negotiate(struct vmsmb_session *sess);
+int vmsmb_smb2_session_setup(struct vmsmb_session *sess);
+int vmsmb_smb2_tree_connect(struct vmsmb_session *sess, const char *share_name);
+int vmsmb_smb2_create(struct vmsmb_session *sess, const char *path,
+		      u32 desired_access, u32 disposition, u32 create_options,
+		      struct vmsmb_fid *fid, struct vmsmb_file_info *info);
+int vmsmb_smb2_close(struct vmsmb_session *sess, struct vmsmb_fid *fid);
+int vmsmb_smb2_read(struct vmsmb_session *sess, struct vmsmb_fid *fid,
+		    u64 offset, u32 length, void *data, u32 *bytes_read);
+int vmsmb_smb2_write(struct vmsmb_session *sess, struct vmsmb_fid *fid,
+		     u64 offset, const void *data, u32 length,
+		     u32 *bytes_written);
+int vmsmb_smb2_query_dir(struct vmsmb_session *sess, struct vmsmb_fid *fid,
+			 const char *pattern, void *buf, u32 buf_size,
+			 u32 *data_len);
 
 #endif /* _VMSMB_H */
