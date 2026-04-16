@@ -20,13 +20,16 @@
 		  0x8e, 0xaa, 0x52, 0x70, 0xfc, 0x6a, 0xbd, 0xb7)
 
 /* Default ring buffer size (bytes per direction) */
-#define VMSMB_RING_SIZE		(128 * 1024)
+#define VMSMB_RING_SIZE		(256 * 1024)
 
 /* Max SMB2 response buffer */
 #define VMSMB_MAX_RESPONSE	4096
 
 /* Max I/O response buffer (header overhead + MaxReadSize) */
 #define VMSMB_MAX_IO_RESPONSE	(1048576 + 256)
+
+/* Max I/O chunk per VMBus send — must fit in ring buffer with headers */
+#define VMSMB_MAX_IO_CHUNK	(192 * 1024)
 
 /* Timeout for synchronous send/recv (ms) */
 #define VMSMB_TIMEOUT_MS	10000

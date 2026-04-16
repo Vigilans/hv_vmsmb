@@ -408,14 +408,14 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 		temp_open = true;
 	}
 
-	buf = kvmalloc(min_t(size_t, remain, sess->max_read_size), GFP_KERNEL);
+	buf = kvmalloc(min_t(size_t, remain, VMSMB_MAX_IO_CHUNK), GFP_KERNEL);
 	if (!buf) {
 		subreq->error = -ENOMEM;
 		goto close;
 	}
 
 	while (remain > 0) {
-		u32 chunk = min_t(size_t, remain, sess->max_read_size);
+		u32 chunk = min_t(size_t, remain, VMSMB_MAX_IO_CHUNK);
 		u32 bytes_read = 0;
 
 		mutex_lock(&sess->transport_mutex);
@@ -467,7 +467,7 @@ static void vmsmb_begin_writeback(struct netfs_io_request *wreq)
 		wreq->netfs_priv = vi->active_ctx;
 
 	wreq->io_streams[0].avail = true;
-	wreq->io_streams[0].sreq_max_len = sbi->sess->max_write_size;
+	wreq->io_streams[0].sreq_max_len = VMSMB_MAX_IO_CHUNK;
 }
 
 static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
@@ -510,14 +510,14 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 		temp_open = true;
 	}
 
-	buf = kvmalloc(min_t(size_t, remain, sess->max_write_size), GFP_KERNEL);
+	buf = kvmalloc(min_t(size_t, remain, VMSMB_MAX_IO_CHUNK), GFP_KERNEL);
 	if (!buf) {
 		ret = -ENOMEM;
 		goto close;
 	}
 
 	while (remain > 0) {
-		u32 chunk = min_t(size_t, remain, sess->max_write_size);
+		u32 chunk = min_t(size_t, remain, VMSMB_MAX_IO_CHUNK);
 		u32 bytes_written = 0;
 		size_t copied;
 
