@@ -43,6 +43,16 @@ int vmsmb_open_channel(struct vmsmb_session *sess)
 	spin_lock_init(&sess->recv_lock);
 	init_completion(&sess->recv_done);
 
+	/*
+	 * Set max_pkt_size before vmbus_open so hv_ringbuffer_init
+	 * allocates a pkt_buffer large enough for I/O responses.
+	 * Default is VMBUS_DEFAULT_MAX_PKT_SIZE (4096) which truncates
+	 * READ responses larger than ~4K in hv_pkt_iter_first.
+	 */
+	ch->max_pkt_size = VMSMB_MAX_IO_RESPONSE +
+			   sizeof(struct vmpipe_hdr) +
+			   sizeof(struct vmpacket_descriptor);
+
 	ret = vmbus_open(ch, VMSMB_RING_SIZE, VMSMB_RING_SIZE,
 			 NULL, 0, vmsmb_channel_cb, sess);
 	if (ret) {
@@ -217,7 +227,8 @@ int vmsmb_send_recv(struct vmsmb_session *sess,
 	kfree(pkt);
 
 	if (ret) {
-		pr_err("vmbus_sendpacket failed: %d\n", ret);
+		pr_err("vmbus_sendpacket failed: %d (pkt_len=%u)\n",
+		       ret, pkt_len);
 		return ret;
 	}
 
