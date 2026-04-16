@@ -151,18 +151,21 @@ static char *vmsmb_build_path(struct dentry *dentry)
  * Parse reparse point buffer and return symlink target as UTF-8 string.
  *
  * Handles IO_REPARSE_TAG_SYMLINK and IO_REPARSE_TAG_MOUNT_POINT.
- * Simplified from CIFS parse_reparse_native_symlink() and
- * parse_reparse_point() (fs/smb/client/reparse.c).
+ * Simplified from CIFS smb2_parse_native_symlink() (fs/smb/client/reparse.c).
  *
- * Path conversion: strip \??\ or \DosDevices\ prefix, convert \ to /.
+ * When symlinkroot is set and the target is an absolute NT path with a
+ * drive letter (e.g. \??\C:\foo), translate it to {symlinkroot}/c/foo.
+ * Otherwise just strip NT prefix and convert \ to /.
  */
-static char *vmsmb_parse_reparse(const void *buf, u32 buf_len)
+static char *vmsmb_parse_reparse(const void *buf, u32 buf_len,
+				 const char *symlinkroot)
 {
 	const struct reparse_data_buffer *hdr = buf;
 	const u8 *name_start;
 	u16 name_off, name_len;
 	u32 tag;
-	char *target, *p;
+	char *smb_target, *result, *abs_path, *p;
+	bool relative = false;
 	int utf8_len;
 
 	if (buf_len < sizeof(*hdr))
@@ -179,6 +182,7 @@ static char *vmsmb_parse_reparse(const void *buf, u32 buf_len)
 		name_off = le16_to_cpu(sym->SubstituteNameOffset);
 		name_len = le16_to_cpu(sym->SubstituteNameLength);
 		name_start = sym->PathBuffer + name_off;
+		relative = !!(le32_to_cpu(sym->Flags) & SYMLINK_FLAG_RELATIVE);
 	} else if (tag == IO_REPARSE_TAG_MOUNT_POINT) {
 		const struct reparse_mount_point_data_buffer *mnt = buf;
 
@@ -195,40 +199,104 @@ static char *vmsmb_parse_reparse(const void *buf, u32 buf_len)
 	if (!name_len)
 		return ERR_PTR(-EINVAL);
 
-	/* UTF-16LE → UTF-8 */
-	target = kmalloc(name_len * 2 + 1, GFP_KERNEL);
-	if (!target)
+	/* UTF-16LE → UTF-8 (keep backslashes for prefix matching) */
+	smb_target = kmalloc(name_len * 2 + 1, GFP_KERNEL);
+	if (!smb_target)
 		return ERR_PTR(-ENOMEM);
 
 	utf8_len = utf16s_to_utf8s((const wchar_t *)name_start,
 				    name_len / sizeof(__le16),
-				    UTF16_LITTLE_ENDIAN, target,
+				    UTF16_LITTLE_ENDIAN, smb_target,
 				    name_len * 2);
 	if (utf8_len < 0) {
-		kfree(target);
+		kfree(smb_target);
 		return ERR_PTR(-EINVAL);
 	}
-	target[utf8_len] = '\0';
+	smb_target[utf8_len] = '\0';
 
-	/* Convert \ to / */
-	for (p = target; *p; p++) {
-		if (*p == '\\')
-			*p = '/';
+	/*
+	 * Absolute NT path with symlinkroot set: translate drive letter.
+	 * Port of CIFS smb2_parse_native_symlink (fs/smb/client/reparse.c).
+	 */
+	if (symlinkroot && !relative) {
+		abs_path = smb_target;
+globalroot:
+		if (strstarts(abs_path, "\\??\\"))
+			abs_path += sizeof("\\??\\") - 1;
+		else if (strstarts(abs_path, "\\DosDevices\\"))
+			abs_path += sizeof("\\DosDevices\\") - 1;
+		else if (strstarts(abs_path, "\\GLOBAL??\\"))
+			abs_path += sizeof("\\GLOBAL??\\") - 1;
+		else
+			goto out_no_translate;
+
+		if (abs_path[0] == '\\')
+			abs_path++;
+
+		while (strstarts(abs_path, "Global\\"))
+			abs_path += sizeof("Global\\") - 1;
+
+		if (strstarts(abs_path, "GLOBALROOT\\")) {
+			abs_path += sizeof("GLOBALROOT") - 1;
+			goto globalroot;
+		}
+
+		/* Only drive-letter paths: X:\... or X: */
+		if (((abs_path[0] >= 'A' && abs_path[0] <= 'Z') ||
+		     (abs_path[0] >= 'a' && abs_path[0] <= 'z')) &&
+		    abs_path[1] == ':' &&
+		    (abs_path[2] == '\\' || abs_path[2] == '\0')) {
+			char drive_letter = abs_path[0];
+			int symroot_len = strlen(symlinkroot);
+			int abs_len;
+
+			if (drive_letter >= 'A' && drive_letter <= 'Z')
+				drive_letter += 'a' - 'A';
+			/* Drop colon: "C:\foo" → "\c\foo" in-place */
+			abs_path++;
+			abs_path[0] = drive_letter;
+
+			/* Convert remaining \ → / */
+			for (p = abs_path; *p; p++)
+				if (*p == '\\')
+					*p = '/';
+
+			if (symlinkroot[symroot_len - 1] == '/')
+				symroot_len--;
+			abs_len = strlen(abs_path) + 1;
+
+			result = kmalloc(symroot_len + 1 + abs_len, GFP_KERNEL);
+			if (!result) {
+				kfree(smb_target);
+				return ERR_PTR(-ENOMEM);
+			}
+			memcpy(result, symlinkroot, symroot_len);
+			result[symroot_len] = '/';
+			memcpy(result + symroot_len + 1, abs_path, abs_len);
+			kfree(smb_target);
+			return result;
+		}
+		/* Non-drive-letter absolute path: fall through to plain conversion */
 	}
 
-	/* Strip NT path prefixes: \??\ or \DosDevices\ (now /??/ or /DosDevices/) */
-	p = target;
+out_no_translate:
+	/* Plain conversion: \ → / and strip NT prefix if present */
+	for (p = smb_target; *p; p++)
+		if (*p == '\\')
+			*p = '/';
+
+	p = smb_target;
 	if (strncmp(p, "/??/", 4) == 0)
 		p += 4;
 	else if (strncmp(p, "/DosDevices/", 12) == 0)
 		p += 12;
 
-	if (p != target) {
+	if (p != smb_target) {
 		utf8_len = strlen(p);
-		memmove(target, p, utf8_len + 1);
+		memmove(smb_target, p, utf8_len + 1);
 	}
 
-	return target;
+	return smb_target;
 }
 
 /* ---- Inode operations ---- */
@@ -302,7 +370,8 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 			return ERR_PTR(ret);
 		}
 
-		target = vmsmb_parse_reparse(reparse_buf, reparse_len);
+		target = vmsmb_parse_reparse(reparse_buf, reparse_len,
+					     sbi->symlinkroot);
 		kfree(reparse_buf);
 
 		if (IS_ERR(target)) {
@@ -1242,6 +1311,7 @@ enum vmsmb_param {
 	Opt_file_mode,
 	Opt_dir_mode,
 	Opt_noperm,
+	Opt_symlinkroot,
 };
 
 static const struct fs_parameter_spec vmsmb_fs_parameters[] = {
@@ -1250,6 +1320,7 @@ static const struct fs_parameter_spec vmsmb_fs_parameters[] = {
 	fsparam_u32oct("file_mode",	Opt_file_mode),
 	fsparam_u32oct("dir_mode",	Opt_dir_mode),
 	fsparam_flag("noperm",		Opt_noperm),
+	fsparam_string("symlinkroot",	Opt_symlinkroot),
 	{}
 };
 
@@ -1267,6 +1338,7 @@ struct vmsmb_fs_context {
 	bool file_mode_set;
 	bool dir_mode_set;
 	bool noperm;
+	char *symlinkroot;
 };
 
 static int vmsmb_parse_param(struct fs_context *fc,
@@ -1303,6 +1375,13 @@ static int vmsmb_parse_param(struct fs_context *fc,
 		break;
 	case Opt_noperm:
 		ctx->noperm = true;
+		break;
+	case Opt_symlinkroot:
+		if (param->string[0] != '/')
+			return invalfc(fc, "symlinkroot must be absolute path");
+		kfree(ctx->symlinkroot);
+		ctx->symlinkroot = param->string;
+		param->string = NULL;
 		break;
 	}
 
@@ -1348,8 +1427,13 @@ static int vmsmb_get_tree(struct fs_context *fc)
 		sbi->dir_mode = 0777;
 	}
 
+	/* Transfer symlinkroot ownership from ctx to sbi */
+	sbi->symlinkroot = ctx->symlinkroot;
+	ctx->symlinkroot = NULL;
+
 	sbi->share_name = kstrdup(dev_name, GFP_KERNEL);
 	if (!sbi->share_name) {
+		kfree(sbi->symlinkroot);
 		kfree(sbi);
 		return -ENOMEM;
 	}
@@ -1362,6 +1446,7 @@ static int vmsmb_get_tree(struct fs_context *fc)
 	if (ret) {
 		pr_err("TREE_CONNECT '%s' failed: %d\n", dev_name, ret);
 		kfree(sbi->share_name);
+		kfree(sbi->symlinkroot);
 		kfree(sbi);
 		return ret;
 	}
@@ -1373,7 +1458,12 @@ static int vmsmb_get_tree(struct fs_context *fc)
 
 static void vmsmb_free_fc(struct fs_context *fc)
 {
-	kfree(fc->fs_private);
+	struct vmsmb_fs_context *ctx = fc->fs_private;
+
+	if (ctx) {
+		kfree(ctx->symlinkroot);
+		kfree(ctx);
+	}
 }
 
 static const struct fs_context_operations vmsmb_context_ops = {
@@ -1404,6 +1494,7 @@ static void vmsmb_kill_sb(struct super_block *sb)
 	if (sbi) {
 		/* TODO: TREE_DISCONNECT */
 		kfree(sbi->share_name);
+		kfree(sbi->symlinkroot);
 		kfree(sbi);
 	}
 }

@@ -186,6 +186,7 @@ struct vmsmb_sb_info {
 	umode_t file_mode;	/* permission bits for files */
 	umode_t dir_mode;	/* permission bits for directories */
 	bool noperm;		/* skip VFS permission checks */
+	char *symlinkroot;	/* mount option: translate Windows abs symlinks to {symlinkroot}/x/... */
 };
 
 /*
