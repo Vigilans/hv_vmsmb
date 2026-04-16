@@ -22,9 +22,20 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/delay.h>
+#include <linux/ktime.h>
 #include <linux/hyperv.h>
 #include "vmsmb.h"
 #include "smb2pdu.h"
+
+/*
+ * Adaptive spinning window (microseconds).
+ *
+ * Before sleeping on wait_for_completion, busy-poll for this long.
+ * Sequential I/O responses arrive within a few microseconds — spinning
+ * avoids the schedule/wake context switch overhead (~7μs per I/O).
+ * Reference: NVMe nvme_poll_cq() uses similar adaptive polling.
+ */
+#define VMSMB_SPIN_USEC		10
 
 /*
  * Find a pending request by SMB2 MessageId.
@@ -531,7 +542,23 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 		return ret;
 	}
 
-	/* Wait for channel_cb to complete this request */
+	/*
+	 * Adaptive spinning: busy-poll briefly before sleeping.
+	 * For fast responses (sequential I/O), the channel callback
+	 * completes the request within microseconds.  Spinning avoids
+	 * the schedule/wake context switch overhead (~7μs per I/O).
+	 */
+	{
+		ktime_t spin_end = ktime_add_us(ktime_get(), VMSMB_SPIN_USEC);
+
+		while (!completion_done(&req.done)) {
+			if (ktime_after(ktime_get(), spin_end))
+				break;
+			cpu_relax();
+		}
+	}
+
+	/* Wait for channel_cb to complete this request (immediate if spun) */
 	remaining = wait_for_completion_timeout(&req.done,
 				msecs_to_jiffies(VMSMB_TIMEOUT_MS));
 	if (!remaining) {
