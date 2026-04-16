@@ -47,6 +47,22 @@ static atomic64_t vmsmb_ino_counter = ATOMIC64_INIT(2);
 /* Inode cache */
 struct kmem_cache *vmsmb_inode_cachep;
 
+/*
+ * Slab constructor for vmsmb_inode_info objects.
+ * inode_init_once() initializes VFS-internal list heads (i_io_list,
+ * i_lru, i_hash, etc.) that are only set up once per slab object
+ * lifetime — not on every alloc_inode call. Without this, those
+ * list heads are {NULL, NULL} and any VFS operation that touches
+ * them (mark_inode_dirty, iput) will NULL-deref.
+ * Matches CIFS: cifs_init_once → inode_init_once.
+ */
+void vmsmb_init_once(void *data)
+{
+	struct vmsmb_inode_info *vi = data;
+
+	inode_init_once(&vi->netfs.inode);
+}
+
 static inline struct vmsmb_sb_info *VMSMB_SB(struct super_block *sb)
 {
 	return sb->s_fs_info;
@@ -81,6 +97,14 @@ static void vmsmb_fill_inode(struct inode *inode,
 	inode_set_atime_to_ts(inode, vmsmb_time_to_ts(info->last_access_time));
 	inode_set_mtime_to_ts(inode, vmsmb_time_to_ts(info->last_write_time));
 	inode_set_ctime_to_ts(inode, vmsmb_time_to_ts(info->change_time));
+
+	/*
+	 * Initialize netfs context after VFS inode_init_always() has run
+	 * and inode size is set. Matches CIFS pattern: cifs_fattr_to_inode()
+	 * calls cifs_set_netfs_context() → netfs_inode_init() only after
+	 * filling all inode attributes.
+	 */
+	netfs_inode_init(&VMSMB_I(inode)->netfs, &vmsmb_netfs_ops, false);
 }
 
 /*
@@ -276,11 +300,8 @@ static int vmsmb_unlink(struct inode *dir, struct dentry *dentry)
 
 	kfree(path);
 
-	if (ret == 0) {
-		if (d_inode(dentry))
-			drop_nlink(d_inode(dentry));
-		d_delete(dentry);
-	}
+	if (ret == 0)
+		drop_nlink(d_inode(dentry));
 	return ret;
 }
 
@@ -311,7 +332,6 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 	if (ret == 0) {
 		drop_nlink(d_inode(dentry));
 		drop_nlink(dir);
-		d_delete(dentry);
 	}
 	return ret;
 }
@@ -862,7 +882,7 @@ static struct inode *vmsmb_alloc_inode(struct super_block *sb)
 	if (!vi)
 		return NULL;
 
-	netfs_inode_init(&vi->netfs, &vmsmb_netfs_ops, false);
+	vi->active_ctx = NULL;
 	return &vi->netfs.inode;
 }
 
@@ -883,9 +903,23 @@ static int vmsmb_statfs(struct dentry *dentry, struct kstatfs *buf)
 	return 0;
 }
 
+static void vmsmb_evict_inode(struct inode *inode)
+{
+	netfs_wait_for_outstanding_io(inode);
+	truncate_inode_pages_final(&inode->i_data);
+	clear_inode(inode);
+}
+
+static int vmsmb_write_inode(struct inode *inode, struct writeback_control *wbc)
+{
+	return netfs_unpin_writeback(inode, wbc);
+}
+
 static const struct super_operations vmsmb_super_ops = {
 	.alloc_inode	= vmsmb_alloc_inode,
 	.free_inode	= vmsmb_free_inode,
+	.write_inode	= vmsmb_write_inode,
+	.evict_inode	= vmsmb_evict_inode,
 	.statfs		= vmsmb_statfs,
 };
 

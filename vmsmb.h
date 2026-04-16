@@ -175,6 +175,7 @@ extern struct vmsmb_session *vmsmb_global_session;
 
 /* Inode cache */
 extern struct kmem_cache *vmsmb_inode_cachep;
+void vmsmb_init_once(void *data);
 
 /* netfs integration */
 extern const struct netfs_request_ops vmsmb_netfs_ops;

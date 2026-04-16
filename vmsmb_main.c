@@ -119,7 +119,7 @@ static int __init vmsmb_init(void)
 					       sizeof(struct vmsmb_inode_info),
 					       0,
 					       SLAB_RECLAIM_ACCOUNT | SLAB_ACCOUNT,
-					       NULL);
+					       vmsmb_init_once);
 	if (!vmsmb_inode_cachep)
 		return -ENOMEM;
 
