@@ -169,6 +169,7 @@ struct vmsmb_file_ctx {
 struct vmsmb_inode_info {
 	struct netfs_inode netfs;	/* Must be first — contains struct inode */
 	struct vmsmb_file_ctx *active_ctx; /* Open file context for writeback */
+	char *symlink_target;		/* Cached readlink target, or NULL */
 };
 
 static inline struct vmsmb_inode_info *VMSMB_I(struct inode *inode)
@@ -196,6 +197,14 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 			void *smb2_resp, u32 resp_buf_size,
 			u32 *resp_len);
 
+/* FSCTL codes for reparse point operations (smbfsctl.h) */
+#define FSCTL_SET_REPARSE_POINT		0x000900a4
+#define FSCTL_GET_REPARSE_POINT		0x000900a8
+
+/* Reparse point tags (smbfsctl.h) */
+#define IO_REPARSE_TAG_MOUNT_POINT	0xa0000003
+#define IO_REPARSE_TAG_SYMLINK		0xa000000c
+
 /* vmsmb_smb2.c */
 int vmsmb_smb2_negotiate(struct vmsmb_session *sess);
 int vmsmb_smb2_session_setup(struct vmsmb_session *sess);
@@ -215,11 +224,20 @@ int vmsmb_smb2_query_dir(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 int vmsmb_smb2_rename(struct vmsmb_session *sess,
 		       const char *old_path, const char *new_path,
 		       bool replace);
+int vmsmb_smb2_unlink(struct vmsmb_session *sess, const char *path);
+int vmsmb_smb2_ioctl(struct vmsmb_session *sess, struct vmsmb_fid *fid,
+		      u32 ctl_code, const void *in, u32 in_len,
+		      void *out, u32 out_size, u32 *out_len);
+int vmsmb_smb2_get_reparse(struct vmsmb_session *sess, const char *path,
+			    void *buf, u32 buf_size, u32 *data_len);
+int vmsmb_smb2_create_symlink(struct vmsmb_session *sess,
+			       const char *path, const char *target);
 
 /* vmsmb_vfs.c */
 extern struct file_system_type vmsmb_fs_type;
 extern const struct inode_operations vmsmb_dir_inode_ops;
 extern const struct inode_operations vmsmb_file_inode_ops;
+extern const struct inode_operations vmsmb_symlink_inode_ops;
 extern const struct file_operations vmsmb_file_ops;
 extern const struct file_operations vmsmb_dir_ops;
 

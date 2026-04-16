@@ -39,12 +39,19 @@
 #define VMSMB_FILE_OVERWRITE_IF	0x05
 
 /* SMB2 create options */
-#define VMSMB_FILE_DIRECTORY	0x01
-#define VMSMB_FILE_NON_DIRECTORY	0x40
-#define VMSMB_FILE_DELETE_ON_CLOSE	0x1000
+#define VMSMB_FILE_DIRECTORY		0x00000001
+#define VMSMB_FILE_NON_DIRECTORY	0x00000040
+#define VMSMB_FILE_DELETE_ON_CLOSE	0x00001000
+#define VMSMB_FILE_OPEN_REPARSE_POINT	0x00200000
 
 /* Inode number counter */
 static atomic64_t vmsmb_ino_counter = ATOMIC64_INIT(2);
+
+/* Forward declarations for symlink inode ops */
+static const char *vmsmb_get_link(struct dentry *dentry, struct inode *inode,
+				   struct delayed_call *done);
+static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
+			  struct dentry *dentry, const char *target);
 
 /* Inode cache */
 struct kmem_cache *vmsmb_inode_cachep;
@@ -78,7 +85,11 @@ static void vmsmb_fill_inode(struct inode *inode,
 {
 	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
 
-	if (info->attributes & FILE_ATTRIBUTE_DIRECTORY) {
+	if (info->attributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+		inode->i_mode = S_IFLNK | 0777;
+		inode->i_op = &vmsmb_symlink_inode_ops;
+		set_nlink(inode, 1);
+	} else if (info->attributes & FILE_ATTRIBUTE_DIRECTORY) {
 		inode->i_mode = S_IFDIR | sbi->dir_mode;
 		inode->i_op = &vmsmb_dir_inode_ops;
 		inode->i_fop = &vmsmb_dir_ops;
@@ -146,6 +157,90 @@ static char *vmsmb_build_path(struct dentry *dentry)
 	}
 }
 
+/*
+ * Parse reparse point buffer and return symlink target as UTF-8 string.
+ *
+ * Handles IO_REPARSE_TAG_SYMLINK and IO_REPARSE_TAG_MOUNT_POINT.
+ * Simplified from CIFS parse_reparse_native_symlink() and
+ * parse_reparse_point() (fs/smb/client/reparse.c).
+ *
+ * Path conversion: strip \??\ or \DosDevices\ prefix, convert \ to /.
+ */
+static char *vmsmb_parse_reparse(const void *buf, u32 buf_len)
+{
+	const struct reparse_data_buffer *hdr = buf;
+	const u8 *name_start;
+	u16 name_off, name_len;
+	u32 tag;
+	char *target, *p;
+	int utf8_len;
+
+	if (buf_len < sizeof(*hdr))
+		return ERR_PTR(-EINVAL);
+
+	tag = le32_to_cpu(hdr->ReparseTag);
+
+	if (tag == IO_REPARSE_TAG_SYMLINK) {
+		const struct reparse_symlink_data_buffer *sym = buf;
+
+		if (buf_len < sizeof(*sym))
+			return ERR_PTR(-EINVAL);
+
+		name_off = le16_to_cpu(sym->SubstituteNameOffset);
+		name_len = le16_to_cpu(sym->SubstituteNameLength);
+		name_start = sym->PathBuffer + name_off;
+	} else if (tag == IO_REPARSE_TAG_MOUNT_POINT) {
+		const struct reparse_mount_point_data_buffer *mnt = buf;
+
+		if (buf_len < sizeof(*mnt))
+			return ERR_PTR(-EINVAL);
+
+		name_off = le16_to_cpu(mnt->SubstituteNameOffset);
+		name_len = le16_to_cpu(mnt->SubstituteNameLength);
+		name_start = mnt->PathBuffer + name_off;
+	} else {
+		return ERR_PTR(-EOPNOTSUPP);
+	}
+
+	if (!name_len)
+		return ERR_PTR(-EINVAL);
+
+	/* UTF-16LE → UTF-8 */
+	target = kmalloc(name_len * 2 + 1, GFP_KERNEL);
+	if (!target)
+		return ERR_PTR(-ENOMEM);
+
+	utf8_len = utf16s_to_utf8s((const wchar_t *)name_start,
+				    name_len / sizeof(__le16),
+				    UTF16_LITTLE_ENDIAN, target,
+				    name_len * 2);
+	if (utf8_len < 0) {
+		kfree(target);
+		return ERR_PTR(-EINVAL);
+	}
+	target[utf8_len] = '\0';
+
+	/* Convert \ to / */
+	for (p = target; *p; p++) {
+		if (*p == '\\')
+			*p = '/';
+	}
+
+	/* Strip NT path prefixes: \??\ or \DosDevices\ (now /??/ or /DosDevices/) */
+	p = target;
+	if (strncmp(p, "/??/", 4) == 0)
+		p += 4;
+	else if (strncmp(p, "/DosDevices/", 12) == 0)
+		p += 12;
+
+	if (p != target) {
+		utf8_len = strlen(p);
+		memmove(target, p, utf8_len + 1);
+	}
+
+	return target;
+}
+
 /* ---- Inode operations ---- */
 
 static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
@@ -165,7 +260,9 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 
 	mutex_lock(&sess->transport_mutex);
 	ret = vmsmb_smb2_create(sess, path, FILE_READ_ATTRIBUTES,
-				VMSMB_FILE_OPEN, 0, &fid, &info);
+				VMSMB_FILE_OPEN,
+				VMSMB_FILE_OPEN_REPARSE_POINT,
+				&fid, &info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, &fid);
 	mutex_unlock(&sess->transport_mutex);
@@ -183,6 +280,48 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 
 	inode->i_ino = atomic64_inc_return(&vmsmb_ino_counter);
 	vmsmb_fill_inode(inode, &info);
+
+	/* Resolve symlink target for reparse points (CIFS caches at lookup) */
+	if (S_ISLNK(inode->i_mode)) {
+		void *reparse_buf;
+		u32 reparse_len;
+		char *target;
+
+		path = vmsmb_build_path(dentry);
+		if (IS_ERR(path)) {
+			iput(inode);
+			return ERR_CAST(path);
+		}
+
+		reparse_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
+		if (!reparse_buf) {
+			kfree(path);
+			iput(inode);
+			return ERR_PTR(-ENOMEM);
+		}
+
+		mutex_lock(&sess->transport_mutex);
+		ret = vmsmb_smb2_get_reparse(sess, path, reparse_buf,
+					      VMSMB_MAX_RESPONSE, &reparse_len);
+		mutex_unlock(&sess->transport_mutex);
+		kfree(path);
+
+		if (ret) {
+			kfree(reparse_buf);
+			iput(inode);
+			return ERR_PTR(ret);
+		}
+
+		target = vmsmb_parse_reparse(reparse_buf, reparse_len);
+		kfree(reparse_buf);
+
+		if (IS_ERR(target)) {
+			iput(inode);
+			return ERR_CAST(target);
+		}
+
+		VMSMB_I(inode)->symlink_target = target;
+	}
 
 	d_add(dentry, inode);
 	return NULL;
@@ -282,7 +421,6 @@ static int vmsmb_unlink(struct inode *dir, struct dentry *dentry)
 {
 	struct vmsmb_sb_info *sbi = VMSMB_SB(dir->i_sb);
 	struct vmsmb_session *sess = sbi->sess;
-	struct vmsmb_fid fid;
 	char *path;
 	int ret;
 
@@ -291,13 +429,7 @@ static int vmsmb_unlink(struct inode *dir, struct dentry *dentry)
 		return PTR_ERR(path);
 
 	mutex_lock(&sess->transport_mutex);
-	ret = vmsmb_smb2_create(sess, path, 0x00010000 /* DELETE */,
-				VMSMB_FILE_OPEN,
-				VMSMB_FILE_DELETE_ON_CLOSE |
-				VMSMB_FILE_NON_DIRECTORY,
-				&fid, NULL);
-	if (ret == 0)
-		vmsmb_smb2_close(sess, &fid);
+	ret = vmsmb_smb2_unlink(sess, path);
 	mutex_unlock(&sess->transport_mutex);
 
 	kfree(path);
@@ -373,6 +505,91 @@ static int vmsmb_rename(struct mnt_idmap *idmap,
 	return ret;
 }
 
+/*
+ * Read cached symlink target.
+ *
+ * Matches CIFS cifs_get_link() (fs/smb/client/cifsfs.c): the target
+ * is resolved and cached at lookup time, so get_link just returns
+ * the cached copy.
+ */
+static const char *vmsmb_get_link(struct dentry *dentry, struct inode *inode,
+				   struct delayed_call *done)
+{
+	char *target;
+
+	if (!dentry)
+		return ERR_PTR(-ECHILD);
+
+	target = VMSMB_I(inode)->symlink_target;
+	if (!target)
+		return ERR_PTR(-EOPNOTSUPP);
+
+	set_delayed_call(done, (void (*)(void *))kfree, kstrdup(target, GFP_KERNEL));
+	return VMSMB_I(inode)->symlink_target;
+}
+
+/*
+ * Create a symlink.
+ *
+ * Note: VSMB host currently denies FSCTL_SET_REPARSE_POINT with
+ * STATUS_ACCESS_DENIED (0xC0000022), so this will fail in practice.
+ */
+static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
+			  struct dentry *dentry, const char *target)
+{
+	struct vmsmb_sb_info *sbi = VMSMB_SB(dir->i_sb);
+	struct vmsmb_session *sess = sbi->sess;
+	struct vmsmb_fid fid;
+	struct vmsmb_file_info info;
+	struct inode *inode;
+	char *path;
+	int ret;
+
+	path = vmsmb_build_path(dentry);
+	if (IS_ERR(path))
+		return PTR_ERR(path);
+
+	mutex_lock(&sess->transport_mutex);
+	ret = vmsmb_smb2_create_symlink(sess, path, target);
+	mutex_unlock(&sess->transport_mutex);
+
+	if (ret) {
+		kfree(path);
+		return ret;
+	}
+
+	/* Re-stat to get inode attributes */
+	mutex_lock(&sess->transport_mutex);
+	ret = vmsmb_smb2_create(sess, path, FILE_READ_ATTRIBUTES,
+				VMSMB_FILE_OPEN,
+				VMSMB_FILE_OPEN_REPARSE_POINT,
+				&fid, &info);
+	if (ret == 0)
+		vmsmb_smb2_close(sess, &fid);
+	mutex_unlock(&sess->transport_mutex);
+
+	kfree(path);
+
+	if (ret)
+		return ret;
+
+	inode = new_inode(dir->i_sb);
+	if (!inode)
+		return -ENOMEM;
+
+	inode->i_ino = atomic64_inc_return(&vmsmb_ino_counter);
+	vmsmb_fill_inode(inode, &info);
+	VMSMB_I(inode)->symlink_target = kstrdup(target, GFP_KERNEL);
+
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+const struct inode_operations vmsmb_symlink_inode_ops = {
+	.get_link	= vmsmb_get_link,
+	.getattr	= vmsmb_getattr,
+};
+
 const struct inode_operations vmsmb_dir_inode_ops = {
 	.lookup		= vmsmb_lookup,
 	.getattr	= vmsmb_getattr,
@@ -381,6 +598,7 @@ const struct inode_operations vmsmb_dir_inode_ops = {
 	.unlink		= vmsmb_unlink,
 	.rmdir		= vmsmb_rmdir,
 	.rename		= vmsmb_rename,
+	.symlink	= vmsmb_symlink,
 };
 
 const struct inode_operations vmsmb_file_inode_ops = {
@@ -841,7 +1059,9 @@ static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 			     name_utf8[1] == '.'))
 				goto next_entry;
 
-			d_type = (attrs & FILE_ATTRIBUTE_DIRECTORY) ?
+			d_type = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) ?
+				 DT_LNK :
+				 (attrs & FILE_ATTRIBUTE_DIRECTORY) ?
 				 DT_DIR : DT_REG;
 
 			if (!dir_emit(ctx, name_utf8, utf8_len,
@@ -883,6 +1103,7 @@ static struct inode *vmsmb_alloc_inode(struct super_block *sb)
 		return NULL;
 
 	vi->active_ctx = NULL;
+	vi->symlink_target = NULL;
 	return &vi->netfs.inode;
 }
 
@@ -905,6 +1126,7 @@ static int vmsmb_statfs(struct dentry *dentry, struct kstatfs *buf)
 
 static void vmsmb_evict_inode(struct inode *inode)
 {
+	kfree(VMSMB_I(inode)->symlink_target);
 	netfs_wait_for_outstanding_io(inode);
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);

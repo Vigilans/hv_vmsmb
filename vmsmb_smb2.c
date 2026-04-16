@@ -933,3 +933,256 @@ close:
 	vmsmb_smb2_close(sess, &fid);
 	return ret;
 }
+
+/*
+ * SMB2 unlink — delete a file or reparse point.
+ *
+ * Port of CIFS smb2_unlink() (fs/smb/client/smb2inode.c:1108-1110):
+ * DELETE_ON_CLOSE + OPEN_REPARSE_POINT ensures reparse points are
+ * deleted rather than followed.
+ */
+int vmsmb_smb2_unlink(struct vmsmb_session *sess, const char *path)
+{
+	struct vmsmb_fid fid;
+	int ret;
+
+	ret = vmsmb_smb2_create(sess, path, 0x00010000 /* DELETE */,
+				0x01 /* FILE_OPEN */,
+				0x00201000 /* DELETE_ON_CLOSE | OPEN_REPARSE_POINT */,
+				&fid, NULL);
+	if (ret == 0)
+		vmsmb_smb2_close(sess, &fid);
+	return ret;
+}
+
+/*
+ * SMB2 IOCTL — generic file system control.
+ *
+ * Simplified from CIFS SMB2_ioctl() (fs/smb/client/smb2pdu.c).
+ * CIFS supports compound requests, async handling, and credit
+ * management. We do a single synchronous round-trip.
+ */
+int vmsmb_smb2_ioctl(struct vmsmb_session *sess, struct vmsmb_fid *fid,
+		      u32 ctl_code, const void *in, u32 in_len,
+		      void *out, u32 out_size, u32 *out_len)
+{
+	struct smb2_ioctl_req *req;
+	const struct smb2_ioctl_rsp *rsp;
+	const struct smb2_hdr *hdr;
+	u8 *pdu_buf, *resp_buf;
+	u32 pdu_len, resp_len, rsp_out_off, rsp_out_len;
+	int ret;
+
+	pdu_len = sizeof(*req) + in_len;
+	pdu_buf = kzalloc(pdu_len, GFP_KERNEL);
+	if (!pdu_buf)
+		return -ENOMEM;
+
+	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
+	if (!resp_buf) {
+		kfree(pdu_buf);
+		return -ENOMEM;
+	}
+
+	req = (struct smb2_ioctl_req *)pdu_buf;
+	vmsmb_fill_hdr(&req->hdr, SMB2_IOCTL_HE, sess);
+	req->StructureSize = cpu_to_le16(57);
+	req->CtlCode = cpu_to_le32(ctl_code);
+	req->PersistentFileId = fid->persistent;
+	req->VolatileFileId = fid->volatile_id;
+	req->InputOffset = cpu_to_le32(sizeof(*req));
+	req->InputCount = cpu_to_le32(in_len);
+	req->MaxInputResponse = 0;
+	req->OutputOffset = 0;
+	req->OutputCount = 0;
+	req->MaxOutputResponse = cpu_to_le32(out_size);
+	req->Flags = cpu_to_le32(0x00000001); /* SMB2_0_IOCTL_IS_FSCTL */
+	req->Reserved2 = 0;
+
+	if (in_len)
+		memcpy(req->Buffer, in, in_len);
+
+	ret = vmsmb_smb2_transact(sess, pdu_buf, pdu_len,
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	kfree(pdu_buf);
+	if (ret)
+		goto free_resp;
+
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
+	if (!hdr) {
+		ret = -EPROTO;
+		goto free_resp;
+	}
+
+	ret = vmsmb_check_status(hdr, "IOCTL");
+	if (ret)
+		goto free_resp;
+
+	rsp = (const struct smb2_ioctl_rsp *)resp_buf;
+	rsp_out_off = le32_to_cpu(rsp->OutputOffset);
+	rsp_out_len = le32_to_cpu(rsp->OutputCount);
+
+	if (rsp_out_off + rsp_out_len > resp_len) {
+		ret = -EPROTO;
+		goto free_resp;
+	}
+
+	if (rsp_out_len > out_size)
+		rsp_out_len = out_size;
+
+	if (out && rsp_out_len)
+		memcpy(out, (const u8 *)resp_buf + rsp_out_off, rsp_out_len);
+	if (out_len)
+		*out_len = rsp_out_len;
+
+free_resp:
+	kfree(resp_buf);
+	return ret;
+}
+
+/*
+ * Read reparse point data for a path.
+ *
+ * Simplified from CIFS smb2_query_reparse_point()
+ * (fs/smb/client/smb2ops.c). Opens with FILE_OPEN_REPARSE_POINT
+ * so CREATE returns metadata about the reparse point itself
+ * instead of following it.
+ */
+int vmsmb_smb2_get_reparse(struct vmsmb_session *sess, const char *path,
+			    void *buf, u32 buf_size, u32 *data_len)
+{
+	struct vmsmb_fid fid;
+	int ret;
+
+	ret = vmsmb_smb2_create(sess, path, FILE_READ_ATTRIBUTES,
+				0x01 /* FILE_OPEN */,
+				0x00200000 /* FILE_OPEN_REPARSE_POINT */,
+				&fid, NULL);
+	if (ret)
+		return ret;
+
+	ret = vmsmb_smb2_ioctl(sess, &fid, FSCTL_GET_REPARSE_POINT,
+			       NULL, 0, buf, buf_size, data_len);
+
+	vmsmb_smb2_close(sess, &fid);
+	return ret;
+}
+
+/*
+ * Create a symlink via NTFS reparse point.
+ *
+ * Simplified from CIFS create_native_symlink() (fs/smb/client/reparse.c).
+ * CIFS handles symlinkroot mapping, compound requests, and xattr
+ * contexts. We do: CREATE → IOCTL(SET_REPARSE_POINT) → CLOSE.
+ *
+ * Note: VSMB host currently denies FSCTL_SET_REPARSE_POINT with
+ * STATUS_ACCESS_DENIED (0xC0000022) for both Linux and Windows guests.
+ */
+int vmsmb_smb2_create_symlink(struct vmsmb_session *sess,
+			       const char *path, const char *target)
+{
+	struct vmsmb_fid fid;
+	struct reparse_symlink_data_buffer *sym;
+	__le16 *target_utf16;
+	int target_utf16_len;
+	u32 sym_len;
+	bool relative;
+	int ret;
+	char *nt_target;
+	int i, tlen;
+
+	/* Determine relative vs absolute */
+	relative = (target[0] != '/');
+
+	/* Build NT-style target path */
+	tlen = strlen(target);
+	if (!relative) {
+		/* Absolute: prepend \??\ */
+		nt_target = kmalloc(4 + tlen + 1, GFP_KERNEL);
+		if (!nt_target)
+			return -ENOMEM;
+		memcpy(nt_target, "\\??\\", 4);
+		memcpy(nt_target + 4, target + 1, tlen); /* skip leading / */
+		tlen = 4 + tlen - 1;
+		nt_target[tlen] = '\0';
+	} else {
+		nt_target = kmalloc(tlen + 1, GFP_KERNEL);
+		if (!nt_target)
+			return -ENOMEM;
+		memcpy(nt_target, target, tlen + 1);
+	}
+
+	/* Convert / to \ */
+	for (i = 0; i < tlen; i++)
+		if (nt_target[i] == '/')
+			nt_target[i] = '\\';
+
+	/* UTF-8 → UTF-16LE */
+	target_utf16 = kmalloc((tlen + 1) * sizeof(__le16), GFP_KERNEL);
+	if (!target_utf16) {
+		kfree(nt_target);
+		return -ENOMEM;
+	}
+
+	target_utf16_len = utf8s_to_utf16s(nt_target, tlen, UTF16_LITTLE_ENDIAN,
+					    (wchar_t *)target_utf16, tlen + 1);
+	kfree(nt_target);
+	if (target_utf16_len < 0) {
+		kfree(target_utf16);
+		return -EINVAL;
+	}
+	target_utf16_len *= sizeof(__le16);
+
+	/* CREATE new file */
+	ret = vmsmb_smb2_create(sess, path,
+				0x40000000 | 0x00010000, /* GENERIC_WRITE | DELETE */
+				0x02 /* FILE_CREATE */,
+				0x00200000 /* FILE_OPEN_REPARSE_POINT */,
+				&fid, NULL);
+	if (ret) {
+		kfree(target_utf16);
+		return ret;
+	}
+
+	/*
+	 * Build reparse_symlink_data_buffer.
+	 * SubstituteName and PrintName are identical, placed sequentially
+	 * in PathBuffer.
+	 */
+	sym_len = sizeof(*sym) + 2 * target_utf16_len;
+	sym = kzalloc(sym_len, GFP_KERNEL);
+	if (!sym) {
+		kfree(target_utf16);
+		ret = -ENOMEM;
+		goto close;
+	}
+
+	sym->ReparseTag = cpu_to_le32(IO_REPARSE_TAG_SYMLINK);
+	sym->ReparseDataLength = cpu_to_le16(12 + 2 * target_utf16_len);
+	sym->SubstituteNameOffset = cpu_to_le16(0);
+	sym->SubstituteNameLength = cpu_to_le16(target_utf16_len);
+	sym->PrintNameOffset = cpu_to_le16(target_utf16_len);
+	sym->PrintNameLength = cpu_to_le16(target_utf16_len);
+	sym->Flags = cpu_to_le32(relative ? SYMLINK_FLAG_RELATIVE : 0);
+
+	memcpy(sym->PathBuffer, target_utf16, target_utf16_len);
+	memcpy(sym->PathBuffer + target_utf16_len, target_utf16, target_utf16_len);
+	kfree(target_utf16);
+
+	ret = vmsmb_smb2_ioctl(sess, &fid, FSCTL_SET_REPARSE_POINT,
+			       sym, sym_len, NULL, 0, NULL);
+	kfree(sym);
+
+close:
+	vmsmb_smb2_close(sess, &fid);
+
+	/*
+	 * Clean up empty file on IOCTL failure.
+	 * Matches CIFS smb2_create_reparse_inode() → smb2_unlink()
+	 * (fs/smb/client/smb2inode.c:1418-1423).
+	 */
+	if (ret)
+		vmsmb_smb2_unlink(sess, path);
+
+	return ret;
+}
