@@ -133,7 +133,7 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 		return ERR_CAST(path);
 
 	mutex_lock(&sess->transport_mutex);
-	ret = vmsmb_smb2_create(sess, path, VMSMB_DIR_ACCESS,
+	ret = vmsmb_smb2_create(sess, path, FILE_READ_ATTRIBUTES,
 				VMSMB_FILE_OPEN, 0, &fid, &info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, &fid);
