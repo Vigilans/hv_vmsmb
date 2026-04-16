@@ -8,8 +8,9 @@ projects use GPL-2.0-compatible licenses.
 
 | Project | Files / API | License | What we use |
 |---------|-------------|---------|-------------|
-| **Linux CIFS client** (`fs/smb/client/`) | `smb2pdu.c`, `smb2maperror.c`, `smb2inode.c`, `cifsfs.c`, `inode.c` | LGPL-2.1 | Inode lifecycle patterns, NTSTATUS mapping, VFS integration |
-| **Linux CIFS common headers** (`fs/smb/common/`) | `smb2pdu.h`, `smb2status.h`, `fscc.h` | LGPL-2.1 | SMB2 struct definitions (copied, SPDX headers preserved) |
+| **Linux CIFS client** (`fs/smb/client/`) | `smb2pdu.c`, `smb2maperror.c`, `smb2inode.c`, `cifsfs.c`, `inode.c`, `reparse.c`, `link.c` | LGPL-2.1 | Inode lifecycle patterns, NTSTATUS mapping, VFS integration, reparse/symlink parsing, hardlink |
+| **Linux CIFS common headers** (`fs/smb/common/`) | `smb2pdu.h`, `smb2status.h`, `fscc.h`, `smbfsctl.h` | LGPL-2.1 | SMB2 struct definitions, FSCTL codes, reparse tags (copied, SPDX headers preserved) |
+| **Linux CIFS client headers** (`fs/smb/client/`) | `smb1pdu.h` | LGPL-2.1 | CreateDisposition / CreateOptions host-endian constants (subset extracted) |
 | **Linux hvsock** (`net/vmw_vsock/hyperv_transport.c`) | `hv_pkt_iter` recv loop | GPL-2.0-only | VMBus pipe-mode receive pattern |
 | **Linux kernel** (`lib/unicode.c`) | `utf8s_to_utf16s`, `utf16s_to_utf8s` | GPL-2.0 | UTF-8 / UTF-16LE conversion (called directly) |
 | **Linux netfs** (`fs/netfs/`) | `netfs_read_folio`, `netfs_writepages`, etc. | GPL-2.0 | Page cache read/write via standard netfs API |
@@ -34,15 +35,24 @@ projects use GPL-2.0-compatible licenses.
 
 | Code | Origin | Notes |
 |------|--------|-------|
-| `smb2pdu.h` / `smb2status.h` / `fscc.h` | **Copied** from CIFS `fs/smb/common/` | Struct definitions only; SPDX headers preserved |
-| `vmsmb_fill_hdr` | **Original** | Simplified from CIFS `smb2_plain_req_init()` + `fill_small_buf()` |
-| `vmsmb_check_resp` | **Original** | Simplified from CIFS `smb2_check_message()` |
+| `smb2pdu.h` / `smb2status.h` / `fscc.h` / `smbfsctl.h` | **Copied** from CIFS `fs/smb/common/` | Struct definitions, FSCTL codes, reparse tags; SPDX headers preserved |
+| `smb1pdu.h` | **Ported** (subset) from CIFS `fs/smb/client/smb1pdu.h` | CreateDisposition + CreateOptions host-endian constants |
+| `vmsmb_fill_hdr` | **Simplified** from CIFS `smb2_plain_req_init()` + `fill_small_buf()` | Skips signing, encryption, compound |
+| `vmsmb_check_resp` | **Simplified** from CIFS `smb2_check_message()` | Skips StructureSize, command match, signing validation |
 | `vmsmb_status_to_errno` | **Ported** from CIFS `smb2maperror.c` | ~40 NTSTATUS-to-errno entries |
-| NEGOTIATE / SESSION_SETUP | **Original** | Intentionally simplified (single dialect, no auth) |
+| NEGOTIATE / SESSION_SETUP | **Simplified** from CIFS | Single dialect, no auth (VSMB-specific) |
 | TREE_CONNECT | **Original** | UNC path `\\vsmb\<ShareName>` discovered via reverse engineering |
 | `vmsmb_path_to_utf16` | **Ported** from kernel `utf8s_to_utf16s()` | Corresponds to CIFS `cifs_strtoUTF16()`, without NLS/SFU/SFM |
-| CREATE / CLOSE / READ / WRITE / QUERY_DIR | **Original** | Fills SMB2 structs per spec; no compound/oplock/async |
-| SET_INFO (rename) | **Original** | Corresponds to CIFS `smb2_rename_path()`; simplified to CREATE+SET_INFO+CLOSE |
+| CREATE | **Simplified** from CIFS `SMB2_open()` | No create contexts, oplock, lease, compound |
+| CLOSE | **Ported** from CIFS `SMB2_close_flags()` | Skips optional `POSTQUERY_ATTRIB` flag |
+| READ / WRITE | **Simplified** from CIFS `smb2_async_readv()` / `smb2_async_writev()` | Synchronous, single credit charge |
+| QUERY_DIR | **Simplified** from CIFS `SMB2_query_directory()` | No resumption, single info class |
+| SET_INFO (rename) | **Simplified** from CIFS `smb2_rename_path()` | Three round-trips instead of compound |
+| SET_INFO (hardlink) | **Ported** from CIFS `smb2_create_hardlink()` | Same access mask + wire format |
+| `vmsmb_smb2_unlink` | **Ported** from CIFS `smb2_unlink()` | Same flags: `DELETE_ON_CLOSE \| OPEN_REPARSE_POINT` |
+| IOCTL | **Simplified** from CIFS `SMB2_ioctl()` | Single synchronous round-trip, no compound/async/credit |
+| `vmsmb_smb2_get_reparse` | **Ported** from CIFS `smb2_query_reparse_point()` | Same flags, separate CREATE+IOCTL+CLOSE |
+| `vmsmb_smb2_create_symlink` | **Simplified** from CIFS `create_native_symlink()` | No symlinkroot, directory detection, or xattr contexts |
 
 ### vmsmb_vfs.c
 
@@ -63,8 +73,16 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_build_path` | **Original** | CIFS has `build_path_from_dentry`, similar but simpler |
 | `vmsmb_lookup` | **Original** | Uses CREATE to probe; CIFS uses compound ops |
 | `vmsmb_create` / `vmsmb_mkdir` | **Original** | |
-| `vmsmb_unlink` / `vmsmb_rmdir` | **Original** | Uses `DELETE_ON_CLOSE`; CIFS uses `SET_INFO FileDispositionInfo` |
+| `vmsmb_unlink` | **Ported** from CIFS `smb2_unlink()` | Uses `vmsmb_smb2_unlink()`; same `DELETE_ON_CLOSE \| OPEN_REPARSE_POINT` flags |
+| `vmsmb_rmdir` | **Original** | Uses `DELETE_ON_CLOSE`; CIFS uses `SET_INFO FileDispositionInfo` |
 | `vmsmb_rename` | **Original** | Calls `vmsmb_smb2_rename()`, supports `RENAME_NOREPLACE` |
+| `vmsmb_link` | **Ported** from CIFS `cifs_hardlink()` | `d_drop()` + `inc_nlink()` under `i_lock` |
+| `vmsmb_symlink` | **Simplified** from CIFS `cifs_symlink()` | Calls `vmsmb_smb2_create_symlink()`; host denies in practice |
+| `vmsmb_get_link` | **Ported** from CIFS `cifs_get_link()` | Returns cached symlink target via `set_delayed_call` |
+| `vmsmb_fill_inode` (reparse) | **Ported** from CIFS `cifs_reparse_point_to_fattr()` | `FILE_ATTRIBUTE_REPARSE_POINT` → `S_IFLNK` |
+| `vmsmb_parse_reparse` | **Simplified** from CIFS `parse_reparse_point()` | Only handles `IO_REPARSE_TAG_SYMLINK` and `MOUNT_POINT`; skips NFS/WSL/AF_UNIX |
+| `vmsmb_lookup` (reparse) | **Ported** from CIFS pattern | `OPEN_REPARSE_POINT` + cache symlink target at lookup time |
+| `vmsmb_readdir` (reparse) | **Ported** from CIFS pattern | `FILE_ATTRIBUTE_REPARSE_POINT` → `DT_LNK` |
 | `vmsmb_file_open` / `release` | **Original** | Open flags to SMB2 disposition mapping |
 | `vmsmb_readdir` | **Original** | Parses `FILE_DIRECTORY_INFO` chain |
 | `vmsmb_utf16_name_to_utf8` | **Ported** from kernel `utf16s_to_utf8s()` | Corresponds to CIFS `cifs_from_utf16()`, without NLS/SFU/SFM |

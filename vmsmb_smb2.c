@@ -558,7 +558,7 @@ out:
 /*
  * SMB2 CLOSE.
  *
- * Matches CIFS SMB2_close_flags() (fs/smb/client/smb2pdu.c).
+ * Port of CIFS SMB2_close_flags() (fs/smb/client/smb2pdu.c).
  * We skip the SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB optimization.
  */
 int vmsmb_smb2_close(struct vmsmb_session *sess, struct vmsmb_fid *fid)
@@ -1137,7 +1137,7 @@ free_resp:
 /*
  * Read reparse point data for a path.
  *
- * Simplified from CIFS smb2_query_reparse_point()
+ * Port of CIFS smb2_query_reparse_point()
  * (fs/smb/client/smb2ops.c). Opens with FILE_OPEN_REPARSE_POINT
  * so CREATE returns metadata about the reparse point itself
  * instead of following it.

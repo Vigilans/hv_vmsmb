@@ -53,7 +53,7 @@ struct kmem_cache *vmsmb_inode_cachep;
  * lifetime — not on every alloc_inode call. Without this, those
  * list heads are {NULL, NULL} and any VFS operation that touches
  * them (mark_inode_dirty, iput) will NULL-deref.
- * Matches CIFS: cifs_init_once → inode_init_once.
+ * Port of CIFS cifs_init_once → inode_init_once.
  */
 void vmsmb_init_once(void *data)
 {
@@ -103,7 +103,7 @@ static void vmsmb_fill_inode(struct inode *inode,
 
 	/*
 	 * Initialize netfs context after VFS inode_init_always() has run
-	 * and inode size is set. Matches CIFS pattern: cifs_fattr_to_inode()
+	 * and inode size is set. Port of CIFS pattern: cifs_fattr_to_inode()
 	 * calls cifs_set_netfs_context() → netfs_inode_init() only after
 	 * filling all inode attributes.
 	 */
@@ -546,7 +546,7 @@ static int vmsmb_link(struct dentry *old_dentry, struct inode *dir,
 /*
  * Read cached symlink target.
  *
- * Matches CIFS cifs_get_link() (fs/smb/client/cifsfs.c): the target
+ * Port of CIFS cifs_get_link() (fs/smb/client/cifsfs.c): the target
  * is resolved and cached at lookup time, so get_link just returns
  * the cached copy.
  */
