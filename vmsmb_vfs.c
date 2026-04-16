@@ -662,6 +662,68 @@ const struct file_operations vmsmb_file_ops = {
 
 /* ---- Directory operations ---- */
 
+/*
+ * Convert a UTF-16LE filename to UTF-8 with surrogate pair support.
+ * Temporary implementation — should be replaced with a port of CIFS
+ * cifs_from_utf16() from cifs_unicode.c.
+ */
+static int vmsmb_utf16_name_to_utf8(char *dst, size_t dst_size,
+				    const char *src, size_t src_len)
+{
+	const __le16 *name = (const __le16 *)src;
+	size_t in_len = src_len / sizeof(__le16);
+	size_t out = 0;
+	size_t i = 0;
+
+	while (i < in_len) {
+		u32 cp = le16_to_cpu(name[i++]);
+		u8 bytes[4];
+		size_t nr_bytes;
+
+		if (cp >= 0xD800 && cp <= 0xDBFF && i < in_len) {
+			u32 low = le16_to_cpu(name[i]);
+
+			if (low >= 0xDC00 && low <= 0xDFFF) {
+				cp = 0x10000 + ((cp - 0xD800) << 10) +
+				     (low - 0xDC00);
+				i++;
+			} else {
+				cp = '?';
+			}
+		} else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+			cp = '?';
+		}
+
+		if (cp < 0x80) {
+			bytes[0] = cp;
+			nr_bytes = 1;
+		} else if (cp < 0x800) {
+			bytes[0] = 0xC0 | (cp >> 6);
+			bytes[1] = 0x80 | (cp & 0x3F);
+			nr_bytes = 2;
+		} else if (cp < 0x10000) {
+			bytes[0] = 0xE0 | (cp >> 12);
+			bytes[1] = 0x80 | ((cp >> 6) & 0x3F);
+			bytes[2] = 0x80 | (cp & 0x3F);
+			nr_bytes = 3;
+		} else {
+			bytes[0] = 0xF0 | (cp >> 18);
+			bytes[1] = 0x80 | ((cp >> 12) & 0x3F);
+			bytes[2] = 0x80 | ((cp >> 6) & 0x3F);
+			bytes[3] = 0x80 | (cp & 0x3F);
+			nr_bytes = 4;
+		}
+
+		if (out + nr_bytes >= dst_size)
+			break;
+		memcpy(dst + out, bytes, nr_bytes);
+		out += nr_bytes;
+	}
+
+	dst[out] = '\0';
+	return out;
+}
+
 static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
@@ -726,18 +788,12 @@ static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 			u32 attrs = le32_to_cpu(entry->ExtFileAttributes);
 			unsigned char d_type;
 			char name_utf8[256];
-			int i, utf8_len;
+			int utf8_len;
 
-			/* Convert UTF-16LE filename to UTF-8 (ASCII subset) */
-			utf8_len = name_len / 2;
-			if (utf8_len > (int)sizeof(name_utf8) - 1)
-				utf8_len = sizeof(name_utf8) - 1;
-			for (i = 0; i < utf8_len; i++) {
-				__le16 c;
-				memcpy(&c, entry->FileName + i * 2, 2);
-				name_utf8[i] = (char)le16_to_cpu(c);
-			}
-			name_utf8[utf8_len] = '\0';
+			utf8_len = vmsmb_utf16_name_to_utf8(name_utf8,
+						      sizeof(name_utf8),
+						      entry->FileName,
+						      name_len);
 
 			pr_debug("readdir: entry off=%u nlen=%u attrs=0x%x name='%s'\n",
 				offset, name_len, attrs, name_utf8);
