@@ -25,9 +25,11 @@ projects use GPL-2.0-compatible licenses.
 | `foreach_vmbus_pkt` recv loop | **Ported** from hvsock `hyperv_transport.c` | `hv_pkt_iter` API, `vmpipe_proto_header` parsing |
 | `max_pkt_size` setup | **Ported** from storvsc/netvsc | Standard VMBus driver pattern |
 | `vmbus_open` / `vmbus_close` | **Standard** VMBus API | |
-| `vmsmb_recv_response` (stream framing) | **Original** | SMB2 stream header parsing, reverse-engineered from VSMB protocol |
-| `vmsmb_send_recv` (sync model) | **Original** | hvsock is async; we use sync + mutex |
-| `vmsmb_smb2_transact` | **Original** | Wraps PipeHdr + StreamHdr, exposes pure SMB2 interface to upper layer |
+| `vmsmb_channel_cb` (parse + dispatch) | **Original** | Design inspired by libsmb2 pdu/callback model; implementation is VMBus tasklet-based, no code ported |
+| `vmsmb_process_data` (stream reassembly) | **Original** | DirectTCP frame splitting + SMB2 MessageId matching + per-request dispatch |
+| `vmsmb_request` struct | **Original** | Analogous to libsmb2 `smb2_pdu` / CIFS `mid_q_entry`; fields designed for VMBus transport |
+| `vmsmb_smb2_transact` (async) | **Original** | Per-request send + `wait_for_completion`; `send_mutex` only protects `vmbus_sendpacket` |
+| `vmsmb_send_recv_sync` | **Original** | Synchronous path retained for version negotiation only |
 | `vmsmb_negotiate_version` | **Original** | VSMB version protocol is entirely reverse-engineered |
 | EAGAIN retry + post-negotiate drain | **Original** | Discovered empirically |
 
@@ -94,8 +96,8 @@ projects use GPL-2.0-compatible licenses.
 
 | Category | Approximate % | Description |
 |----------|---------------|-------------|
-| Ported from upstream | ~20% | Inode lifecycle (CIFS), recv loop (hvsock), netfs aops/fops, struct headers |
-| Spec-conformant original | ~60% | SMB2 command construction, VFS ops, stream framing, mount logic |
+| Ported from upstream | ~15% | Inode lifecycle (CIFS), recv loop (hvsock), netfs aops/fops, struct headers |
+| Spec-conformant original | ~65% | SMB2 command construction, VFS ops, async transport (design inspired by libsmb2), mount logic |
 | Reverse-engineered original | ~20% | VSMB version protocol, UNC path format, 64K pipe MTU, post-negotiate drain |
 
 ## Protocol Discovery
@@ -120,4 +122,4 @@ public specification and were discovered through reverse engineering:
 | hvsock (`hyperv_transport.c`) | GPL-2.0-only | Yes |
 | Kernel `lib/unicode.c` | GPL-2.0 | Yes |
 | netfs (`fs/netfs/`) | GPL-2.0 | Yes |
-| libsmb2 (future async reference) | LGPL-2.1 | Yes |
+| libsmb2 (design reference) | LGPL-2.1 | Yes |
