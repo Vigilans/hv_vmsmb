@@ -353,8 +353,9 @@ int vmsmb_smb2_tree_connect(struct vmsmb_session *sess, const char *share_name)
 	rsp = (const struct smb2_tree_connect_rsp *)hdr;
 	sess->tree_id = le32_to_cpu(hdr->Id.SyncId.TreeId);
 
-	pr_info("TREE_CONNECT '%s': TreeId=%u ShareType=%u\n",
-		share_name, sess->tree_id, rsp->ShareType);
+	pr_info("TREE_CONNECT '%s': TreeId=%u ShareType=%u Capability=0x%x MaxAccess=0x%x\n",
+		share_name, sess->tree_id, rsp->ShareType,
+		le32_to_cpu(rsp->Capabilities), le32_to_cpu(rsp->MaximalAccess));
 
 out:
 	kfree(resp_buf);
