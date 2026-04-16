@@ -58,6 +58,8 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_smb2_create_symlink` | **Simplified** from CIFS `create_native_symlink()` | No symlinkroot, directory detection, or xattr contexts |
 | `vmsmb_smb2_queryfs` | **Simplified** from CIFS `smb2_queryfs()` | QUERY_INFO InfoType=FILESYSTEM, FileInfoClass=FS_FULL_SIZE_INFORMATION on share root; CIFS uses compound CREATE+QUERY+CLOSE, we use three round-trips |
 | `vmsmb_smb2_set_basic_info` | **Simplified** from CIFS `smb2_set_file_info_compound()` | SET_INFO InfoType=FILE, FileInfoClass=FILE_BASIC_INFORMATION; three round-trips (CREATE+SET_INFO+CLOSE) instead of CIFS compound |
+| `vmsmb_smb2_set_eof` | **Simplified** from CIFS `smb2_set_file_size()` | SET_INFO InfoType=FILE, FileInfoClass=FILE_END_OF_FILE_INFORMATION; three round-trips (CREATE+SET_INFO+CLOSE) instead of CIFS compound |
+| `vmsmb_smb2_flush` | **Ported** from CIFS `SMB2_flush()` | MS-SMB2 2.2.17, single round-trip |
 
 ### vmsmb_vfs.c
 
@@ -71,7 +73,7 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_aops` | **Standard** netfs API | `netfs_read_folio`, `netfs_readahead`, `netfs_writepages`, etc. |
 | `vmsmb_file_ops` (read/write) | **Standard** netfs API | `netfs_file_read_iter`, `netfs_unbuffered_write_iter` |
 | `.mmap = generic_file_mmap` | **Standard** VFS API | Page faults handled by netfs `read_folio` |
-| `vmsmb_fsync` | **Ported** from CIFS `cifs_fsync` pattern | `file_write_and_wait_range` |
+| `vmsmb_fsync` | **Ported** from CIFS `cifs_fsync` pattern | `file_write_and_wait_range` + SMB2 FLUSH via `vmsmb_smb2_flush()` |
 | `super_setup_bdi` | **Ported** from CIFS | Required for netfs writeback |
 | `fs_context` / mount options | **Standard** VFS `fs_context` API | `fs_parameter_spec` + `parse_param` |
 | `vmsmb_fill_inode` | **Original** | SMB2 attrs to inode; CIFS `cifs_fattr_to_inode` is much more complex |
@@ -94,7 +96,7 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_issue_read` / `issue_write` | **Original** | netfs callbacks; CIFS versions are async |
 | `vmsmb_statfs` | **Original** | Calls `vmsmb_smb2_queryfs()` and converts FS_FULL_SIZE_INFORMATION to `kstatfs` |
 | `vmsmb_getattr` | **Original** | `generic_fillattr` only, no server revalidation |
-| `vmsmb_setattr` | **Ported** from CIFS `cifs_setattr()` | Pushes atime/mtime/ctime via `vmsmb_smb2_set_basic_info()`; uid/gid/mode stay local; ATTR_SIZE falls through (TODO) |
+| `vmsmb_setattr` | **Ported** from CIFS `cifs_setattr()` | Pushes atime/mtime/ctime via `vmsmb_smb2_set_basic_info()` and size via `vmsmb_smb2_set_eof()` + `truncate_setsize()`; uid/gid/mode stay local |
 ## Summary
 
 | Category | Approximate % | Description |

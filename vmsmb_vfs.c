@@ -710,13 +710,11 @@ static inline u64 vmsmb_ts_to_filetime(struct timespec64 ts)
 
 /*
  * Push atime/mtime/ctime changes to the server via SMB2 SET_INFO
- * (FileBasicInformation). uid/gid/mode are kept local (matching CIFS
- * default without modefromsid). Size changes fall through to
- * simple_setattr and do not reach the server — truncate-push is a
- * separate gap (TODO).
+ * (FileBasicInformation), and size changes via SET_INFO
+ * (FileEndOfFileInformation). uid/gid/mode are kept local (matching CIFS
+ * default without modefromsid).
  *
- * Port of CIFS cifs_setattr() path (fs/smb/client/inode.c) which also
- * uses SET_INFO with FILE_BASIC_INFO to push timestamps.
+ * Port of CIFS cifs_setattr() path (fs/smb/client/inode.c).
  */
 static int vmsmb_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			 struct iattr *attr)
@@ -730,6 +728,21 @@ static int vmsmb_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	ret = setattr_prepare(idmap, dentry, attr);
 	if (ret)
 		return ret;
+
+	if (attr->ia_valid & ATTR_SIZE) {
+		loff_t newsize = attr->ia_size;
+
+		path = vmsmb_build_path(dentry);
+		if (IS_ERR(path))
+			return PTR_ERR(path);
+
+		ret = vmsmb_smb2_set_eof(sess, sbi->tree_id, path, newsize);
+		kfree(path);
+		if (ret)
+			return ret;
+
+		truncate_setsize(inode, newsize);
+	}
 
 	if (attr->ia_valid & (ATTR_ATIME | ATTR_MTIME | ATTR_CTIME)) {
 		FILE_BASIC_INFO binfo = {};
@@ -1101,18 +1114,25 @@ static loff_t vmsmb_file_llseek(struct file *file, loff_t offset, int whence)
 }
 
 /*
- * Flush dirty pages to server.
- * VSMB writes are synchronous, so once netfs writeback completes
- * the data is on the host.  Modelled after cifs_fsync.
+ * Flush dirty pages to server, then force host-side flush via SMB2 FLUSH.
+ * Modelled after cifs_fsync.
  */
 static int vmsmb_fsync(struct file *file, loff_t start, loff_t end,
 		       int datasync)
 {
+	struct vmsmb_file_ctx *ctx = file->private_data;
+	struct inode *inode = file_inode(file);
+	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
 	int ret;
 
 	ret = file_write_and_wait_range(file, start, end);
-	if (ret)
+	if (ret) {
 		pr_debug("fsync: write_and_wait error %d\n", ret);
+		return ret;
+	}
+
+	if (ctx)
+		ret = vmsmb_smb2_flush(sbi->sess, sbi->tree_id, &ctx->fid);
 	return ret;
 }
 

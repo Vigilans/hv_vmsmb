@@ -1453,3 +1453,126 @@ close:
 	vmsmb_smb2_close(sess, tree_id, &fid);
 	return ret;
 }
+/*
+ * SMB2 SET_INFO (FileEndOfFileInformation) — truncate/extend a file.
+ *
+ * Simplified from CIFS smb2_set_file_size() (fs/smb/client/smb2ops.c). CIFS
+ * may issue this as part of a compound; we do a CREATE+SET_INFO+CLOSE
+ * sequence.
+ *
+ * Payload is an 8-byte LE __le64 EndOfFile value (MS-FSCC 2.4.13).
+ */
+int vmsmb_smb2_set_eof(struct vmsmb_session *sess, u32 tree_id,
+		       const char *path, u64 eof)
+{
+	struct vmsmb_fid fid;
+	u8 *pdu_buf, *resp_buf;
+	struct smb2_set_info_req *req;
+	const struct smb2_hdr *hdr;
+	__le64 eof_le = cpu_to_le64(eof);
+	u32 buf_len, pdu_len, resp_len;
+	int ret;
+
+	ret = vmsmb_smb2_create(sess, tree_id, path, FILE_WRITE_DATA,
+				FILE_OPEN, 0, &fid, NULL);
+	if (ret)
+		return ret;
+
+	buf_len = sizeof(struct smb2_set_info_req) + sizeof(eof_le);
+	pdu_buf = kzalloc(buf_len, GFP_KERNEL);
+	if (!pdu_buf) {
+		ret = -ENOMEM;
+		goto close;
+	}
+
+	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
+	if (!resp_buf) {
+		kfree(pdu_buf);
+		ret = -ENOMEM;
+		goto close;
+	}
+
+	req = (struct smb2_set_info_req *)pdu_buf;
+	vmsmb_fill_hdr(&req->hdr, SMB2_SET_INFO_HE, sess, tree_id);
+	req->StructureSize = cpu_to_le16(33);
+	req->InfoType = SMB2_O_INFO_FILE;
+	req->FileInfoClass = FILE_END_OF_FILE_INFORMATION;
+	req->BufferLength = cpu_to_le32(sizeof(eof_le));
+	req->BufferOffset = cpu_to_le16(sizeof(struct smb2_set_info_req));
+	req->AdditionalInformation = 0;
+	req->PersistentFileId = fid.persistent;
+	req->VolatileFileId = fid.volatile_id;
+	memcpy(req->Buffer, &eof_le, sizeof(eof_le));
+
+	pdu_len = sizeof(struct smb2_set_info_req) + sizeof(eof_le);
+
+	ret = vmsmb_smb2_transact(sess, pdu_buf, pdu_len,
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	kfree(pdu_buf);
+	if (ret)
+		goto free_resp;
+
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
+	if (!hdr) {
+		ret = -EPROTO;
+		goto free_resp;
+	}
+
+	ret = vmsmb_check_status(hdr, "SET_INFO(eof)");
+
+free_resp:
+	kfree(resp_buf);
+close:
+	vmsmb_smb2_close(sess, tree_id, &fid);
+	return ret;
+}
+
+/*
+ * SMB2 FLUSH — force server-side flush of an open file.
+ *
+ * Port of CIFS SMB2_flush() (fs/smb/client/smb2pdu.c). MS-SMB2 2.2.17.
+ * Single round-trip, no body beyond the 24-byte request.
+ */
+int vmsmb_smb2_flush(struct vmsmb_session *sess, u32 tree_id,
+		     struct vmsmb_fid *fid)
+{
+	u8 *pdu_buf, *resp_buf;
+	struct smb2_flush_req *req;
+	const struct smb2_hdr *hdr;
+	u32 resp_len;
+	int ret;
+
+	pdu_buf = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!pdu_buf)
+		return -ENOMEM;
+
+	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
+	if (!resp_buf) {
+		kfree(pdu_buf);
+		return -ENOMEM;
+	}
+
+	req = (struct smb2_flush_req *)pdu_buf;
+	vmsmb_fill_hdr(&req->hdr, SMB2_FLUSH_HE, sess, tree_id);
+	req->StructureSize = cpu_to_le16(24);
+	req->PersistentFileId = fid->persistent;
+	req->VolatileFileId = fid->volatile_id;
+
+	ret = vmsmb_smb2_transact(sess, pdu_buf, sizeof(*req),
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	kfree(pdu_buf);
+	if (ret)
+		goto out;
+
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
+	if (!hdr) {
+		ret = -EPROTO;
+		goto out;
+	}
+
+	ret = vmsmb_check_status(hdr, "FLUSH");
+
+out:
+	kfree(resp_buf);
+	return ret;
+}

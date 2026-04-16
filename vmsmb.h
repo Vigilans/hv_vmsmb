@@ -276,6 +276,10 @@ int vmsmb_smb2_queryfs(struct vmsmb_session *sess, u32 tree_id,
 int vmsmb_smb2_set_basic_info(struct vmsmb_session *sess, u32 tree_id,
 			      const char *path,
 			      const FILE_BASIC_INFO *binfo);
+int vmsmb_smb2_set_eof(struct vmsmb_session *sess, u32 tree_id,
+		       const char *path, u64 eof);
+int vmsmb_smb2_flush(struct vmsmb_session *sess, u32 tree_id,
+		     struct vmsmb_fid *fid);
 
 /* vmsmb_vfs.c */
 extern struct file_system_type vmsmb_fs_type;
