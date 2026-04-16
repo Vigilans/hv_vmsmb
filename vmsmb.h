@@ -127,7 +127,6 @@ struct vmsmb_session {
 
 	/* SMB2 session state */
 	u64 session_id;
-	u32 tree_id;
 	u64 message_id;
 	u32 max_read_size;
 	u32 max_write_size;
@@ -200,31 +199,40 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 /* vmsmb_smb2.c */
 int vmsmb_smb2_negotiate(struct vmsmb_session *sess);
 int vmsmb_smb2_session_setup(struct vmsmb_session *sess);
-int vmsmb_smb2_tree_connect(struct vmsmb_session *sess, const char *share_name);
-int vmsmb_smb2_create(struct vmsmb_session *sess, const char *path,
+int vmsmb_smb2_tree_connect(struct vmsmb_session *sess, const char *share_name,
+			    u32 *tree_id_out);
+int vmsmb_smb2_create(struct vmsmb_session *sess, u32 tree_id,
+		      const char *path,
 		      u32 desired_access, u32 disposition, u32 create_options,
 		      struct vmsmb_fid *fid, struct vmsmb_file_info *info);
-int vmsmb_smb2_close(struct vmsmb_session *sess, struct vmsmb_fid *fid);
-int vmsmb_smb2_read(struct vmsmb_session *sess, struct vmsmb_fid *fid,
+int vmsmb_smb2_close(struct vmsmb_session *sess, u32 tree_id,
+		     struct vmsmb_fid *fid);
+int vmsmb_smb2_read(struct vmsmb_session *sess, u32 tree_id,
+		    struct vmsmb_fid *fid,
 		    u64 offset, u32 length, void *data, u32 *bytes_read);
-int vmsmb_smb2_write(struct vmsmb_session *sess, struct vmsmb_fid *fid,
+int vmsmb_smb2_write(struct vmsmb_session *sess, u32 tree_id,
+		     struct vmsmb_fid *fid,
 		     u64 offset, const void *data, u32 length,
 		     u32 *bytes_written);
-int vmsmb_smb2_query_dir(struct vmsmb_session *sess, struct vmsmb_fid *fid,
+int vmsmb_smb2_query_dir(struct vmsmb_session *sess, u32 tree_id,
+			 struct vmsmb_fid *fid,
 			 const char *pattern, void *buf, u32 buf_size,
 			 u32 *data_len);
-int vmsmb_smb2_rename(struct vmsmb_session *sess,
+int vmsmb_smb2_rename(struct vmsmb_session *sess, u32 tree_id,
 		       const char *old_path, const char *new_path,
 		       bool replace);
-int vmsmb_smb2_unlink(struct vmsmb_session *sess, const char *path);
-int vmsmb_smb2_hardlink(struct vmsmb_session *sess,
+int vmsmb_smb2_unlink(struct vmsmb_session *sess, u32 tree_id,
+		      const char *path);
+int vmsmb_smb2_hardlink(struct vmsmb_session *sess, u32 tree_id,
 			 const char *src_path, const char *link_path);
-int vmsmb_smb2_ioctl(struct vmsmb_session *sess, struct vmsmb_fid *fid,
+int vmsmb_smb2_ioctl(struct vmsmb_session *sess, u32 tree_id,
+		      struct vmsmb_fid *fid,
 		      u32 ctl_code, const void *in, u32 in_len,
 		      void *out, u32 out_size, u32 *out_len);
-int vmsmb_smb2_get_reparse(struct vmsmb_session *sess, const char *path,
+int vmsmb_smb2_get_reparse(struct vmsmb_session *sess, u32 tree_id,
+			    const char *path,
 			    void *buf, u32 buf_size, u32 *data_len);
-int vmsmb_smb2_create_symlink(struct vmsmb_session *sess,
+int vmsmb_smb2_create_symlink(struct vmsmb_session *sess, u32 tree_id,
 			       const char *path, const char *target);
 
 /* vmsmb_vfs.c */

@@ -25,7 +25,7 @@
  * encryption, and compound request support.
  */
 static void vmsmb_fill_hdr(struct smb2_hdr *hdr, u16 command,
-			    struct vmsmb_session *sess)
+			    struct vmsmb_session *sess, u32 tree_id)
 {
 	memset(hdr, 0, sizeof(*hdr));
 	hdr->ProtocolId = SMB2_PROTO_NUMBER;
@@ -34,7 +34,7 @@ static void vmsmb_fill_hdr(struct smb2_hdr *hdr, u16 command,
 	hdr->CreditCharge = cpu_to_le16(1);
 	hdr->CreditRequest = cpu_to_le16(64); /* request plenty of credits */
 	hdr->MessageId = cpu_to_le64(sess->message_id++);
-	hdr->Id.SyncId.TreeId = cpu_to_le32(sess->tree_id);
+	hdr->Id.SyncId.TreeId = cpu_to_le32(tree_id);
 	hdr->SessionId = cpu_to_le64(sess->session_id);
 }
 
@@ -220,7 +220,7 @@ int vmsmb_smb2_negotiate(struct vmsmb_session *sess)
 		return -ENOMEM;
 
 	memset(&pdu, 0, sizeof(pdu));
-	vmsmb_fill_hdr(&pdu.req.hdr, SMB2_NEGOTIATE_HE, sess);
+	vmsmb_fill_hdr(&pdu.req.hdr, SMB2_NEGOTIATE_HE, sess, 0);
 	pdu.req.StructureSize = cpu_to_le16(36);
 	pdu.req.DialectCount = cpu_to_le16(1);
 	pdu.req.SecurityMode = cpu_to_le16(0); /* no signing */
@@ -284,7 +284,7 @@ int vmsmb_smb2_session_setup(struct vmsmb_session *sess)
 		return -ENOMEM;
 
 	memset(&pdu, 0, sizeof(pdu));
-	vmsmb_fill_hdr(&pdu.hdr, SMB2_SESSION_SETUP_HE, sess);
+	vmsmb_fill_hdr(&pdu.hdr, SMB2_SESSION_SETUP_HE, sess, 0);
 	pdu.StructureSize = cpu_to_le16(25);
 	pdu.SecurityMode = 0;
 	pdu.Capabilities = cpu_to_le32(0);
@@ -370,7 +370,8 @@ static __le16 *vmsmb_path_to_utf16(const char *path, int *out_len)
  * VSMB uses a fixed UNC format \\vsmb\<ShareName> discovered
  * via reverse engineering of vmwp.exe.
  */
-int vmsmb_smb2_tree_connect(struct vmsmb_session *sess, const char *share_name)
+int vmsmb_smb2_tree_connect(struct vmsmb_session *sess, const char *share_name,
+			    u32 *tree_id_out)
 {
 	u8 *pdu_buf;
 	struct smb2_tree_connect_req *req;
@@ -406,7 +407,7 @@ int vmsmb_smb2_tree_connect(struct vmsmb_session *sess, const char *share_name)
 	}
 
 	req = (struct smb2_tree_connect_req *)pdu_buf;
-	vmsmb_fill_hdr(&req->hdr, SMB2_TREE_CONNECT_HE, sess);
+	vmsmb_fill_hdr(&req->hdr, SMB2_TREE_CONNECT_HE, sess, 0);
 	req->StructureSize = cpu_to_le16(9);
 	req->Flags = 0;
 	req->PathOffset = cpu_to_le16(sizeof(struct smb2_tree_connect_req));
@@ -440,10 +441,10 @@ int vmsmb_smb2_tree_connect(struct vmsmb_session *sess, const char *share_name)
 	}
 
 	rsp = (const struct smb2_tree_connect_rsp *)resp_buf;
-	sess->tree_id = le32_to_cpu(hdr->Id.SyncId.TreeId);
+	*tree_id_out = le32_to_cpu(hdr->Id.SyncId.TreeId);
 
 	pr_info("TREE_CONNECT '%s': TreeId=%u ShareType=%u Capability=0x%x MaxAccess=0x%x\n",
-		share_name, sess->tree_id, rsp->ShareType,
+		share_name, *tree_id_out, rsp->ShareType,
 		le32_to_cpu(rsp->Capabilities), le32_to_cpu(rsp->MaximalAccess));
 
 out:
@@ -458,7 +459,8 @@ out:
  * create contexts (oplock, lease, durable handle, query-on-create).
  * We send a plain CREATE with no contexts.
  */
-int vmsmb_smb2_create(struct vmsmb_session *sess, const char *path,
+int vmsmb_smb2_create(struct vmsmb_session *sess, u32 tree_id,
+		      const char *path,
 		      u32 desired_access, u32 disposition, u32 create_options,
 		      struct vmsmb_fid *fid, struct vmsmb_file_info *info)
 {
@@ -490,7 +492,7 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, const char *path,
 	}
 
 	req = (struct smb2_create_req *)pdu_buf;
-	vmsmb_fill_hdr(&req->hdr, SMB2_CREATE_HE, sess);
+	vmsmb_fill_hdr(&req->hdr, SMB2_CREATE_HE, sess, tree_id);
 	req->StructureSize = cpu_to_le16(57);
 	req->ImpersonationLevel = cpu_to_le32(0x02); /* Impersonation */
 	req->DesiredAccess = cpu_to_le32(desired_access);
@@ -561,7 +563,8 @@ out:
  * Port of CIFS SMB2_close_flags() (fs/smb/client/smb2pdu.c).
  * We skip the SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB optimization.
  */
-int vmsmb_smb2_close(struct vmsmb_session *sess, struct vmsmb_fid *fid)
+int vmsmb_smb2_close(struct vmsmb_session *sess, u32 tree_id,
+		     struct vmsmb_fid *fid)
 {
 	struct smb2_close_req pdu;
 	u8 *resp_buf;
@@ -574,7 +577,7 @@ int vmsmb_smb2_close(struct vmsmb_session *sess, struct vmsmb_fid *fid)
 		return -ENOMEM;
 
 	memset(&pdu, 0, sizeof(pdu));
-	vmsmb_fill_hdr(&pdu.hdr, SMB2_CLOSE_HE, sess);
+	vmsmb_fill_hdr(&pdu.hdr, SMB2_CLOSE_HE, sess, tree_id);
 	pdu.StructureSize = cpu_to_le16(24);
 	pdu.PersistentFileId = fid->persistent;
 	pdu.VolatileFileId = fid->volatile_id;
@@ -604,7 +607,8 @@ out:
  * uses async I/O with credit-based flow control. We do synchronous
  * reads with a single credit charge.
  */
-int vmsmb_smb2_read(struct vmsmb_session *sess, struct vmsmb_fid *fid,
+int vmsmb_smb2_read(struct vmsmb_session *sess, u32 tree_id,
+		    struct vmsmb_fid *fid,
 		    u64 offset, u32 length, void *data, u32 *bytes_read)
 {
 	struct smb2_read_req pdu;
@@ -625,7 +629,7 @@ int vmsmb_smb2_read(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 		return -ENOMEM;
 
 	memset(&pdu, 0, sizeof(pdu));
-	vmsmb_fill_hdr(&pdu.hdr, SMB2_READ_HE, sess);
+	vmsmb_fill_hdr(&pdu.hdr, SMB2_READ_HE, sess, tree_id);
 	pdu.StructureSize = cpu_to_le16(49);
 	pdu.Length = cpu_to_le32(length);
 	pdu.Offset = cpu_to_le64(offset);
@@ -676,7 +680,8 @@ out:
  * uses async I/O with credit-based flow control. We do synchronous
  * writes with a single credit charge.
  */
-int vmsmb_smb2_write(struct vmsmb_session *sess, struct vmsmb_fid *fid,
+int vmsmb_smb2_write(struct vmsmb_session *sess, u32 tree_id,
+		     struct vmsmb_fid *fid,
 		     u64 offset, const void *data, u32 length,
 		     u32 *bytes_written)
 {
@@ -706,7 +711,7 @@ int vmsmb_smb2_write(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 
 	memset(pdu_buf, 0, data_offset);
 	req = (struct smb2_write_req *)pdu_buf;
-	vmsmb_fill_hdr(&req->hdr, SMB2_WRITE_HE, sess);
+	vmsmb_fill_hdr(&req->hdr, SMB2_WRITE_HE, sess, tree_id);
 	req->StructureSize = cpu_to_le16(49);
 	req->DataOffset = cpu_to_le16(data_offset);
 	req->Length = cpu_to_le32(length);
@@ -750,7 +755,8 @@ out:
  * supports resumption via FileIndex and multiple info classes.
  * We always restart scans and use FileDirectoryInformation only.
  */
-int vmsmb_smb2_query_dir(struct vmsmb_session *sess, struct vmsmb_fid *fid,
+int vmsmb_smb2_query_dir(struct vmsmb_session *sess, u32 tree_id,
+			 struct vmsmb_fid *fid,
 			 const char *pattern, void *buf, u32 buf_size,
 			 u32 *data_len)
 {
@@ -785,7 +791,7 @@ int vmsmb_smb2_query_dir(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 	}
 
 	req = (struct smb2_query_directory_req *)pdu_buf;
-	vmsmb_fill_hdr(&req->hdr, SMB2_QUERY_DIRECTORY_HE, sess);
+	vmsmb_fill_hdr(&req->hdr, SMB2_QUERY_DIRECTORY_HE, sess, tree_id);
 	req->StructureSize = cpu_to_le16(33);
 	req->FileInformationClass = 1; /* FileDirectoryInformation */
 	req->Flags = SMB2_RESTART_SCANS;
@@ -845,7 +851,7 @@ out:
  * @new_path: target path relative to share root
  * @replace:  if true, replace existing target (RENAME_NOREPLACE inverts this)
  */
-int vmsmb_smb2_rename(struct vmsmb_session *sess,
+int vmsmb_smb2_rename(struct vmsmb_session *sess, u32 tree_id,
 		       const char *old_path, const char *new_path,
 		       bool replace)
 {
@@ -860,7 +866,7 @@ int vmsmb_smb2_rename(struct vmsmb_session *sess,
 	int ret;
 
 	/* Step 1: Open source with DELETE access */
-	ret = vmsmb_smb2_create(sess, old_path, DELETE,
+	ret = vmsmb_smb2_create(sess, tree_id, old_path, DELETE,
 				FILE_OPEN, 0, &fid, NULL);
 	if (ret)
 		return ret;
@@ -891,7 +897,7 @@ int vmsmb_smb2_rename(struct vmsmb_session *sess,
 	}
 
 	req = (struct smb2_set_info_req *)pdu_buf;
-	vmsmb_fill_hdr(&req->hdr, SMB2_SET_INFO_HE, sess);
+	vmsmb_fill_hdr(&req->hdr, SMB2_SET_INFO_HE, sess, tree_id);
 	req->StructureSize = cpu_to_le16(33);
 	req->InfoType = SMB2_O_INFO_FILE;
 	req->FileInfoClass = FILE_RENAME_INFORMATION;
@@ -932,7 +938,7 @@ free_resp:
 	kfree(resp_buf);
 close:
 	/* Step 3: Close handle */
-	vmsmb_smb2_close(sess, &fid);
+	vmsmb_smb2_close(sess, tree_id, &fid);
 	return ret;
 }
 
@@ -944,7 +950,7 @@ close:
  * FILE_LINK_INFORMATION (level 11). Same wire format as rename
  * (FILE_RENAME_INFORMATION, level 10) but ReplaceIfExists is always 0.
  */
-int vmsmb_smb2_hardlink(struct vmsmb_session *sess,
+int vmsmb_smb2_hardlink(struct vmsmb_session *sess, u32 tree_id,
 			 const char *src_path, const char *link_path)
 {
 	struct vmsmb_fid fid;
@@ -957,7 +963,7 @@ int vmsmb_smb2_hardlink(struct vmsmb_session *sess,
 	u32 link_info_len, buf_len, pdu_len, resp_len;
 	int ret;
 
-	ret = vmsmb_smb2_create(sess, src_path, FILE_READ_ATTRIBUTES,
+	ret = vmsmb_smb2_create(sess, tree_id, src_path, FILE_READ_ATTRIBUTES,
 				FILE_OPEN, 0, &fid, NULL);
 	if (ret)
 		return ret;
@@ -986,7 +992,7 @@ int vmsmb_smb2_hardlink(struct vmsmb_session *sess,
 	}
 
 	req = (struct smb2_set_info_req *)pdu_buf;
-	vmsmb_fill_hdr(&req->hdr, SMB2_SET_INFO_HE, sess);
+	vmsmb_fill_hdr(&req->hdr, SMB2_SET_INFO_HE, sess, tree_id);
 	req->StructureSize = cpu_to_le16(33);
 	req->InfoType = SMB2_O_INFO_FILE;
 	req->FileInfoClass = FILE_LINK_INFORMATION;
@@ -1024,7 +1030,7 @@ int vmsmb_smb2_hardlink(struct vmsmb_session *sess,
 hfree_resp:
 	kfree(resp_buf);
 hclose:
-	vmsmb_smb2_close(sess, &fid);
+	vmsmb_smb2_close(sess, tree_id, &fid);
 	return ret;
 }
 
@@ -1035,17 +1041,18 @@ hclose:
  * DELETE_ON_CLOSE + OPEN_REPARSE_POINT ensures reparse points are
  * deleted rather than followed.
  */
-int vmsmb_smb2_unlink(struct vmsmb_session *sess, const char *path)
+int vmsmb_smb2_unlink(struct vmsmb_session *sess, u32 tree_id,
+		      const char *path)
 {
 	struct vmsmb_fid fid;
 	int ret;
 
-	ret = vmsmb_smb2_create(sess, path, DELETE,
+	ret = vmsmb_smb2_create(sess, tree_id, path, DELETE,
 				FILE_OPEN,
 				CREATE_DELETE_ON_CLOSE | OPEN_REPARSE_POINT,
 				&fid, NULL);
 	if (ret == 0)
-		vmsmb_smb2_close(sess, &fid);
+		vmsmb_smb2_close(sess, tree_id, &fid);
 	return ret;
 }
 
@@ -1056,7 +1063,8 @@ int vmsmb_smb2_unlink(struct vmsmb_session *sess, const char *path)
  * CIFS supports compound requests, async handling, and credit
  * management. We do a single synchronous round-trip.
  */
-int vmsmb_smb2_ioctl(struct vmsmb_session *sess, struct vmsmb_fid *fid,
+int vmsmb_smb2_ioctl(struct vmsmb_session *sess, u32 tree_id,
+		      struct vmsmb_fid *fid,
 		      u32 ctl_code, const void *in, u32 in_len,
 		      void *out, u32 out_size, u32 *out_len)
 {
@@ -1079,7 +1087,7 @@ int vmsmb_smb2_ioctl(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 	}
 
 	req = (struct smb2_ioctl_req *)pdu_buf;
-	vmsmb_fill_hdr(&req->hdr, SMB2_IOCTL_HE, sess);
+	vmsmb_fill_hdr(&req->hdr, SMB2_IOCTL_HE, sess, tree_id);
 	req->StructureSize = cpu_to_le16(57);
 	req->CtlCode = cpu_to_le32(ctl_code);
 	req->PersistentFileId = fid->persistent;
@@ -1142,23 +1150,24 @@ free_resp:
  * so CREATE returns metadata about the reparse point itself
  * instead of following it.
  */
-int vmsmb_smb2_get_reparse(struct vmsmb_session *sess, const char *path,
+int vmsmb_smb2_get_reparse(struct vmsmb_session *sess, u32 tree_id,
+			    const char *path,
 			    void *buf, u32 buf_size, u32 *data_len)
 {
 	struct vmsmb_fid fid;
 	int ret;
 
-	ret = vmsmb_smb2_create(sess, path, FILE_READ_ATTRIBUTES,
+	ret = vmsmb_smb2_create(sess, tree_id, path, FILE_READ_ATTRIBUTES,
 				FILE_OPEN,
 				OPEN_REPARSE_POINT,
 				&fid, NULL);
 	if (ret)
 		return ret;
 
-	ret = vmsmb_smb2_ioctl(sess, &fid, FSCTL_GET_REPARSE_POINT,
+	ret = vmsmb_smb2_ioctl(sess, tree_id, &fid, FSCTL_GET_REPARSE_POINT,
 			       NULL, 0, buf, buf_size, data_len);
 
-	vmsmb_smb2_close(sess, &fid);
+	vmsmb_smb2_close(sess, tree_id, &fid);
 	return ret;
 }
 
@@ -1172,7 +1181,7 @@ int vmsmb_smb2_get_reparse(struct vmsmb_session *sess, const char *path,
  * Note: VSMB host currently denies FSCTL_SET_REPARSE_POINT with
  * STATUS_ACCESS_DENIED (0xC0000022) for both Linux and Windows guests.
  */
-int vmsmb_smb2_create_symlink(struct vmsmb_session *sess,
+int vmsmb_smb2_create_symlink(struct vmsmb_session *sess, u32 tree_id,
 			       const char *path, const char *target)
 {
 	struct vmsmb_fid fid;
@@ -1228,7 +1237,7 @@ int vmsmb_smb2_create_symlink(struct vmsmb_session *sess,
 	target_utf16_len *= sizeof(__le16);
 
 	/* CREATE new file */
-	ret = vmsmb_smb2_create(sess, path,
+	ret = vmsmb_smb2_create(sess, tree_id, path,
 				GENERIC_WRITE | DELETE,
 				FILE_CREATE,
 				OPEN_REPARSE_POINT,
@@ -1263,12 +1272,12 @@ int vmsmb_smb2_create_symlink(struct vmsmb_session *sess,
 	memcpy(sym->PathBuffer + target_utf16_len, target_utf16, target_utf16_len);
 	kfree(target_utf16);
 
-	ret = vmsmb_smb2_ioctl(sess, &fid, FSCTL_SET_REPARSE_POINT,
+	ret = vmsmb_smb2_ioctl(sess, tree_id, &fid, FSCTL_SET_REPARSE_POINT,
 			       sym, sym_len, NULL, 0, NULL);
 	kfree(sym);
 
 close:
-	vmsmb_smb2_close(sess, &fid);
+	vmsmb_smb2_close(sess, tree_id, &fid);
 
 	/*
 	 * Clean up empty file on IOCTL failure.
@@ -1276,7 +1285,7 @@ close:
 	 * (fs/smb/client/smb2inode.c:1418-1423).
 	 */
 	if (ret)
-		vmsmb_smb2_unlink(sess, path);
+		vmsmb_smb2_unlink(sess, tree_id, path);
 
 	return ret;
 }
