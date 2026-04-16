@@ -133,6 +133,10 @@ struct vmsmb_sb_info {
 	struct vmsmb_session *sess;
 	char *share_name;
 	u32 tree_id;
+	kuid_t uid;		/* owner uid for all inodes (mount-time) */
+	kgid_t gid;		/* owner gid for all inodes (mount-time) */
+	umode_t file_mode;	/* permission bits for files */
+	umode_t dir_mode;	/* permission bits for directories */
 };
 
 /*

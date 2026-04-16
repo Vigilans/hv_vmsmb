@@ -58,18 +58,23 @@ static inline struct vmsmb_sb_info *VMSMB_SB(struct super_block *sb)
 static void vmsmb_fill_inode(struct inode *inode,
 			     const struct vmsmb_file_info *info)
 {
+	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
+
 	if (info->attributes & FILE_ATTRIBUTE_DIRECTORY) {
-		inode->i_mode = S_IFDIR | 0755;
+		inode->i_mode = S_IFDIR | sbi->dir_mode;
 		inode->i_op = &vmsmb_dir_inode_ops;
 		inode->i_fop = &vmsmb_dir_ops;
 		set_nlink(inode, 2);
 	} else {
-		inode->i_mode = S_IFREG | 0644;
+		inode->i_mode = S_IFREG | sbi->file_mode;
 		inode->i_op = &vmsmb_file_inode_ops;
 		inode->i_fop = &vmsmb_file_ops;
 		inode->i_mapping->a_ops = &vmsmb_aops;
 		set_nlink(inode, 1);
 	}
+
+	inode->i_uid = sbi->uid;
+	inode->i_gid = sbi->gid;
 
 	i_size_write(inode, info->size);
 	inode->i_blocks = (info->alloc_size + 511) / 512;
@@ -883,6 +888,10 @@ static int vmsmb_get_tree(struct fs_context *fc)
 		return -ENOMEM;
 
 	sbi->sess = sess;
+	sbi->uid = current_fsuid();
+	sbi->gid = current_fsgid();
+	sbi->file_mode = S_IRUGO | S_IXUGO | S_IWUSR; /* 0755 */
+	sbi->dir_mode = S_IRUGO | S_IXUGO | S_IWUSR;  /* 0755 */
 	sbi->share_name = kstrdup(dev_name, GFP_KERNEL);
 	if (!sbi->share_name) {
 		kfree(sbi);
