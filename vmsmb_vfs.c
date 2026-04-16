@@ -248,14 +248,14 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 	if (IS_ERR(path))
 		return ERR_CAST(path);
 
-	mutex_lock(&sess->transport_mutex);
+
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, FILE_READ_ATTRIBUTES,
 				FILE_OPEN,
 				OPEN_REPARSE_POINT,
 				&fid, &info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, sbi->tree_id, &fid);
-	mutex_unlock(&sess->transport_mutex);
+
 
 	kfree(path);
 
@@ -290,10 +290,10 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 			return ERR_PTR(-ENOMEM);
 		}
 
-		mutex_lock(&sess->transport_mutex);
+	
 		ret = vmsmb_smb2_get_reparse(sess, sbi->tree_id, path, reparse_buf,
 					      VMSMB_MAX_RESPONSE, &reparse_len);
-		mutex_unlock(&sess->transport_mutex);
+	
 		kfree(path);
 
 		if (ret) {
@@ -343,13 +343,13 @@ static int vmsmb_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 
-	mutex_lock(&sess->transport_mutex);
+
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, VMSMB_RW_ACCESS,
 				excl ? FILE_CREATE : FILE_OPEN_IF,
 				CREATE_NOT_DIR, &fid, &info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, sbi->tree_id, &fid);
-	mutex_unlock(&sess->transport_mutex);
+
 
 	kfree(path);
 
@@ -382,13 +382,13 @@ static struct dentry *vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	if (IS_ERR(path))
 		return ERR_CAST(path);
 
-	mutex_lock(&sess->transport_mutex);
+
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, VMSMB_DIR_ACCESS,
 				FILE_CREATE, CREATE_NOT_FILE,
 				&fid, &info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, sbi->tree_id, &fid);
-	mutex_unlock(&sess->transport_mutex);
+
 
 	kfree(path);
 
@@ -418,9 +418,9 @@ static int vmsmb_unlink(struct inode *dir, struct dentry *dentry)
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 
-	mutex_lock(&sess->transport_mutex);
+
 	ret = vmsmb_smb2_unlink(sess, sbi->tree_id, path);
-	mutex_unlock(&sess->transport_mutex);
+
 
 	kfree(path);
 
@@ -441,7 +441,7 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 
-	mutex_lock(&sess->transport_mutex);
+
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, 0x00010000 /* DELETE */,
 				FILE_OPEN,
 				CREATE_DELETE_ON_CLOSE |
@@ -449,7 +449,7 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 				&fid, NULL);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, sbi->tree_id, &fid);
-	mutex_unlock(&sess->transport_mutex);
+
 
 	kfree(path);
 
@@ -486,9 +486,9 @@ static int vmsmb_rename(struct mnt_idmap *idmap,
 
 	replace = !(flags & RENAME_NOREPLACE);
 
-	mutex_lock(&sess->transport_mutex);
+
 	ret = vmsmb_smb2_rename(sess, sbi->tree_id, old_path, new_path, replace);
-	mutex_unlock(&sess->transport_mutex);
+
 
 	kfree(old_path);
 	kfree(new_path);
@@ -520,9 +520,9 @@ static int vmsmb_link(struct dentry *old_dentry, struct inode *dir,
 		return PTR_ERR(new_path);
 	}
 
-	mutex_lock(&sess->transport_mutex);
+
 	ret = vmsmb_smb2_hardlink(sess, sbi->tree_id, old_path, new_path);
-	mutex_unlock(&sess->transport_mutex);
+
 
 	if ((ret == -EIO) || (ret == -EINVAL))
 		ret = -EOPNOTSUPP;
@@ -587,9 +587,9 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 
-	mutex_lock(&sess->transport_mutex);
+
 	ret = vmsmb_smb2_create_symlink(sess, sbi->tree_id, path, target);
-	mutex_unlock(&sess->transport_mutex);
+
 
 	if (ret) {
 		kfree(path);
@@ -597,14 +597,14 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	}
 
 	/* Re-stat to get inode attributes */
-	mutex_lock(&sess->transport_mutex);
+
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, FILE_READ_ATTRIBUTES,
 				FILE_OPEN,
 				OPEN_REPARSE_POINT,
 				&fid, &info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, sbi->tree_id, &fid);
-	mutex_unlock(&sess->transport_mutex);
+
 
 	kfree(path);
 
@@ -709,11 +709,11 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 			subreq->error = PTR_ERR(path);
 			goto out;
 		}
-		mutex_lock(&sess->transport_mutex);
+	
 		ret = vmsmb_smb2_create(sess, sbi->tree_id, path, VMSMB_READ_ACCESS,
 					FILE_OPEN, CREATE_NOT_DIR,
 					&temp_fid, NULL);
-		mutex_unlock(&sess->transport_mutex);
+	
 		kfree(path);
 		if (ret) {
 			subreq->error = ret;
@@ -733,9 +733,9 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 		u32 chunk = min_t(size_t, remain, VMSMB_MAX_READ_CHUNK);
 		u32 bytes_read = 0;
 
-		mutex_lock(&sess->transport_mutex);
+	
 		ret = vmsmb_smb2_read(sess, sbi->tree_id, fid, pos, chunk, buf, &bytes_read);
-		mutex_unlock(&sess->transport_mutex);
+	
 
 		if (ret)
 			break;
@@ -763,9 +763,9 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 
 close:
 	if (temp_open) {
-		mutex_lock(&sess->transport_mutex);
+	
 		vmsmb_smb2_close(sess, sbi->tree_id, &temp_fid);
-		mutex_unlock(&sess->transport_mutex);
+	
 	}
 out:
 	netfs_read_subreq_terminated(subreq);
@@ -813,11 +813,11 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 			ret = PTR_ERR(path);
 			goto fail;
 		}
-		mutex_lock(&sess->transport_mutex);
+	
 		ret = vmsmb_smb2_create(sess, sbi->tree_id, path, VMSMB_WRITE_ACCESS,
 					FILE_OPEN, CREATE_NOT_DIR,
 					&temp_fid, NULL);
-		mutex_unlock(&sess->transport_mutex);
+	
 		kfree(path);
 		if (ret)
 			goto fail;
@@ -842,10 +842,10 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 			break;
 		}
 
-		mutex_lock(&sess->transport_mutex);
+	
 		ret = vmsmb_smb2_write(sess, sbi->tree_id, fid, pos, buf, copied,
 				       &bytes_written);
-		mutex_unlock(&sess->transport_mutex);
+	
 
 		if (ret)
 			break;
@@ -862,9 +862,9 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 
 close:
 	if (temp_open) {
-		mutex_lock(&sess->transport_mutex);
+	
 		vmsmb_smb2_close(sess, sbi->tree_id, &temp_fid);
-		mutex_unlock(&sess->transport_mutex);
+	
 	}
 fail:
 	netfs_write_subrequest_terminated(subreq,
@@ -919,11 +919,11 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 		disposition = FILE_OPEN;
 	}
 
-	mutex_lock(&sess->transport_mutex);
+
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, access, disposition,
 				CREATE_NOT_DIR,
 				&ctx->fid, &info);
-	mutex_unlock(&sess->transport_mutex);
+
 
 	kfree(path);
 
@@ -950,9 +950,9 @@ static int vmsmb_file_release(struct inode *inode, struct file *file)
 		if (VMSMB_I(inode)->active_ctx == ctx)
 			VMSMB_I(inode)->active_ctx = NULL;
 
-		mutex_lock(&sess->transport_mutex);
+	
 		vmsmb_smb2_close(sess, sbi->tree_id, &ctx->fid);
-		mutex_unlock(&sess->transport_mutex);
+	
 		kfree(ctx);
 	}
 	return 0;
@@ -1048,12 +1048,12 @@ static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 	}
 
 	/* Open directory */
-	mutex_lock(&sess->transport_mutex);
+
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, VMSMB_DIR_ACCESS,
 				FILE_OPEN, CREATE_NOT_FILE,
 				&fid, NULL);
 	if (ret) {
-		mutex_unlock(&sess->transport_mutex);
+	
 		pr_err("readdir: CREATE '%s' failed: %d\n", path, ret);
 		kfree(path);
 		kfree(buf);
@@ -1119,7 +1119,7 @@ next_entry:
 
 	/* Close directory */
 	vmsmb_smb2_close(sess, sbi->tree_id, &fid);
-	mutex_unlock(&sess->transport_mutex);
+
 
 	kfree(path);
 	kfree(buf);
@@ -1207,13 +1207,13 @@ static int vmsmb_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_flags |= SB_ACTIVE;
 
 	/* Query root directory attributes — empty path = share root */
-	mutex_lock(&sess->transport_mutex);
+
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, "", FILE_READ_ATTRIBUTES,
 				FILE_OPEN, CREATE_NOT_FILE,
 				&root_fid, &root_info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, sbi->tree_id, &root_fid);
-	mutex_unlock(&sess->transport_mutex);
+
 
 	if (ret) {
 		pr_err("failed to open share root: %d\n", ret);
@@ -1355,9 +1355,9 @@ static int vmsmb_get_tree(struct fs_context *fc)
 	}
 
 	/* TREE_CONNECT to the requested share */
-	mutex_lock(&sess->transport_mutex);
+
 	ret = vmsmb_smb2_tree_connect(sess, dev_name, &sbi->tree_id);
-	mutex_unlock(&sess->transport_mutex);
+
 
 	if (ret) {
 		pr_err("TREE_CONNECT '%s' failed: %d\n", dev_name, ret);

@@ -2,13 +2,19 @@
 /*
  * vmsmb_transport.c - VMBus ring buffer transport for VSMB
  *
- * Handles channel open/close and synchronous send/receive over VMBus.
+ * Handles channel open/close and asynchronous send/receive over VMBus.
  *
- * Receive path follows the hvsock (hyperv_transport.c) pattern: iterate
- * ring buffer entries with hv_pkt_iter, parse the vmpipe_proto_header
- * in each entry, skip notifications (pkt_type=0), accumulate data
- * payloads (pkt_type=1). No overflow buffer, no magic scanning —
- * each VMBus ring entry is one self-contained pipe message.
+ * Receive path: the VMBus channel callback iterates ring buffer entries
+ * with hv_pkt_iter, parses vmpipe_proto_header + DirectTCP stream header,
+ * matches responses to pending requests by SMB2 MessageId, and completes
+ * them. Multiple requests can be in-flight simultaneously.
+ *
+ * Send path: vmbus_sendpacket is serialized by send_mutex (ring buffer
+ * write is not concurrent-safe), but the mutex is only held during the
+ * send — not during the response wait.
+ *
+ * Version negotiation (pre-SMB2) uses a separate synchronous path since
+ * there is no concurrency at that point.
  */
 
 #define pr_fmt(fmt) "hv_vmsmb: " fmt
@@ -20,10 +26,211 @@
 #include "vmsmb.h"
 #include "smb2pdu.h"
 
+/*
+ * Find a pending request by SMB2 MessageId.
+ * Must be called with sess->pending_lock held.
+ *
+ * Analogous to CIFS __smb2_find_mid() (fs/smb/client/smb2transport.c).
+ */
+static struct vmsmb_request *
+vmsmb_find_request(struct vmsmb_session *sess, u64 message_id)
+{
+	struct vmsmb_request *req;
+
+	list_for_each_entry(req, &sess->pending_requests, list) {
+		if (req->message_id == message_id)
+			return req;
+	}
+	return NULL;
+}
+
+/*
+ * Process one vmpipe DATA payload chunk in the channel callback.
+ *
+ * The VSMB byte stream is: [StreamHdr(4)] [SMB2 PDU(N)] per response.
+ * Multiple responses arrive sequentially (no interleaving).
+ *
+ * sess->current_recv tracks the request currently being received.
+ * When NULL, we're at the start of a new response and need to parse
+ * StreamHdr + SMB2 header to extract MessageId for dispatch.
+ */
+static void vmsmb_process_data(struct vmsmb_session *sess,
+				const u8 *data, u32 len)
+{
+	while (len > 0) {
+		struct vmsmb_request *req = sess->current_recv;
+
+		if (!req) {
+			/*
+			 * Starting a new response. We need at least
+			 * StreamHdr(4) + SMB2 header up to MessageId.
+			 * MessageId is at offset 24 in struct smb2_hdr,
+			 * so we need 4 + 24 + 8 = 36 bytes minimum.
+			 *
+			 * Use the session's scratch buffer to accumulate
+			 * initial bytes until we can parse MessageId.
+			 */
+			const u32 min_hdr = sizeof(struct smb2_stream_hdr) +
+					     offsetof(struct smb2_hdr, MessageId) +
+					     sizeof(u64);
+			u32 have = sess->scratch_len;
+			u32 need = min_hdr - have;
+			u32 copy = min(need, len);
+			const struct smb2_stream_hdr *sh;
+			const struct smb2_hdr *smb2h;
+			u64 mid;
+			u32 body_size;
+
+			memcpy(sess->scratch + have, data, copy);
+			sess->scratch_len += copy;
+			data += copy;
+			len -= copy;
+
+			if (sess->scratch_len < min_hdr)
+				return; /* need more data */
+
+			/* Parse StreamHdr */
+			sh = (const struct smb2_stream_hdr *)sess->scratch;
+			body_size = smb2_stream_get_size(sh);
+
+			/* Parse MessageId from SMB2 header */
+			smb2h = (const struct smb2_hdr *)
+				(sess->scratch + sizeof(struct smb2_stream_hdr));
+			mid = le64_to_cpu(smb2h->MessageId);
+
+			/* Find matching pending request */
+			spin_lock(&sess->pending_lock);
+			req = vmsmb_find_request(sess, mid);
+			if (req)
+				list_del_init(&req->list);
+			spin_unlock(&sess->pending_lock);
+
+			if (!req) {
+				pr_warn("recv: no pending request for MessageId=%llu\n",
+					mid);
+				/*
+				 * Skip this response. We know the total size
+				 * from DirectTCP, so skip remaining bytes.
+				 */
+				sess->skip_bytes = sizeof(struct smb2_stream_hdr) +
+						   body_size - sess->scratch_len;
+				sess->scratch_len = 0;
+				goto skip;
+			}
+
+			/* Set up framing state */
+			req->expected_total = sizeof(struct smb2_stream_hdr) +
+					       body_size;
+			req->recv_offset = 0;
+
+			/* Copy scratch bytes into request's response buffer */
+			{
+				u32 tocopy = min(sess->scratch_len,
+						 req->response_buf_size);
+				memcpy(req->response_buf, sess->scratch, tocopy);
+				req->recv_offset = tocopy;
+			}
+			sess->scratch_len = 0;
+			sess->current_recv = req;
+
+			/* Check if already complete (small response) */
+			if (req->recv_offset >= req->expected_total) {
+				req->response_len = req->recv_offset;
+				req->status = 0;
+				complete(&req->done);
+				sess->current_recv = NULL;
+			}
+			continue;
+		}
+
+		/* Continuing accumulation into current request */
+		{
+			u32 space = req->response_buf_size - req->recv_offset;
+			u32 remaining = req->expected_total - req->recv_offset;
+			u32 copy = min3(len, space, remaining);
+
+			if (copy > 0) {
+				memcpy(req->response_buf + req->recv_offset,
+				       data, copy);
+				req->recv_offset += copy;
+			}
+			data += min(len, remaining);
+			len -= min(len, remaining);
+
+			if (req->recv_offset >= req->expected_total) {
+				req->response_len = req->recv_offset;
+				req->status = 0;
+				complete(&req->done);
+				sess->current_recv = NULL;
+			}
+		}
+		continue;
+skip:
+		/* Skip bytes of an unmatched response */
+		{
+			u32 skip = min(len, sess->skip_bytes);
+			data += skip;
+			len -= skip;
+			sess->skip_bytes -= skip;
+		}
+	}
+}
+
+/*
+ * VMBus channel callback — parse and dispatch responses.
+ *
+ * Iterates ring buffer entries using hv_pkt_iter (hvsock pattern),
+ * extracts vmpipe DATA payloads, and feeds them into the stream
+ * reassembly state machine.
+ *
+ * Dispatch model inspired by libsmb2's smb2_service_fd() readable
+ * path (parse header → match by MessageId → invoke completion).
+ * CIFS uses a dedicated demultiplex_thread for the same purpose.
+ *
+ * Also signals recv_done for the synchronous version negotiation path.
+ */
 static void vmsmb_channel_cb(void *ctx)
 {
 	struct vmsmb_session *sess = ctx;
 
+	/*
+	 * If async requests are in flight, iterate ring buffer and
+	 * dispatch responses. Otherwise, leave packets in the ring
+	 * buffer for the synchronous receive path (version negotiation).
+	 */
+	if (!list_empty(&sess->pending_requests) || sess->current_recv) {
+		struct vmpacket_descriptor *desc;
+
+		foreach_vmbus_pkt(desc, sess->channel) {
+			const struct vmpipe_hdr *ph;
+			u32 pkt_payload_len, ptype, dsize;
+			const u8 *data;
+
+			pkt_payload_len = hv_pkt_datalen(desc);
+			if (pkt_payload_len < sizeof(struct vmpipe_hdr))
+				continue;
+
+			ph = (const struct vmpipe_hdr *)
+				((const u8 *)desc + (desc->offset8 << 3));
+			ptype = le32_to_cpu(ph->pkt_type);
+			dsize = le32_to_cpu(ph->data_size);
+
+			if (ptype == 0)
+				continue;
+
+			if (ptype != VMPIPE_TYPE_DATA || dsize == 0)
+				continue;
+
+			if (sizeof(struct vmpipe_hdr) + dsize > pkt_payload_len)
+				dsize = pkt_payload_len -
+					sizeof(struct vmpipe_hdr);
+
+			data = (const u8 *)ph + sizeof(struct vmpipe_hdr);
+			vmsmb_process_data(sess, data, dsize);
+		}
+	}
+
+	/* Signal synchronous waiters (version negotiation, drain) */
 	complete(&sess->recv_done);
 }
 
@@ -39,8 +246,12 @@ int vmsmb_open_channel(struct vmsmb_session *sess)
 	}
 
 	sess->channel = ch;
-	mutex_init(&sess->transport_mutex);
-	spin_lock_init(&sess->recv_lock);
+	mutex_init(&sess->send_mutex);
+	spin_lock_init(&sess->pending_lock);
+	INIT_LIST_HEAD(&sess->pending_requests);
+	sess->current_recv = NULL;
+	sess->scratch_len = 0;
+	sess->skip_bytes = 0;
 	init_completion(&sess->recv_done);
 
 	/*
@@ -74,130 +285,23 @@ void vmsmb_close_channel(struct vmsmb_session *sess)
 }
 
 /*
- * Receive one response by iterating VMBus ring buffer entries.
+ * Synchronous send + receive for pre-SMB2 paths (version negotiation).
  *
- * Each ring entry contains one vmpipe_proto_header (8 bytes) followed
- * by data_size bytes of payload. Like hvsock, we use hv_pkt_iter to
- * walk entries without copying alignment padding.
- *
- * pkt_type=0 entries are notifications (skip).
- * pkt_type=1 entries carry response data (DirectTCP + SMB2).
- *
- * Data payloads are accumulated into recv_buf starting at offset
- * sizeof(vmpipe_hdr) to leave room for a synthetic PipeHdr that
- * callers expect.
+ * Only used when no async requests are pending. Uses the sess->recv_done
+ * completion signaled by the channel callback.
  */
-static int vmsmb_recv_response(struct vmsmb_session *sess,
-			       void *recv_buf, u32 recv_buf_size,
-			       u32 *recv_len)
-{
-	struct vmbus_channel *ch = sess->channel;
-	/* Reserve space for synthetic PipeHdr at recv_buf[0..7] */
-	const u32 hdr_reserve = sizeof(struct vmpipe_hdr);
-	u32 offset = hdr_reserve;
-	u32 expected_total = 0; /* 0 = unknown, set once DirectTCP parsed */
-	unsigned long deadline = jiffies +
-		msecs_to_jiffies(VMSMB_TIMEOUT_MS);
-
-	while (1) {
-		struct vmpacket_descriptor *desc;
-		bool got_data = false;
-
-		foreach_vmbus_pkt(desc, ch) {
-			const struct vmpipe_hdr *ph;
-			u32 pkt_payload_len, ptype, dsize, copy;
-			const u8 *data;
-
-			pkt_payload_len = hv_pkt_datalen(desc);
-			if (pkt_payload_len < sizeof(struct vmpipe_hdr))
-				continue;
-
-			ph = (const struct vmpipe_hdr *)
-				((const u8 *)desc + (desc->offset8 << 3));
-			ptype = le32_to_cpu(ph->pkt_type);
-			dsize = le32_to_cpu(ph->data_size);
-
-			if (ptype == 0) {
-				/* Notification — skip */
-				continue;
-			}
-
-			if (ptype != VMPIPE_TYPE_DATA || dsize == 0)
-				continue;
-
-			/* Validate data_size against actual packet payload */
-			if (sizeof(struct vmpipe_hdr) + dsize > pkt_payload_len)
-				dsize = pkt_payload_len -
-					sizeof(struct vmpipe_hdr);
-
-			data = (const u8 *)ph + sizeof(struct vmpipe_hdr);
-			copy = min(dsize, recv_buf_size - offset);
-			if (copy > 0) {
-				memcpy(recv_buf + offset, data, copy);
-				offset += copy;
-			}
-			got_data = true;
-
-			if (expected_total == 0 &&
-			    offset - hdr_reserve >=
-					sizeof(struct smb2_stream_hdr)) {
-				const struct smb2_stream_hdr *sh =
-					recv_buf + hdr_reserve;
-				u32 body_size =
-					smb2_stream_get_size(sh);
-
-				expected_total = hdr_reserve +
-					sizeof(struct smb2_stream_hdr) +
-					body_size;
-			}
-		}
-
-		/* Check if response is complete */
-		if (expected_total > 0 && offset >= expected_total)
-			break;
-
-		if (got_data)
-			continue;
-
-		/* No data — wait briefly, then recheck.
-		 * Short waits avoid completion races: if the
-		 * callback fired before we entered wait, we just
-		 * spin again after the short timeout.
-		 */
-		if (time_after(jiffies, deadline)) {
-			pr_err("recv timeout (offset=%u expected=%u)\n",
-			       offset - hdr_reserve, expected_total);
-			return -ETIMEDOUT;
-		}
-
-		wait_for_completion_timeout(&sess->recv_done,
-					    msecs_to_jiffies(50));
-		reinit_completion(&sess->recv_done);
-	}
-
-	/* Write synthetic PipeHdr at the front */
-	{
-		struct vmpipe_hdr *ph = recv_buf;
-		u32 data_len = offset - hdr_reserve;
-
-		ph->pkt_type = cpu_to_le32(VMPIPE_TYPE_DATA);
-		ph->data_size = cpu_to_le32(data_len);
-	}
-
-	*recv_len = offset;
-	return 0;
-}
-
-static int vmsmb_send_recv(struct vmsmb_session *sess,
-		    const void *send_buf, u32 send_len,
-		    void *recv_buf, u32 recv_buf_size,
-		    u32 *recv_len)
+static int vmsmb_send_recv_sync(struct vmsmb_session *sess,
+				const void *send_buf, u32 send_len,
+				void *recv_buf, u32 recv_buf_size,
+				u32 *recv_len)
 {
 	struct {
 		struct vmpipe_hdr pipe;
 		u8 data[];
 	} __packed *pkt;
 	u32 pkt_len;
+	u32 offset, expected_total;
+	unsigned long deadline;
 	int ret;
 
 	pkt_len = sizeof(struct vmpipe_hdr) + send_len;
@@ -211,14 +315,13 @@ static int vmsmb_send_recv(struct vmsmb_session *sess,
 
 	reinit_completion(&sess->recv_done);
 
-	/* Send with EAGAIN retry — ring buffer may be full during large I/O */
+	/* Send with EAGAIN retry */
 	{
 		int send_retries;
 
 		for (send_retries = 0; send_retries < 100; send_retries++) {
 			ret = vmbus_sendpacket(sess->channel, pkt, pkt_len,
-					       sess->message_id,
-					       VM_PKT_DATA_INBAND, 0);
+					       0, VM_PKT_DATA_INBAND, 0);
 			if (ret != -EAGAIN)
 				break;
 			usleep_range(100, 500);
@@ -232,7 +335,91 @@ static int vmsmb_send_recv(struct vmsmb_session *sess,
 		return ret;
 	}
 
-	return vmsmb_recv_response(sess, recv_buf, recv_buf_size, recv_len);
+	/*
+	 * Synchronous receive — same logic as the old vmsmb_recv_response
+	 * but with PipeHdr prefix for backward compatibility with callers.
+	 */
+	offset = sizeof(struct vmpipe_hdr);
+	expected_total = 0;
+	deadline = jiffies + msecs_to_jiffies(VMSMB_TIMEOUT_MS);
+
+	while (1) {
+		struct vmpacket_descriptor *desc;
+		bool got_data = false;
+
+		foreach_vmbus_pkt(desc, sess->channel) {
+			const struct vmpipe_hdr *ph;
+			u32 pkt_payload_len, ptype, dsize, copy;
+			const u8 *data;
+
+			pkt_payload_len = hv_pkt_datalen(desc);
+			if (pkt_payload_len < sizeof(struct vmpipe_hdr))
+				continue;
+
+			ph = (const struct vmpipe_hdr *)
+				((const u8 *)desc + (desc->offset8 << 3));
+			ptype = le32_to_cpu(ph->pkt_type);
+			dsize = le32_to_cpu(ph->data_size);
+
+			if (ptype == 0)
+				continue;
+			if (ptype != VMPIPE_TYPE_DATA || dsize == 0)
+				continue;
+
+			if (sizeof(struct vmpipe_hdr) + dsize > pkt_payload_len)
+				dsize = pkt_payload_len -
+					sizeof(struct vmpipe_hdr);
+
+			data = (const u8 *)ph + sizeof(struct vmpipe_hdr);
+			copy = min(dsize, recv_buf_size - offset);
+			if (copy > 0) {
+				memcpy(recv_buf + offset, data, copy);
+				offset += copy;
+			}
+			got_data = true;
+
+			if (expected_total == 0 &&
+			    offset - sizeof(struct vmpipe_hdr) >=
+					sizeof(struct smb2_stream_hdr)) {
+				const struct smb2_stream_hdr *sh =
+					recv_buf + sizeof(struct vmpipe_hdr);
+				u32 body_size = smb2_stream_get_size(sh);
+
+				expected_total = sizeof(struct vmpipe_hdr) +
+					sizeof(struct smb2_stream_hdr) +
+					body_size;
+			}
+		}
+
+		if (expected_total > 0 && offset >= expected_total)
+			break;
+
+		if (got_data)
+			continue;
+
+		if (time_after(jiffies, deadline)) {
+			pr_err("recv timeout (offset=%u expected=%u)\n",
+			       offset - (u32)sizeof(struct vmpipe_hdr),
+			       expected_total);
+			return -ETIMEDOUT;
+		}
+
+		wait_for_completion_timeout(&sess->recv_done,
+					    msecs_to_jiffies(50));
+		reinit_completion(&sess->recv_done);
+	}
+
+	/* Write synthetic PipeHdr */
+	{
+		struct vmpipe_hdr *ph = recv_buf;
+		u32 data_len = offset - sizeof(struct vmpipe_hdr);
+
+		ph->pkt_type = cpu_to_le32(VMPIPE_TYPE_DATA);
+		ph->data_size = cpu_to_le32(data_len);
+	}
+
+	*recv_len = offset;
+	return 0;
 }
 
 /*
@@ -240,6 +427,11 @@ static int vmsmb_send_recv(struct vmsmb_session *sess,
  *
  * Handles all transport framing (PipeHdr + StreamHdr) internally so the
  * SMB2 layer has no knowledge of VMBus pipe mode or stream framing.
+ *
+ * Multiple transacts can be in-flight concurrently. Each allocates a
+ * per-request vmsmb_request on the stack, registers it in the pending
+ * list, sends via vmbus_sendpacket (serialized by send_mutex), then
+ * waits on its own completion.
  *
  * @smb2_req / @req_len:       SMB2 request PDU (no framing headers)
  * @smb2_resp / @resp_buf_size: caller-allocated buffer for SMB2 response
@@ -250,52 +442,131 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 			void *smb2_resp, u32 resp_buf_size,
 			u32 *resp_len)
 {
-	const u32 hdr_overhead = sizeof(struct vmpipe_hdr) +
-				 sizeof(struct smb2_stream_hdr);
+	const u32 stream_hdr_size = sizeof(struct smb2_stream_hdr);
+	struct vmsmb_request req;
 	struct smb2_stream_hdr *sh;
+	struct vmpipe_hdr *pipe;
 	u8 *send_buf;
-	u32 send_len;
+	u32 send_pkt_len;
 	void *recv_buf;
-	u32 recv_buf_size, recv_len;
+	u32 recv_buf_size;
+	const struct smb2_hdr *smb2h;
 	u32 smb2_size;
+	unsigned long remaining;
 	int ret;
 
-	/* Build send payload: StreamHdr(type=0) + SMB2 PDU */
-	send_len = sizeof(struct smb2_stream_hdr) + req_len;
-	send_buf = kmalloc(send_len, GFP_KERNEL);
-	if (!send_buf)
+	/* Extract MessageId from SMB2 header */
+	if (req_len < sizeof(struct smb2_hdr))
+		return -EINVAL;
+	smb2h = (const struct smb2_hdr *)smb2_req;
+
+	/* Initialize per-request state */
+	INIT_LIST_HEAD(&req.list);
+	req.message_id = le64_to_cpu(smb2h->MessageId);
+	init_completion(&req.done);
+	req.status = -EINPROGRESS;
+	req.recv_offset = 0;
+	req.expected_total = 0;
+
+	/*
+	 * Allocate response buffer with room for StreamHdr.
+	 * channel_cb writes StreamHdr + SMB2 data here directly.
+	 */
+	recv_buf_size = stream_hdr_size + resp_buf_size;
+	recv_buf = kvmalloc(recv_buf_size, GFP_KERNEL);
+	if (!recv_buf)
 		return -ENOMEM;
 
-	sh = (struct smb2_stream_hdr *)send_buf;
-	sh->type = SMB2_STREAM_TYPE_SMB2;
-	smb2_stream_set_size(sh, req_len);
-	memcpy(send_buf + sizeof(*sh), smb2_req, req_len);
+	req.response_buf = recv_buf;
+	req.response_buf_size = recv_buf_size;
+	req.response_len = 0;
 
-	/* Allocate recv buffer with room for transport headers */
-	recv_buf_size = hdr_overhead + resp_buf_size;
-	recv_buf = kvmalloc(recv_buf_size, GFP_KERNEL);
-	if (!recv_buf) {
-		kfree(send_buf);
+	/* Build send packet: PipeHdr + StreamHdr + SMB2 PDU */
+	send_pkt_len = sizeof(struct vmpipe_hdr) + stream_hdr_size + req_len;
+	send_buf = kmalloc(send_pkt_len, GFP_KERNEL);
+	if (!send_buf) {
+		kvfree(recv_buf);
 		return -ENOMEM;
 	}
 
-	ret = vmsmb_send_recv(sess, send_buf, send_len,
-			      recv_buf, recv_buf_size, &recv_len);
+	pipe = (struct vmpipe_hdr *)send_buf;
+	pipe->pkt_type = cpu_to_le32(VMPIPE_TYPE_DATA);
+	pipe->data_size = cpu_to_le32(stream_hdr_size + req_len);
+
+	sh = (struct smb2_stream_hdr *)(send_buf + sizeof(struct vmpipe_hdr));
+	sh->type = SMB2_STREAM_TYPE_SMB2;
+	smb2_stream_set_size(sh, req_len);
+
+	memcpy(send_buf + sizeof(struct vmpipe_hdr) + stream_hdr_size,
+	       smb2_req, req_len);
+
+	/* Register in pending list before sending */
+	spin_lock(&sess->pending_lock);
+	list_add_tail(&req.list, &sess->pending_requests);
+	spin_unlock(&sess->pending_lock);
+
+	/* Send with EAGAIN retry (ring buffer may be full) */
+	mutex_lock(&sess->send_mutex);
+	{
+		int send_retries;
+
+		for (send_retries = 0; send_retries < 100; send_retries++) {
+			ret = vmbus_sendpacket(sess->channel, send_buf,
+					       send_pkt_len, 0,
+					       VM_PKT_DATA_INBAND, 0);
+			if (ret != -EAGAIN)
+				break;
+			usleep_range(100, 500);
+		}
+	}
+	mutex_unlock(&sess->send_mutex);
 	kfree(send_buf);
+
 	if (ret) {
+		pr_err("vmbus_sendpacket failed: %d\n", ret);
+		spin_lock(&sess->pending_lock);
+		list_del_init(&req.list);
+		spin_unlock(&sess->pending_lock);
 		kvfree(recv_buf);
 		return ret;
 	}
 
-	/* Validate transport headers */
-	if (recv_len < hdr_overhead) {
-		pr_err("smb2_transact: response too short: %u\n", recv_len);
+	/* Wait for channel_cb to complete this request */
+	remaining = wait_for_completion_timeout(&req.done,
+				msecs_to_jiffies(VMSMB_TIMEOUT_MS));
+	if (!remaining) {
+		/*
+		 * Timeout. Remove from pending list if still there.
+		 * The channel_cb might have completed us in a race.
+		 */
+		spin_lock(&sess->pending_lock);
+		if (!list_empty(&req.list))
+			list_del_init(&req.list);
+		spin_unlock(&sess->pending_lock);
+
+		if (req.status == -EINPROGRESS) {
+			pr_err("transact timeout (mid=%llu)\n",
+			       req.message_id);
+			kvfree(recv_buf);
+			return -ETIMEDOUT;
+		}
+		/* Completed in the race — fall through */
+	}
+
+	if (req.status) {
+		kvfree(recv_buf);
+		return req.status;
+	}
+
+	/* Validate StreamHdr */
+	if (req.response_len < stream_hdr_size) {
+		pr_err("smb2_transact: response too short: %u\n",
+		       req.response_len);
 		kvfree(recv_buf);
 		return -EPROTO;
 	}
 
-	sh = (struct smb2_stream_hdr *)((u8 *)recv_buf +
-					sizeof(struct vmpipe_hdr));
+	sh = (struct smb2_stream_hdr *)recv_buf;
 	if (sh->type != SMB2_STREAM_TYPE_SMB2) {
 		pr_err("smb2_transact: unexpected stream type: %u\n",
 		       sh->type);
@@ -304,11 +575,11 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 	}
 
 	/* Copy SMB2 portion to caller's buffer */
-	smb2_size = recv_len - hdr_overhead;
+	smb2_size = req.response_len - stream_hdr_size;
 	if (smb2_size > resp_buf_size)
 		smb2_size = resp_buf_size;
 
-	memcpy(smb2_resp, (u8 *)recv_buf + hdr_overhead, smb2_size);
+	memcpy(smb2_resp, (u8 *)recv_buf + stream_hdr_size, smb2_size);
 	*resp_len = smb2_size;
 
 	kvfree(recv_buf);
@@ -317,6 +588,9 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 
 /*
  * VSMB version negotiation (pre-SMB2).
+ *
+ * Uses the synchronous send_recv_sync path since there is no
+ * concurrency at this point (probe is single-threaded).
  */
 int vmsmb_negotiate_version(struct vmsmb_session *sess)
 {
@@ -336,8 +610,8 @@ int vmsmb_negotiate_version(struct vmsmb_session *sess)
 	req.ver.version = cpu_to_le32(VSMB_VERSION_1);
 	req.ver.capabilities = cpu_to_le32(VSMB_CAP_DIRECTMAP);
 
-	ret = vmsmb_send_recv(sess, &req, sizeof(req),
-			      resp_buf, sizeof(resp_buf), &resp_len);
+	ret = vmsmb_send_recv_sync(sess, &req, sizeof(req),
+				   resp_buf, sizeof(resp_buf), &resp_len);
 	if (ret)
 		return ret;
 

@@ -10,6 +10,7 @@
 #include <linux/hyperv.h>
 #include <linux/completion.h>
 #include <linux/mutex.h>
+#include <linux/atomic.h>
 #include <linux/types.h>
 #include <linux/fs.h>
 #include <linux/netfs.h>
@@ -115,6 +116,30 @@ struct vmsmb_file_info {
 };
 
 /*
+ * Per-request tracking for async transport.
+ *
+ * Analogous to libsmb2's struct smb2_pdu / CIFS's struct mid_q_entry.
+ * Each in-flight SMB2 request gets one of these; the channel callback
+ * matches responses by MessageId and completes the right request.
+ */
+struct vmsmb_request {
+	struct list_head list;		/* in sess->pending_requests */
+	u64 message_id;			/* SMB2 MessageId for matching */
+
+	/* Response buffer (caller-owned) */
+	void *response_buf;
+	u32 response_buf_size;
+	u32 response_len;		/* actual bytes received */
+
+	/* Stream framing state (used by channel_cb) */
+	u32 expected_total;		/* from DirectTCP header, 0=unknown */
+	u32 recv_offset;		/* bytes accumulated so far */
+
+	int status;			/* 0 or -errno */
+	struct completion done;		/* signaled when response complete */
+};
+
+/*
  * Session state for one VSMB connection.
  */
 struct vmsmb_session {
@@ -127,17 +152,26 @@ struct vmsmb_session {
 
 	/* SMB2 session state */
 	u64 session_id;
-	u64 message_id;
+	atomic64_t message_id;
 	u32 max_read_size;
 	u32 max_write_size;
 	u32 max_transact_size;
 
-	/* Transport serialization */
-	struct mutex transport_mutex;
+	/* Send serialization (ring buffer write is not concurrent-safe) */
+	struct mutex send_mutex;
 
-	/* Synchronous receive completion */
+	/* Pending request tracking */
+	spinlock_t pending_lock;
+	struct list_head pending_requests;
+
+	/* Stream reassembly state (channel_cb context, single-threaded) */
+	struct vmsmb_request *current_recv;
+	u8 scratch[64];		/* accumulate initial bytes of new response */
+	u32 scratch_len;
+	u32 skip_bytes;		/* bytes to skip for unmatched response */
+
+	/* Synchronous send+recv for pre-SMB2 (version negotiation) */
 	struct completion recv_done;
-	spinlock_t recv_lock;
 };
 
 /*
