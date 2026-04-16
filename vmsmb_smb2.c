@@ -694,11 +694,18 @@ int vmsmb_smb2_query_dir(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 	const struct smb2_hdr *hdr;
 	__le16 *pat_utf16;
 	int pat_len;
-	u32 pdu_len, resp_len, smb2_len;
+	u32 pdu_len, resp_len, smb2_len, resp_buf_size;
 	u32 out_offset, out_len;
 	int ret;
 
-	resp_buf = kvmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
+	/*
+	 * recv buffer must hold PipeHdr + DirectTCP + SMB2 headers +
+	 * the output data (up to buf_size bytes).
+	 */
+	resp_buf_size = sizeof(struct vmpipe_hdr) +
+			sizeof(struct smb2_direct_tcp_hdr) +
+			sizeof(struct smb2_query_directory_rsp) + buf_size;
+	resp_buf = kvmalloc(resp_buf_size, GFP_KERNEL);
 	if (!resp_buf)
 		return -ENOMEM;
 
@@ -732,7 +739,7 @@ int vmsmb_smb2_query_dir(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 	kfree(pat_utf16);
 
 	ret = vmsmb_smb2_send_recv(sess, pdu_buf, pdu_len,
-				   resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+				   resp_buf, resp_buf_size, &resp_len);
 	kfree(pdu_buf);
 	if (ret)
 		goto out;
