@@ -371,6 +371,7 @@ static __le16 *vmsmb_path_to_utf16(const char *path, int *out_len)
 	__le16 *buf;
 	int i, len = strlen(path);
 
+	*out_len = 0;
 	buf = kmalloc((len + 1) * 2, GFP_KERNEL);
 	if (!buf)
 		return NULL;
@@ -400,6 +401,18 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, const char *path,
 	int name_len;
 	u32 pdu_len, resp_len, smb2_len;
 	int ret;
+	const char *p;
+
+	/* Guard: reject non-ASCII paths until UTF-8→UTF-16 is ported
+	 * from CIFS cifs_strtoUTF16() in cifs_unicode.c.
+	 */
+	for (p = path; *p; p++) {
+		if ((unsigned char)*p >= 0x80) {
+			pr_warn("CREATE path contains non-ASCII; UTF-8→UTF-16 not implemented: '%s'\n",
+				path);
+			return -EOPNOTSUPP;
+		}
+	}
 
 	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
 	if (!resp_buf)
