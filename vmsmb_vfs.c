@@ -17,6 +17,7 @@
 #include <linux/uio.h>
 #include <linux/namei.h>
 #include <linux/backing-dev.h>
+#include <linux/nls.h>
 #include "vmsmb.h"
 #include "smb2pdu.h"
 #include "fscc.h"
@@ -700,65 +701,26 @@ const struct file_operations vmsmb_file_ops = {
 /* ---- Directory operations ---- */
 
 /*
- * Convert a UTF-16LE filename to UTF-8 with surrogate pair support.
- * Temporary implementation — should be replaced with a port of CIFS
- * cifs_from_utf16() from cifs_unicode.c.
+ * Convert a UTF-16LE filename to UTF-8.
+ *
+ * Uses the kernel's utf16s_to_utf8s() (lib/unicode.c), the same
+ * function underlying CIFS cifs_from_utf16() (cifs_unicode.c).
+ * We skip CIFS's NLS codepage and SFU/SFM character mapping since
+ * VSMB doesn't need them.
  */
 static int vmsmb_utf16_name_to_utf8(char *dst, size_t dst_size,
 				    const char *src, size_t src_len)
 {
 	const __le16 *name = (const __le16 *)src;
-	size_t in_len = src_len / sizeof(__le16);
-	size_t out = 0;
-	size_t i = 0;
+	int wlen = src_len / sizeof(__le16);
+	int ret;
 
-	while (i < in_len) {
-		u32 cp = le16_to_cpu(name[i++]);
-		u8 bytes[4];
-		size_t nr_bytes;
-
-		if (cp >= 0xD800 && cp <= 0xDBFF && i < in_len) {
-			u32 low = le16_to_cpu(name[i]);
-
-			if (low >= 0xDC00 && low <= 0xDFFF) {
-				cp = 0x10000 + ((cp - 0xD800) << 10) +
-				     (low - 0xDC00);
-				i++;
-			} else {
-				cp = '?';
-			}
-		} else if (cp >= 0xDC00 && cp <= 0xDFFF) {
-			cp = '?';
-		}
-
-		if (cp < 0x80) {
-			bytes[0] = cp;
-			nr_bytes = 1;
-		} else if (cp < 0x800) {
-			bytes[0] = 0xC0 | (cp >> 6);
-			bytes[1] = 0x80 | (cp & 0x3F);
-			nr_bytes = 2;
-		} else if (cp < 0x10000) {
-			bytes[0] = 0xE0 | (cp >> 12);
-			bytes[1] = 0x80 | ((cp >> 6) & 0x3F);
-			bytes[2] = 0x80 | (cp & 0x3F);
-			nr_bytes = 3;
-		} else {
-			bytes[0] = 0xF0 | (cp >> 18);
-			bytes[1] = 0x80 | ((cp >> 12) & 0x3F);
-			bytes[2] = 0x80 | ((cp >> 6) & 0x3F);
-			bytes[3] = 0x80 | (cp & 0x3F);
-			nr_bytes = 4;
-		}
-
-		if (out + nr_bytes >= dst_size)
-			break;
-		memcpy(dst + out, bytes, nr_bytes);
-		out += nr_bytes;
-	}
-
-	dst[out] = '\0';
-	return out;
+	ret = utf16s_to_utf8s((const wchar_t *)name, wlen,
+			      UTF16_LITTLE_ENDIAN, dst, dst_size - 1);
+	if (ret < 0)
+		return ret;
+	dst[ret] = '\0';
+	return ret;
 }
 
 static int vmsmb_readdir(struct file *file, struct dir_context *ctx)

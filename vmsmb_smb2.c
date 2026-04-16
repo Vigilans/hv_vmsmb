@@ -17,6 +17,10 @@
 
 /*
  * Fill a common SMB2 header.
+ *
+ * Simplified version of CIFS smb2_plain_req_init() + fill_small_buf()
+ * (fs/smb/client/smb2pdu.c, smb2transport.c). We skip signing,
+ * encryption, and compound request support.
  */
 static void vmsmb_fill_hdr(struct smb2_hdr *hdr, u16 command,
 			    struct vmsmb_session *sess)
@@ -33,8 +37,12 @@ static void vmsmb_fill_hdr(struct smb2_hdr *hdr, u16 command,
 }
 
 /*
- * Validate SMB2 response header in a recv buffer.
- * Returns pointer to SMB2 header within resp_buf.
+ * Validate SMB2 response header.
+ *
+ * Simplified version of CIFS smb2_check_message()
+ * (fs/smb/client/smb2misc.c). We only check protocol magic and
+ * minimum length; CIFS additionally validates StructureSize,
+ * command match, and signing.
  */
 static const struct smb2_hdr *vmsmb_check_resp(const void *resp_buf,
 					       u32 resp_len)
@@ -56,30 +64,115 @@ static const struct smb2_hdr *vmsmb_check_resp(const void *resp_buf,
 }
 
 /*
- * Map SMB2/NTSTATUS error to errno.
+ * Map NTSTATUS to errno.
+ *
+ * Subset of the CIFS smb2_error_map_table (fs/smb/client/smb2maperror.c),
+ * covering status codes relevant to file operations. The canonical
+ * NTSTATUS→errno mapping is defined by comments in smb2status.h
+ * (copied from fs/smb/common/).
  */
-static int vmsmb_status_to_errno(u32 status)
+static int vmsmb_status_to_errno(__le32 status)
 {
 	switch (status) {
-	case 0:
+	case STATUS_SUCCESS:
 		return 0;
-	case 0xC0000034: /* STATUS_OBJECT_NAME_NOT_FOUND */
-	case 0xC000003A: /* STATUS_OBJECT_PATH_NOT_FOUND */
+
+	/* File/path lookup errors → ENOENT */
+	case STATUS_NO_SUCH_FILE:
+	case STATUS_OBJECT_NAME_NOT_FOUND:
+	case STATUS_OBJECT_PATH_NOT_FOUND:
+	case STATUS_OBJECT_NAME_INVALID:
+	case STATUS_DELETE_PENDING:
+	case STATUS_BAD_NETWORK_NAME:
+	case STATUS_NOT_FOUND:
 		return -ENOENT;
-	case 0xC0000022: /* STATUS_ACCESS_DENIED */
+
+	/* Access control → EACCES / EPERM */
+	case STATUS_ACCESS_DENIED:
+	case STATUS_NETWORK_ACCESS_DENIED:
+	case STATUS_ACCESS_VIOLATION:
+	case STATUS_FILE_LOCK_CONFLICT:
+	case STATUS_LOCK_NOT_GRANTED:
+	case STATUS_CANNOT_DELETE:
+	case STATUS_LOGON_FAILURE:
 		return -EACCES;
-	case 0xC00000BA: /* STATUS_FILE_IS_A_DIRECTORY */
+	case STATUS_PRIVILEGE_NOT_HELD:
+		return -EPERM;
+
+	/* File type errors */
+	case STATUS_FILE_IS_A_DIRECTORY:
 		return -EISDIR;
-	case 0xC00000D5: /* STATUS_NOT_A_DIRECTORY */
+	case STATUS_NOT_A_DIRECTORY:
+	case STATUS_OBJECT_PATH_INVALID:
 		return -ENOTDIR;
-	case 0xC0000035: /* STATUS_OBJECT_NAME_COLLISION */
+
+	/* Name collision → EEXIST */
+	case STATUS_OBJECT_NAME_COLLISION:
 		return -EEXIST;
-	case 0xC0000101: /* STATUS_DIRECTORY_NOT_EMPTY */
+
+	/* Directory not empty → ENOTEMPTY */
+	case STATUS_DIRECTORY_NOT_EMPTY:
 		return -ENOTEMPTY;
-	case 0xC0000043: /* STATUS_SHARING_VIOLATION */
+
+	/* Resource busy → EBUSY */
+	case STATUS_SHARING_VIOLATION:
+	case STATUS_DEVICE_BUSY:
+	case STATUS_PIPE_BUSY:
 		return -EBUSY;
-	case 0x80000006: /* STATUS_NO_MORE_FILES */
+
+	/* Cross-device → EXDEV (rename across volumes) */
+	case STATUS_NOT_SAME_DEVICE:
+		return -EXDEV;
+
+	/* Disk/space errors → ENOSPC */
+	case STATUS_DISK_FULL:
+		return -ENOSPC;
+
+	/* Read-only → EROFS */
+	case STATUS_MEDIA_WRITE_PROTECTED:
+		return -EROFS;
+
+	/* Name too long → ENAMETOOLONG */
+	case STATUS_NAME_TOO_LONG:
+		return -ENAMETOOLONG;
+
+	/* Too many links → EMLINK */
+	case STATUS_TOO_MANY_LINKS:
+		return -EMLINK;
+
+	/* End of file / no more data */
+	case STATUS_END_OF_FILE:
+	case STATUS_NO_MORE_FILES:
+	case STATUS_NO_EAS_ON_FILE:
+	case STATUS_NOT_A_REPARSE_POINT:
 		return -ENODATA;
+
+	/* Not supported/implemented → EOPNOTSUPP */
+	case STATUS_NOT_SUPPORTED:
+	case STATUS_NOT_IMPLEMENTED:
+	case STATUS_INVALID_DEVICE_REQUEST:
+	case STATUS_EAS_NOT_SUPPORTED:
+		return -EOPNOTSUPP;
+
+	/* Invalid parameter → EINVAL */
+	case STATUS_INVALID_PARAMETER:
+		return -EINVAL;
+
+	/* Invalid handle → EBADF */
+	case STATUS_INVALID_HANDLE:
+	case STATUS_FILE_CLOSED:
+		return -EBADF;
+
+	/* Timeout / retry → EAGAIN / ETIMEDOUT */
+	case STATUS_TIMEOUT:
+	case STATUS_IO_TIMEOUT:
+		return -ETIMEDOUT;
+	case STATUS_INSUFFICIENT_RESOURCES:
+	case STATUS_RETRY:
+	case STATUS_SERVER_UNAVAILABLE:
+	case STATUS_FILE_NOT_AVAILABLE:
+		return -EAGAIN;
+
 	default:
 		return -EIO;
 	}
@@ -90,13 +183,12 @@ static int vmsmb_status_to_errno(u32 status)
  */
 static int vmsmb_check_status(const struct smb2_hdr *hdr, const char *cmd_name)
 {
-	u32 status = le32_to_cpu(hdr->Status);
-
-	if (status != 0) {
-		int err = vmsmb_status_to_errno(status);
+	if (hdr->Status != STATUS_SUCCESS) {
+		int err = vmsmb_status_to_errno(hdr->Status);
 
 		if (err != -ENOENT && err != -ENODATA)
-			pr_err("%s failed: NTSTATUS 0x%08x\n", cmd_name, status);
+			pr_err("%s failed: NTSTATUS 0x%08x\n", cmd_name,
+			       le32_to_cpu(hdr->Status));
 		return err;
 	}
 	return 0;
@@ -104,6 +196,10 @@ static int vmsmb_check_status(const struct smb2_hdr *hdr, const char *cmd_name)
 
 /*
  * SMB2 NEGOTIATE — single dialect 0x210 (SMB 2.1).
+ *
+ * Simplified: CIFS SMB2_negotiate() (fs/smb/client/smb2pdu.c)
+ * negotiates multiple dialects, preauth integrity, and encryption.
+ * VSMB only needs SMB 2.1 with no security features.
  */
 int vmsmb_smb2_negotiate(struct vmsmb_session *sess)
 {
@@ -168,6 +264,10 @@ out:
 
 /*
  * SMB2 SESSION_SETUP — anonymous/null session (no auth).
+ *
+ * Simplified: CIFS SMB2_sess_setup() (fs/smb/client/smb2pdu.c)
+ * does multi-round SPNEGO/NTLMSSP authentication.
+ * VSMB accepts anonymous sessions with no auth token.
  */
 int vmsmb_smb2_session_setup(struct vmsmb_session *sess)
 {
@@ -207,7 +307,7 @@ int vmsmb_smb2_session_setup(struct vmsmb_session *sess)
 	 * or STATUS_MORE_PROCESSING_REQUIRED (0xC0000016) if auth is needed.
 	 * For VSMB we expect success or null session.
 	 */
-	if (hdr->Status != 0 &&
+	if (hdr->Status != STATUS_SUCCESS &&
 	    hdr->Status != STATUS_MORE_PROCESSING_REQUIRED) {
 		pr_err("SESSION_SETUP failed: NTSTATUS 0x%08x\n",
 		       le32_to_cpu(hdr->Status));
@@ -224,11 +324,49 @@ out:
 }
 
 /*
- * SMB2 TREE_CONNECT — connect to a named share.
- * @share_name: UTF-8 share name (e.g., "Shared")
+ * Convert UTF-8 path to UTF-16LE with backslash separators.
+ * Returns allocated buffer and sets *out_len (in bytes).
+ * Caller must kfree the result.
  *
- * The path is sent as UTF-16LE. For VSMB, the server expects
- * the share name directly (not \\server\share format).
+ * Uses the kernel's utf8s_to_utf16s() (lib/unicode.c), the same
+ * function underlying CIFS cifs_strtoUTF16() (cifs_unicode.c).
+ */
+static __le16 *vmsmb_path_to_utf16(const char *path, int *out_len)
+{
+	int len = strlen(path);
+	__le16 *buf;
+	int i, wlen;
+
+	*out_len = 0;
+	buf = kmalloc((len + 1) * sizeof(__le16), GFP_KERNEL);
+	if (!buf)
+		return NULL;
+
+	wlen = utf8s_to_utf16s(path, len, UTF16_LITTLE_ENDIAN,
+			       (wchar_t *)buf, len + 1);
+	if (wlen < 0) {
+		pr_err("utf8→utf16 conversion failed: %d\n", wlen);
+		kfree(buf);
+		return NULL;
+	}
+
+	/* SMB2 paths use backslash separators */
+	for (i = 0; i < wlen; i++) {
+		if (le16_to_cpu(buf[i]) == '/')
+			buf[i] = cpu_to_le16('\\');
+	}
+
+	*out_len = wlen * sizeof(__le16);
+	return buf;
+}
+
+/*
+ * SMB2 TREE_CONNECT — connect to a named share.
+ *
+ * Simplified: CIFS SMB2_tcon() (fs/smb/client/smb2pdu.c) handles
+ * DFS referrals, encryption per-share, and secure signing.
+ * VSMB uses a fixed UNC format \\vsmb\<ShareName> discovered
+ * via reverse engineering of vmwp.exe.
  */
 int vmsmb_smb2_tree_connect(struct vmsmb_session *sess, const char *share_name)
 {
@@ -236,11 +374,12 @@ int vmsmb_smb2_tree_connect(struct vmsmb_session *sess, const char *share_name)
 	struct smb2_tree_connect_req *req;
 	u32 pdu_len;
 	__le16 *path_utf16;
-	int path_utf16_len, i;
+	int path_utf16_len;
 	u8 *resp_buf;
 	u32 resp_len;
 	const struct smb2_hdr *hdr;
 	const struct smb2_tree_connect_rsp *rsp;
+	char unc[256];
 	int ret;
 
 	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
@@ -248,18 +387,11 @@ int vmsmb_smb2_tree_connect(struct vmsmb_session *sess, const char *share_name)
 		return -ENOMEM;
 
 	/* Build UNC path: \\vsmb\ShareName */
-	{
-		char unc[256];
-
-		snprintf(unc, sizeof(unc), "\\\\vsmb\\%s", share_name);
-		path_utf16_len = strlen(unc) * 2;
-		path_utf16 = kmalloc(path_utf16_len, GFP_KERNEL);
-		if (!path_utf16) {
-			kfree(resp_buf);
-			return -ENOMEM;
-		}
-		for (i = 0; unc[i]; i++)
-			path_utf16[i] = cpu_to_le16((u16)(u8)unc[i]);
+	snprintf(unc, sizeof(unc), "\\\\vsmb\\%s", share_name);
+	path_utf16 = vmsmb_path_to_utf16(unc, &path_utf16_len);
+	if (!path_utf16) {
+		kfree(resp_buf);
+		return -ENOMEM;
 	}
 
 	/* Build PDU: fixed header + UTF-16 path */
@@ -318,32 +450,11 @@ out:
 }
 
 /*
- * Helper: convert UTF-8 path to UTF-16LE with backslash separators.
- * Returns allocated buffer and sets *out_len (in bytes).
- * Caller must kfree the result.
- */
-static __le16 *vmsmb_path_to_utf16(const char *path, int *out_len)
-{
-	__le16 *buf;
-	int i, len = strlen(path);
-
-	*out_len = 0;
-	buf = kmalloc((len + 1) * 2, GFP_KERNEL);
-	if (!buf)
-		return NULL;
-
-	for (i = 0; i < len; i++) {
-		if (path[i] == '/')
-			buf[i] = cpu_to_le16('\\');
-		else
-			buf[i] = cpu_to_le16((u16)(u8)path[i]);
-	}
-	*out_len = len * 2;
-	return buf;
-}
-
-/*
  * SMB2 CREATE — open or create a file/directory.
+ *
+ * Simplified: CIFS SMB2_open() (fs/smb/client/smb2pdu.c) supports
+ * create contexts (oplock, lease, durable handle, query-on-create).
+ * We send a plain CREATE with no contexts.
  */
 int vmsmb_smb2_create(struct vmsmb_session *sess, const char *path,
 		      u32 desired_access, u32 disposition, u32 create_options,
@@ -357,18 +468,6 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, const char *path,
 	int name_len;
 	u32 pdu_len, resp_len;
 	int ret;
-	const char *p;
-
-	/* Guard: reject non-ASCII paths until UTF-8→UTF-16 is ported
-	 * from CIFS cifs_strtoUTF16() in cifs_unicode.c.
-	 */
-	for (p = path; *p; p++) {
-		if ((unsigned char)*p >= 0x80) {
-			pr_warn("CREATE path contains non-ASCII; UTF-8→UTF-16 not implemented: '%s'\n",
-				path);
-			return -EOPNOTSUPP;
-		}
-	}
 
 	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
 	if (!resp_buf)
@@ -456,6 +555,9 @@ out:
 
 /*
  * SMB2 CLOSE.
+ *
+ * Matches CIFS SMB2_close_flags() (fs/smb/client/smb2pdu.c).
+ * We skip the SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB optimization.
  */
 int vmsmb_smb2_close(struct vmsmb_session *sess, struct vmsmb_fid *fid)
 {
@@ -495,6 +597,10 @@ out:
 
 /*
  * SMB2 READ — read data from an open file.
+ *
+ * Simplified: CIFS smb2_async_readv() (fs/smb/client/smb2pdu.c)
+ * uses async I/O with credit-based flow control. We do synchronous
+ * reads with a single credit charge.
  */
 int vmsmb_smb2_read(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 		    u64 offset, u32 length, void *data, u32 *bytes_read)
@@ -563,6 +669,10 @@ out:
 
 /*
  * SMB2 WRITE — write data to an open file.
+ *
+ * Simplified: CIFS smb2_async_writev() (fs/smb/client/smb2pdu.c)
+ * uses async I/O with credit-based flow control. We do synchronous
+ * writes with a single credit charge.
  */
 int vmsmb_smb2_write(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 		     u64 offset, const void *data, u32 length,
@@ -633,6 +743,10 @@ out:
 /*
  * SMB2 QUERY_DIRECTORY — enumerate directory entries.
  * Returns the raw output buffer; caller parses FILE_DIRECTORY_INFO entries.
+ *
+ * Simplified: CIFS SMB2_query_directory() (fs/smb/client/smb2pdu.c)
+ * supports resumption via FileIndex and multiple info classes.
+ * We always restart scans and use FileDirectoryInformation only.
  */
 int vmsmb_smb2_query_dir(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 			 const char *pattern, void *buf, u32 buf_size,
