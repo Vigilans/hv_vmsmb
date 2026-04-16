@@ -52,25 +52,30 @@ struct vmpipe_hdr {
 #define VMPIPE_TYPE_DATA	1
 
 /*
- * SMB2 Direct TCP framing header (4 bytes, big-endian).
+ * SMB2 stream framing header (4 bytes, big-endian).
+ *
+ * Same format as MS-SMB2 "Direct TCP Transport" (§2.1) and the
+ * "rfc1002_marker" in the Linux CIFS client (fs/smb/client/transport.c),
+ * but carried over VMBus pipes instead of TCP.
+ *
+ * VSMB extends the type field: 0 = SMB2 PDU, 1 = VSMB version exchange.
  */
-struct smb2_direct_tcp_hdr {
+struct smb2_stream_hdr {
 	u8 type;
 	u8 size_be[3];
 } __packed;
 
-#define SMB2_DIRECT_TYPE_SMB2		0
-#define SMB2_DIRECT_TYPE_VERSION	1
+#define SMB2_STREAM_TYPE_SMB2		0
+#define SMB2_STREAM_TYPE_VERSION	1
 
-static inline void smb2_direct_tcp_set_size(struct smb2_direct_tcp_hdr *h,
-					    u32 size)
+static inline void smb2_stream_set_size(struct smb2_stream_hdr *h, u32 size)
 {
 	h->size_be[0] = (size >> 16) & 0xff;
 	h->size_be[1] = (size >> 8) & 0xff;
 	h->size_be[2] = size & 0xff;
 }
 
-static inline u32 smb2_direct_tcp_get_size(const struct smb2_direct_tcp_hdr *h)
+static inline u32 smb2_stream_get_size(const struct smb2_stream_hdr *h)
 {
 	return ((u32)h->size_be[0] << 16) |
 	       ((u32)h->size_be[1] << 8) |
@@ -184,11 +189,11 @@ extern const struct address_space_operations vmsmb_aops;
 /* vmsmb_transport.c */
 int vmsmb_open_channel(struct vmsmb_session *sess);
 void vmsmb_close_channel(struct vmsmb_session *sess);
-int vmsmb_send_recv(struct vmsmb_session *sess,
-		    const void *send_buf, u32 send_len,
-		    void *recv_buf, u32 recv_buf_size,
-		    u32 *recv_len);
 int vmsmb_negotiate_version(struct vmsmb_session *sess);
+int vmsmb_smb2_transact(struct vmsmb_session *sess,
+			const void *smb2_req, u32 req_len,
+			void *smb2_resp, u32 resp_buf_size,
+			u32 *resp_len);
 
 /* vmsmb_smb2.c */
 int vmsmb_smb2_negotiate(struct vmsmb_session *sess);

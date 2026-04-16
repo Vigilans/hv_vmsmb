@@ -33,70 +33,25 @@ static void vmsmb_fill_hdr(struct smb2_hdr *hdr, u16 command,
 }
 
 /*
- * Wrap an SMB2 PDU in Direct TCP framing and send/recv.
+ * Validate SMB2 response header in a recv buffer.
+ * Returns pointer to SMB2 header within resp_buf.
  */
-static int vmsmb_smb2_send_recv(struct vmsmb_session *sess,
-				void *pdu, u32 pdu_len,
-				void *resp, u32 resp_size,
-				u32 *resp_len)
+static const struct smb2_hdr *vmsmb_check_resp(const void *resp_buf,
+					       u32 resp_len)
 {
-	struct smb2_direct_tcp_hdr *tcp;
-	u8 *buf;
-	u32 buf_len;
-	int ret;
+	const struct smb2_hdr *hdr = resp_buf;
 
-	/* Direct TCP header (4 bytes) + SMB2 PDU */
-	buf_len = sizeof(struct smb2_direct_tcp_hdr) + pdu_len;
-	buf = kmalloc(buf_len, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	tcp = (struct smb2_direct_tcp_hdr *)buf;
-	tcp->type = SMB2_DIRECT_TYPE_SMB2;
-	smb2_direct_tcp_set_size(tcp, pdu_len);
-	memcpy(buf + sizeof(*tcp), pdu, pdu_len);
-
-	ret = vmsmb_send_recv(sess, buf, buf_len, resp, resp_size, resp_len);
-	kfree(buf);
-	return ret;
-}
-
-/*
- * Parse an SMB2 response from the raw recv buffer.
- * The recv buffer contains: PipeHeader(8) + DirectTCP(4) + SMB2 PDU
- * Returns pointer to the SMB2 header and sets *smb2_len.
- */
-static const struct smb2_hdr *vmsmb_parse_response(const void *recv_buf,
-						    u32 recv_len,
-						    u32 *smb2_len)
-{
-	const struct smb2_direct_tcp_hdr *tcp;
-	const struct smb2_hdr *hdr;
-	u32 offset;
-
-	offset = sizeof(struct vmpipe_hdr) + sizeof(struct smb2_direct_tcp_hdr);
-	if (recv_len < offset + sizeof(struct smb2_hdr)) {
-		pr_err("response too short: %u bytes [%*ph]\n",
-		       recv_len, min_t(u32, recv_len, 32), recv_buf);
+	if (resp_len < sizeof(struct smb2_hdr)) {
+		pr_err("response too short: %u bytes\n", resp_len);
 		return NULL;
 	}
 
-	tcp = recv_buf + sizeof(struct vmpipe_hdr);
-
-	if (tcp->type != SMB2_DIRECT_TYPE_SMB2) {
-		pr_err("unexpected direct tcp type: %u\n", tcp->type);
-		return NULL;
-	}
-
-	hdr = recv_buf + offset;
 	if (hdr->ProtocolId != SMB2_PROTO_NUMBER) {
-		pr_err("bad SMB2 protocol id: 0x%08x (recv_len=%u, offset=%u, first32=[%*ph])\n",
-		       le32_to_cpu(hdr->ProtocolId), recv_len, offset,
-		       min_t(u32, recv_len, 32), recv_buf);
+		pr_err("bad SMB2 protocol id: 0x%08x\n",
+		       le32_to_cpu(hdr->ProtocolId));
 		return NULL;
 	}
 
-	*smb2_len = recv_len - offset;
 	return hdr;
 }
 
@@ -157,7 +112,7 @@ int vmsmb_smb2_negotiate(struct vmsmb_session *sess)
 		__le16 dialect;
 	} __packed pdu;
 	u8 *resp_buf;
-	u32 resp_len, smb2_len;
+	u32 resp_len;
 	const struct smb2_hdr *hdr;
 	const struct smb2_negotiate_rsp *rsp;
 	int ret;
@@ -175,12 +130,12 @@ int vmsmb_smb2_negotiate(struct vmsmb_session *sess)
 	/* ClientGUID left as zeros — VSMB doesn't use it */
 	pdu.dialect = cpu_to_le16(SMB21_PROT_ID);
 
-	ret = vmsmb_smb2_send_recv(sess, &pdu, sizeof(pdu),
-				   resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	ret = vmsmb_smb2_transact(sess, &pdu, sizeof(pdu),
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
 	if (ret)
 		goto out;
 
-	hdr = vmsmb_parse_response(resp_buf, resp_len, &smb2_len);
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
 	if (!hdr) {
 		ret = -EPROTO;
 		goto out;
@@ -190,13 +145,13 @@ int vmsmb_smb2_negotiate(struct vmsmb_session *sess)
 	if (ret)
 		goto out;
 
-	if (smb2_len < sizeof(struct smb2_negotiate_rsp)) {
-		pr_err("NEGOTIATE response too short: %u\n", smb2_len);
+	if (resp_len < sizeof(struct smb2_negotiate_rsp)) {
+		pr_err("NEGOTIATE response too short: %u\n", resp_len);
 		ret = -EPROTO;
 		goto out;
 	}
 
-	rsp = (const struct smb2_negotiate_rsp *)hdr;
+	rsp = (const struct smb2_negotiate_rsp *)resp_buf;
 	sess->max_transact_size = le32_to_cpu(rsp->MaxTransactSize);
 	sess->max_read_size = le32_to_cpu(rsp->MaxReadSize);
 	sess->max_write_size = le32_to_cpu(rsp->MaxWriteSize);
@@ -218,7 +173,7 @@ int vmsmb_smb2_session_setup(struct vmsmb_session *sess)
 {
 	struct smb2_sess_setup_req pdu;
 	u8 *resp_buf;
-	u32 resp_len, smb2_len;
+	u32 resp_len;
 	const struct smb2_hdr *hdr;
 	int ret;
 
@@ -236,12 +191,12 @@ int vmsmb_smb2_session_setup(struct vmsmb_session *sess)
 	pdu.SecurityBufferOffset = cpu_to_le16(sizeof(pdu));
 	pdu.SecurityBufferLength = cpu_to_le16(0);
 
-	ret = vmsmb_smb2_send_recv(sess, &pdu, sizeof(pdu),
-				   resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	ret = vmsmb_smb2_transact(sess, &pdu, sizeof(pdu),
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
 	if (ret)
 		goto out;
 
-	hdr = vmsmb_parse_response(resp_buf, resp_len, &smb2_len);
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
 	if (!hdr) {
 		ret = -EPROTO;
 		goto out;
@@ -283,7 +238,7 @@ int vmsmb_smb2_tree_connect(struct vmsmb_session *sess, const char *share_name)
 	__le16 *path_utf16;
 	int path_utf16_len, i;
 	u8 *resp_buf;
-	u32 resp_len, smb2_len;
+	u32 resp_len;
 	const struct smb2_hdr *hdr;
 	const struct smb2_tree_connect_rsp *rsp;
 	int ret;
@@ -327,14 +282,14 @@ int vmsmb_smb2_tree_connect(struct vmsmb_session *sess, const char *share_name)
 
 	kfree(path_utf16);
 
-	ret = vmsmb_smb2_send_recv(sess, pdu_buf, pdu_len,
-				   resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	ret = vmsmb_smb2_transact(sess, pdu_buf, pdu_len,
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
 	kfree(pdu_buf);
 
 	if (ret)
 		goto out;
 
-	hdr = vmsmb_parse_response(resp_buf, resp_len, &smb2_len);
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
 	if (!hdr) {
 		ret = -EPROTO;
 		goto out;
@@ -344,13 +299,13 @@ int vmsmb_smb2_tree_connect(struct vmsmb_session *sess, const char *share_name)
 	if (ret)
 		goto out;
 
-	if (smb2_len < sizeof(struct smb2_tree_connect_rsp)) {
+	if (resp_len < sizeof(struct smb2_tree_connect_rsp)) {
 		pr_err("TREE_CONNECT response too short\n");
 		ret = -EPROTO;
 		goto out;
 	}
 
-	rsp = (const struct smb2_tree_connect_rsp *)hdr;
+	rsp = (const struct smb2_tree_connect_rsp *)resp_buf;
 	sess->tree_id = le32_to_cpu(hdr->Id.SyncId.TreeId);
 
 	pr_info("TREE_CONNECT '%s': TreeId=%u ShareType=%u Capability=0x%x MaxAccess=0x%x\n",
@@ -400,7 +355,7 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, const char *path,
 	const struct smb2_hdr *hdr;
 	__le16 *name_utf16;
 	int name_len;
-	u32 pdu_len, resp_len, smb2_len;
+	u32 pdu_len, resp_len;
 	int ret;
 	const char *p;
 
@@ -457,13 +412,13 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, const char *path,
 		 path, desired_access, disposition, create_options, name_len, pdu_len,
 		 (unsigned)sizeof(struct smb2_create_req));
 
-	ret = vmsmb_smb2_send_recv(sess, pdu_buf, pdu_len,
-				   resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	ret = vmsmb_smb2_transact(sess, pdu_buf, pdu_len,
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
 	kfree(pdu_buf);
 	if (ret)
 		goto out;
 
-	hdr = vmsmb_parse_response(resp_buf, resp_len, &smb2_len);
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
 	if (!hdr) {
 		ret = -EPROTO;
 		goto out;
@@ -473,12 +428,12 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, const char *path,
 	if (ret)
 		goto out;
 
-	if (smb2_len < sizeof(struct smb2_create_rsp)) {
+	if (resp_len < sizeof(struct smb2_create_rsp)) {
 		ret = -EPROTO;
 		goto out;
 	}
 
-	rsp = (const struct smb2_create_rsp *)hdr;
+	rsp = (const struct smb2_create_rsp *)resp_buf;
 
 	if (fid) {
 		fid->persistent = rsp->PersistentFileId;
@@ -506,7 +461,7 @@ int vmsmb_smb2_close(struct vmsmb_session *sess, struct vmsmb_fid *fid)
 {
 	struct smb2_close_req pdu;
 	u8 *resp_buf;
-	u32 resp_len, smb2_len;
+	u32 resp_len;
 	const struct smb2_hdr *hdr;
 	int ret;
 
@@ -520,12 +475,12 @@ int vmsmb_smb2_close(struct vmsmb_session *sess, struct vmsmb_fid *fid)
 	pdu.PersistentFileId = fid->persistent;
 	pdu.VolatileFileId = fid->volatile_id;
 
-	ret = vmsmb_smb2_send_recv(sess, &pdu, sizeof(pdu),
-				   resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	ret = vmsmb_smb2_transact(sess, &pdu, sizeof(pdu),
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
 	if (ret)
 		goto out;
 
-	hdr = vmsmb_parse_response(resp_buf, resp_len, &smb2_len);
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
 	if (!hdr) {
 		ret = -EPROTO;
 		goto out;
@@ -546,7 +501,7 @@ int vmsmb_smb2_read(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 {
 	struct smb2_read_req pdu;
 	u8 *resp_buf;
-	u32 resp_len, smb2_len, resp_buf_size;
+	u32 resp_len, resp_buf_size;
 	const struct smb2_hdr *hdr;
 	const struct smb2_read_rsp *rsp;
 	u32 data_offset, data_len;
@@ -555,13 +510,8 @@ int vmsmb_smb2_read(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 	if (length > sess->max_read_size)
 		length = sess->max_read_size;
 
-	/* Response: PipeHdr(8) + DirectTCP(4) + SMB2_hdr(64) + ReadRsp + data
-	 * Add 4KB padding for VMBus packet coalescing — the last VMBus
-	 * packet may contain data from the next response.
-	 */
-	resp_buf_size = sizeof(struct vmpipe_hdr) +
-			sizeof(struct smb2_direct_tcp_hdr) +
-			sizeof(struct smb2_read_rsp) + length + 4096;
+	/* Response buffer: SMB2 READ response header + data */
+	resp_buf_size = sizeof(struct smb2_read_rsp) + length + 4096;
 	resp_buf = kvmalloc(resp_buf_size, GFP_KERNEL);
 	if (!resp_buf)
 		return -ENOMEM;
@@ -576,12 +526,12 @@ int vmsmb_smb2_read(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 	pdu.MinimumCount = cpu_to_le32(0);
 	pdu.RemainingBytes = cpu_to_le32(0);
 
-	ret = vmsmb_smb2_send_recv(sess, &pdu, sizeof(pdu),
-				   resp_buf, resp_buf_size, &resp_len);
+	ret = vmsmb_smb2_transact(sess, &pdu, sizeof(pdu),
+				  resp_buf, resp_buf_size, &resp_len);
 	if (ret)
 		goto out;
 
-	hdr = vmsmb_parse_response(resp_buf, resp_len, &smb2_len);
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
 	if (!hdr) {
 		ret = -EPROTO;
 		goto out;
@@ -591,11 +541,11 @@ int vmsmb_smb2_read(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 	if (ret)
 		goto out;
 
-	rsp = (const struct smb2_read_rsp *)hdr;
+	rsp = (const struct smb2_read_rsp *)resp_buf;
 	data_offset = le16_to_cpu(rsp->DataOffset);
 	data_len = le32_to_cpu(rsp->DataLength);
 
-	if (data_offset + data_len > smb2_len) {
+	if (data_offset + data_len > resp_len) {
 		ret = -EPROTO;
 		goto out;
 	}
@@ -603,7 +553,7 @@ int vmsmb_smb2_read(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 	if (data_len > length)
 		data_len = length;
 
-	memcpy(data, (const u8 *)hdr + data_offset, data_len);
+	memcpy(data, (const u8 *)resp_buf + data_offset, data_len);
 	*bytes_read = data_len;
 
 out:
@@ -622,7 +572,7 @@ int vmsmb_smb2_write(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 	struct smb2_write_req *req;
 	const struct smb2_write_rsp *rsp;
 	const struct smb2_hdr *hdr;
-	u32 pdu_len, resp_len, smb2_len;
+	u32 pdu_len, resp_len;
 	u32 data_offset;
 	int ret;
 
@@ -656,13 +606,13 @@ int vmsmb_smb2_write(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 
 	memcpy(pdu_buf + data_offset, data, length);
 
-	ret = vmsmb_smb2_send_recv(sess, pdu_buf, pdu_len,
-				   resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	ret = vmsmb_smb2_transact(sess, pdu_buf, pdu_len,
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
 	kvfree(pdu_buf);
 	if (ret)
 		goto out;
 
-	hdr = vmsmb_parse_response(resp_buf, resp_len, &smb2_len);
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
 	if (!hdr) {
 		ret = -EPROTO;
 		goto out;
@@ -672,7 +622,7 @@ int vmsmb_smb2_write(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 	if (ret)
 		goto out;
 
-	rsp = (const struct smb2_write_rsp *)hdr;
+	rsp = (const struct smb2_write_rsp *)resp_buf;
 	*bytes_written = le32_to_cpu(rsp->DataLength);
 
 out:
@@ -694,17 +644,12 @@ int vmsmb_smb2_query_dir(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 	const struct smb2_hdr *hdr;
 	__le16 *pat_utf16;
 	int pat_len;
-	u32 pdu_len, resp_len, smb2_len, resp_buf_size;
+	u32 pdu_len, resp_len, resp_buf_size;
 	u32 out_offset, out_len;
 	int ret;
 
-	/*
-	 * recv buffer must hold PipeHdr + DirectTCP + SMB2 headers +
-	 * the output data (up to buf_size bytes).
-	 */
-	resp_buf_size = sizeof(struct vmpipe_hdr) +
-			sizeof(struct smb2_direct_tcp_hdr) +
-			sizeof(struct smb2_query_directory_rsp) + buf_size;
+	/* SMB2 response: header + output data (up to buf_size bytes) */
+	resp_buf_size = sizeof(struct smb2_query_directory_rsp) + buf_size;
 	resp_buf = kvmalloc(resp_buf_size, GFP_KERNEL);
 	if (!resp_buf)
 		return -ENOMEM;
@@ -738,13 +683,13 @@ int vmsmb_smb2_query_dir(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 
 	kfree(pat_utf16);
 
-	ret = vmsmb_smb2_send_recv(sess, pdu_buf, pdu_len,
-				   resp_buf, resp_buf_size, &resp_len);
+	ret = vmsmb_smb2_transact(sess, pdu_buf, pdu_len,
+				  resp_buf, resp_buf_size, &resp_len);
 	kfree(pdu_buf);
 	if (ret)
 		goto out;
 
-	hdr = vmsmb_parse_response(resp_buf, resp_len, &smb2_len);
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
 	if (!hdr) {
 		ret = -EPROTO;
 		goto out;
@@ -754,16 +699,16 @@ int vmsmb_smb2_query_dir(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 	if (ret)
 		goto out;
 
-	rsp = (const struct smb2_query_directory_rsp *)hdr;
+	rsp = (const struct smb2_query_directory_rsp *)resp_buf;
 	out_offset = le16_to_cpu(rsp->OutputBufferOffset);
 	out_len = le32_to_cpu(rsp->OutputBufferLength);
 
-	if (out_offset + out_len > smb2_len || out_len > buf_size) {
+	if (out_offset + out_len > resp_len || out_len > buf_size) {
 		ret = -EPROTO;
 		goto out;
 	}
 
-	memcpy(buf, (const u8 *)hdr + out_offset, out_len);
+	memcpy(buf, (const u8 *)resp_buf + out_offset, out_len);
 	*data_len = out_len;
 
 out:

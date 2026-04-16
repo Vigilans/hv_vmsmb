@@ -140,14 +140,14 @@ static int vmsmb_recv_response(struct vmsmb_session *sess,
 
 			if (expected_total == 0 &&
 			    offset - hdr_reserve >=
-					sizeof(struct smb2_direct_tcp_hdr)) {
-				const struct smb2_direct_tcp_hdr *tcp =
+					sizeof(struct smb2_stream_hdr)) {
+				const struct smb2_stream_hdr *sh =
 					recv_buf + hdr_reserve;
 				u32 body_size =
-					smb2_direct_tcp_get_size(tcp);
+					smb2_stream_get_size(sh);
 
 				expected_total = hdr_reserve +
-					sizeof(struct smb2_direct_tcp_hdr) +
+					sizeof(struct smb2_stream_hdr) +
 					body_size;
 			}
 		}
@@ -188,7 +188,7 @@ static int vmsmb_recv_response(struct vmsmb_session *sess,
 	return 0;
 }
 
-int vmsmb_send_recv(struct vmsmb_session *sess,
+static int vmsmb_send_recv(struct vmsmb_session *sess,
 		    const void *send_buf, u32 send_len,
 		    void *recv_buf, u32 recv_buf_size,
 		    u32 *recv_len)
@@ -236,23 +236,103 @@ int vmsmb_send_recv(struct vmsmb_session *sess,
 }
 
 /*
+ * SMB2-level transact: send a pure SMB2 PDU, receive a pure SMB2 response.
+ *
+ * Handles all transport framing (PipeHdr + StreamHdr) internally so the
+ * SMB2 layer has no knowledge of VMBus pipe mode or stream framing.
+ *
+ * @smb2_req / @req_len:       SMB2 request PDU (no framing headers)
+ * @smb2_resp / @resp_buf_size: caller-allocated buffer for SMB2 response
+ * @resp_len:                  actual SMB2 response length on success
+ */
+int vmsmb_smb2_transact(struct vmsmb_session *sess,
+			const void *smb2_req, u32 req_len,
+			void *smb2_resp, u32 resp_buf_size,
+			u32 *resp_len)
+{
+	const u32 hdr_overhead = sizeof(struct vmpipe_hdr) +
+				 sizeof(struct smb2_stream_hdr);
+	struct smb2_stream_hdr *sh;
+	u8 *send_buf;
+	u32 send_len;
+	void *recv_buf;
+	u32 recv_buf_size, recv_len;
+	u32 smb2_size;
+	int ret;
+
+	/* Build send payload: StreamHdr(type=0) + SMB2 PDU */
+	send_len = sizeof(struct smb2_stream_hdr) + req_len;
+	send_buf = kmalloc(send_len, GFP_KERNEL);
+	if (!send_buf)
+		return -ENOMEM;
+
+	sh = (struct smb2_stream_hdr *)send_buf;
+	sh->type = SMB2_STREAM_TYPE_SMB2;
+	smb2_stream_set_size(sh, req_len);
+	memcpy(send_buf + sizeof(*sh), smb2_req, req_len);
+
+	/* Allocate recv buffer with room for transport headers */
+	recv_buf_size = hdr_overhead + resp_buf_size;
+	recv_buf = kvmalloc(recv_buf_size, GFP_KERNEL);
+	if (!recv_buf) {
+		kfree(send_buf);
+		return -ENOMEM;
+	}
+
+	ret = vmsmb_send_recv(sess, send_buf, send_len,
+			      recv_buf, recv_buf_size, &recv_len);
+	kfree(send_buf);
+	if (ret) {
+		kvfree(recv_buf);
+		return ret;
+	}
+
+	/* Validate transport headers */
+	if (recv_len < hdr_overhead) {
+		pr_err("smb2_transact: response too short: %u\n", recv_len);
+		kvfree(recv_buf);
+		return -EPROTO;
+	}
+
+	sh = (struct smb2_stream_hdr *)((u8 *)recv_buf +
+					sizeof(struct vmpipe_hdr));
+	if (sh->type != SMB2_STREAM_TYPE_SMB2) {
+		pr_err("smb2_transact: unexpected stream type: %u\n",
+		       sh->type);
+		kvfree(recv_buf);
+		return -EPROTO;
+	}
+
+	/* Copy SMB2 portion to caller's buffer */
+	smb2_size = recv_len - hdr_overhead;
+	if (smb2_size > resp_buf_size)
+		smb2_size = resp_buf_size;
+
+	memcpy(smb2_resp, (u8 *)recv_buf + hdr_overhead, smb2_size);
+	*resp_len = smb2_size;
+
+	kvfree(recv_buf);
+	return 0;
+}
+
+/*
  * VSMB version negotiation (pre-SMB2).
  */
 int vmsmb_negotiate_version(struct vmsmb_session *sess)
 {
 	struct {
-		struct smb2_direct_tcp_hdr tcp;
+		struct smb2_stream_hdr stream;
 		struct vsmb_version_payload ver;
 	} __packed req;
 	u8 resp_buf[64];
 	u32 resp_len;
 	const struct vmpipe_hdr *pipe_resp;
-	const struct smb2_direct_tcp_hdr *tcp_resp;
+	const struct smb2_stream_hdr *stream_resp;
 	const struct vsmb_version_payload *ver_resp;
 	int ret;
 
-	req.tcp.type = SMB2_DIRECT_TYPE_VERSION;
-	smb2_direct_tcp_set_size(&req.tcp, sizeof(req.ver));
+	req.stream.type = SMB2_STREAM_TYPE_VERSION;
+	smb2_stream_set_size(&req.stream, sizeof(req.ver));
 	req.ver.version = cpu_to_le32(VSMB_VERSION_1);
 	req.ver.capabilities = cpu_to_le32(VSMB_CAP_DIRECTMAP);
 
@@ -262,21 +342,21 @@ int vmsmb_negotiate_version(struct vmsmb_session *sess)
 		return ret;
 
 	if (resp_len < sizeof(struct vmpipe_hdr) +
-		       sizeof(struct smb2_direct_tcp_hdr) +
+		       sizeof(struct smb2_stream_hdr) +
 		       sizeof(struct vsmb_version_payload)) {
 		pr_err("version response too short: %u\n", resp_len);
 		return -EPROTO;
 	}
 
 	pipe_resp = (const struct vmpipe_hdr *)resp_buf;
-	tcp_resp = (const struct smb2_direct_tcp_hdr *)
-		   (resp_buf + sizeof(struct vmpipe_hdr));
+	stream_resp = (const struct smb2_stream_hdr *)
+		      (resp_buf + sizeof(struct vmpipe_hdr));
 	ver_resp = (const struct vsmb_version_payload *)
 		   (resp_buf + sizeof(struct vmpipe_hdr) +
-		    sizeof(struct smb2_direct_tcp_hdr));
+		    sizeof(struct smb2_stream_hdr));
 
-	if (tcp_resp->type != SMB2_DIRECT_TYPE_VERSION) {
-		pr_err("unexpected response type: %u\n", tcp_resp->type);
+	if (stream_resp->type != SMB2_STREAM_TYPE_VERSION) {
+		pr_err("unexpected response type: %u\n", stream_resp->type);
 		return -EPROTO;
 	}
 
