@@ -1222,13 +1222,36 @@ static void vmsmb_free_inode(struct inode *inode)
 
 static int vmsmb_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
+	struct vmsmb_sb_info *sbi = VMSMB_SB(dentry->d_sb);
+	struct smb2_fs_full_size_info fs;
+	u32 sectors_per_unit, bytes_per_sector;
+	u64 unit_size;
+	int ret;
+
 	buf->f_type = 0x564D5342; /* "VMSB" */
-	buf->f_bsize = 4096;
 	buf->f_namelen = 255;
-	/* Report large capacity so tools don't refuse to operate */
-	buf->f_blocks = 1024 * 1024 * 1024ULL / 4096; /* 1 TiB */
-	buf->f_bfree = 1024 * 1024 * 1024ULL / 4096;
-	buf->f_bavail = 1024 * 1024 * 1024ULL / 4096;
+
+	ret = vmsmb_smb2_queryfs(sbi->sess, sbi->tree_id, &fs);
+	if (ret) {
+		/* Server query failed — fall back to a non-zero but obviously
+		 * fake report so userspace tools don't refuse to operate. */
+		buf->f_bsize = 4096;
+		buf->f_blocks = 1024 * 1024 * 1024ULL / 4096;
+		buf->f_bfree = buf->f_blocks;
+		buf->f_bavail = buf->f_blocks;
+		return 0;
+	}
+
+	sectors_per_unit = le32_to_cpu(fs.SectorsPerAllocationUnit);
+	bytes_per_sector = le32_to_cpu(fs.BytesPerSector);
+	unit_size = (u64)sectors_per_unit * bytes_per_sector;
+	if (!unit_size)
+		unit_size = 4096;
+
+	buf->f_bsize = unit_size;
+	buf->f_blocks = le64_to_cpu(fs.TotalAllocationUnits);
+	buf->f_bfree = le64_to_cpu(fs.ActualAvailableAllocationUnits);
+	buf->f_bavail = le64_to_cpu(fs.CallerAvailableAllocationUnits);
 	return 0;
 }
 

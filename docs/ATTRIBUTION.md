@@ -56,6 +56,7 @@ projects use GPL-2.0-compatible licenses.
 | IOCTL | **Simplified** from CIFS `SMB2_ioctl()` | Single synchronous round-trip, no compound/async/credit |
 | `vmsmb_smb2_get_reparse` | **Ported** from CIFS `smb2_query_reparse_point()` | Same flags, separate CREATE+IOCTL+CLOSE |
 | `vmsmb_smb2_create_symlink` | **Simplified** from CIFS `create_native_symlink()` | No symlinkroot, directory detection, or xattr contexts |
+| `vmsmb_smb2_queryfs` | **Simplified** from CIFS `smb2_queryfs()` | QUERY_INFO InfoType=FILESYSTEM, FileInfoClass=FS_FULL_SIZE_INFORMATION on share root; CIFS uses compound CREATE+QUERY+CLOSE, we use three round-trips |
 
 ### vmsmb_vfs.c
 
@@ -90,7 +91,7 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_readdir` | **Original** | Parses `FILE_DIRECTORY_INFO` chain |
 | `vmsmb_utf16_name_to_utf8` | **Ported** from kernel `utf16s_to_utf8s()` | Corresponds to CIFS `cifs_from_utf16()`, without NLS/SFU/SFM |
 | `vmsmb_issue_read` / `issue_write` | **Original** | netfs callbacks; CIFS versions are async |
-| `vmsmb_statfs` | **Original** | Hardcoded values, no server query |
+| `vmsmb_statfs` | **Original** | Calls `vmsmb_smb2_queryfs()` and converts FS_FULL_SIZE_INFORMATION to `kstatfs` |
 | `vmsmb_getattr` | **Original** | `generic_fillattr` only, no server revalidation |
 
 ## Summary
