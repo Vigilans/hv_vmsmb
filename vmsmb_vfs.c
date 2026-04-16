@@ -732,6 +732,7 @@ const struct file_operations vmsmb_file_ops = {
 	.write_iter	= netfs_unbuffered_write_iter,
 	.llseek		= vmsmb_file_llseek,
 	.fsync		= vmsmb_fsync,
+	.mmap		= generic_file_mmap,
 };
 
 /* ---- Directory operations ---- */
