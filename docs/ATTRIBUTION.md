@@ -28,7 +28,8 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_channel_cb` (parse + dispatch) | **Original** | Design inspired by libsmb2 pdu/callback model; implementation is VMBus tasklet-based, no code ported |
 | `vmsmb_process_data` (stream reassembly) | **Original** | DirectTCP frame splitting + SMB2 MessageId matching + per-request dispatch |
 | `vmsmb_request` struct | **Original** | Analogous to libsmb2 `smb2_pdu` / CIFS `mid_q_entry`; fields designed for VMBus transport |
-| `vmsmb_smb2_transact` (async) | **Original** | Per-request send + `wait_for_completion`; `send_mutex` only protects `vmbus_sendpacket` |
+| `vmsmb_smb2_transact` (async) | **Original** | Per-request send + `wait_for_completion`; `send_mutex` only protects `vmbus_sendpacket`; `spin_lock_bh` for pending_lock (shared with tasklet) |
+| Adaptive spinning (`VMSMB_SPIN_USEC`) | **Original** | `completion_done()` busy-poll before `wait_for_completion`; concept from NVMe `nvme_poll_cq()`, no code ported |
 | `vmsmb_send_recv_sync` | **Original** | Synchronous path retained for version negotiation only |
 | `vmsmb_negotiate_version` | **Original** | VSMB version protocol is entirely reverse-engineered |
 | EAGAIN retry + post-negotiate drain | **Original** | Discovered empirically |
