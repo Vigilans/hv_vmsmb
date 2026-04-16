@@ -227,4 +227,20 @@ typedef struct {
 	/* NB flags can come from FILE_SYSTEM_DEVICE_INFO call   */
 } __packed FILE_SYSTEM_POSIX_INFO;
 
+/*
+ * See MS-FSCC 2.4.7. Upstream defines this as FILE_BASIC_INFO in
+ * fs/cifs/cifspdu.h (CIFS client only, LGPL-2.1); we mirror it here
+ * so it lives alongside the other FSCC structs.
+ * Timestamp 0 = "do not change"; -1 = "maintain current".
+ * FileAttributes 0 = "do not change".
+ */
+typedef struct {
+	__le64 CreationTime;
+	__le64 LastAccessTime;
+	__le64 LastWriteTime;
+	__le64 ChangeTime;
+	__le32 Attributes;
+	__u32  Pad;
+} __packed FILE_BASIC_INFO;
+
 #endif /* _COMMON_SMB_FSCC_H */

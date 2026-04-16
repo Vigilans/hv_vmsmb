@@ -14,6 +14,7 @@
 #include <linux/types.h>
 #include <linux/fs.h>
 #include <linux/netfs.h>
+#include "fscc.h"
 
 /* VSMB class GUID: 4d12e519-17a0-4ae4-8eaa-5270fc6abdb7 */
 #define HV_VSMB_GUID \
@@ -272,6 +273,9 @@ int vmsmb_smb2_create_symlink(struct vmsmb_session *sess, u32 tree_id,
 struct smb2_fs_full_size_info;
 int vmsmb_smb2_queryfs(struct vmsmb_session *sess, u32 tree_id,
 		       struct smb2_fs_full_size_info *out);
+int vmsmb_smb2_set_basic_info(struct vmsmb_session *sess, u32 tree_id,
+			      const char *path,
+			      const FILE_BASIC_INFO *binfo);
 
 /* vmsmb_vfs.c */
 extern struct file_system_type vmsmb_fs_type;

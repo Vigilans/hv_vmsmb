@@ -697,9 +697,72 @@ const struct inode_operations vmsmb_symlink_inode_ops = {
 	.getattr	= vmsmb_getattr,
 };
 
+/*
+ * Convert a Linux timespec64 to a Windows FILETIME (100-ns intervals
+ * since 1601-01-01). Inverse of vmsmb_time_to_ts().
+ */
+static inline u64 vmsmb_ts_to_filetime(struct timespec64 ts)
+{
+	return (u64)ts.tv_sec * 10000000ULL +
+	       (u64)ts.tv_nsec / 100ULL +
+	       116444736000000000ULL;
+}
+
+/*
+ * Push atime/mtime/ctime changes to the server via SMB2 SET_INFO
+ * (FileBasicInformation). uid/gid/mode are kept local (matching CIFS
+ * default without modefromsid). Size changes fall through to
+ * simple_setattr and do not reach the server — truncate-push is a
+ * separate gap (TODO).
+ *
+ * Port of CIFS cifs_setattr() path (fs/smb/client/inode.c) which also
+ * uses SET_INFO with FILE_BASIC_INFO to push timestamps.
+ */
+static int vmsmb_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+			 struct iattr *attr)
+{
+	struct inode *inode = d_inode(dentry);
+	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
+	struct vmsmb_session *sess = sbi->sess;
+	char *path = NULL;
+	int ret;
+
+	ret = setattr_prepare(idmap, dentry, attr);
+	if (ret)
+		return ret;
+
+	if (attr->ia_valid & (ATTR_ATIME | ATTR_MTIME | ATTR_CTIME)) {
+		FILE_BASIC_INFO binfo = {};
+
+		if (attr->ia_valid & ATTR_ATIME)
+			binfo.LastAccessTime =
+				cpu_to_le64(vmsmb_ts_to_filetime(attr->ia_atime));
+		if (attr->ia_valid & ATTR_MTIME)
+			binfo.LastWriteTime =
+				cpu_to_le64(vmsmb_ts_to_filetime(attr->ia_mtime));
+		if (attr->ia_valid & ATTR_CTIME)
+			binfo.ChangeTime =
+				cpu_to_le64(vmsmb_ts_to_filetime(attr->ia_ctime));
+
+		path = vmsmb_build_path(dentry);
+		if (IS_ERR(path))
+			return PTR_ERR(path);
+
+		ret = vmsmb_smb2_set_basic_info(sess, sbi->tree_id, path, &binfo);
+		kfree(path);
+		if (ret)
+			return ret;
+	}
+
+	setattr_copy(idmap, inode, attr);
+	mark_inode_dirty(inode);
+	return 0;
+}
+
 const struct inode_operations vmsmb_dir_inode_ops = {
 	.lookup		= vmsmb_lookup,
 	.getattr	= vmsmb_getattr,
+	.setattr	= vmsmb_setattr,
 	.create		= vmsmb_create,
 	.mkdir		= vmsmb_mkdir,
 	.unlink		= vmsmb_unlink,
@@ -711,6 +774,7 @@ const struct inode_operations vmsmb_dir_inode_ops = {
 
 const struct inode_operations vmsmb_file_inode_ops = {
 	.getattr	= vmsmb_getattr,
+	.setattr	= vmsmb_setattr,
 };
 
 /* ---- Address space operations (netfs) ---- */

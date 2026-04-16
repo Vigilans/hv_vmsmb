@@ -1375,3 +1375,81 @@ close:
 	vmsmb_smb2_close(sess, tree_id, &fid);
 	return ret;
 }
+
+/*
+ * SMB2 SET_INFO (FileBasicInformation) — push timestamps + file attributes.
+ *
+ * Simplified from CIFS smb2_set_file_info_compound() / set_basic_info path
+ * (fs/smb/client/smb2inode.c). CIFS issues a compound CREATE+SET_INFO+CLOSE;
+ * we do three separate round-trips.
+ *
+ * Per MS-FSCC 2.4.7: timestamp value 0 means "do not change", -1 means
+ * "maintain current". FileAttributes = 0 also means "do not change".
+ *
+ * @path: path relative to share root (empty string for share root)
+ * @binfo: 40-byte FILE_BASIC_INFORMATION payload (caller-filled)
+ */
+int vmsmb_smb2_set_basic_info(struct vmsmb_session *sess, u32 tree_id,
+			      const char *path,
+			      const FILE_BASIC_INFO *binfo)
+{
+	struct vmsmb_fid fid;
+	u8 *pdu_buf, *resp_buf;
+	struct smb2_set_info_req *req;
+	const struct smb2_hdr *hdr;
+	u32 buf_len, pdu_len, resp_len;
+	int ret;
+
+	ret = vmsmb_smb2_create(sess, tree_id, path, FILE_WRITE_ATTRIBUTES,
+				FILE_OPEN, 0, &fid, NULL);
+	if (ret)
+		return ret;
+
+	buf_len = sizeof(struct smb2_set_info_req) + sizeof(*binfo);
+	pdu_buf = kzalloc(buf_len, GFP_KERNEL);
+	if (!pdu_buf) {
+		ret = -ENOMEM;
+		goto close;
+	}
+
+	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
+	if (!resp_buf) {
+		kfree(pdu_buf);
+		ret = -ENOMEM;
+		goto close;
+	}
+
+	req = (struct smb2_set_info_req *)pdu_buf;
+	vmsmb_fill_hdr(&req->hdr, SMB2_SET_INFO_HE, sess, tree_id);
+	req->StructureSize = cpu_to_le16(33);
+	req->InfoType = SMB2_O_INFO_FILE;
+	req->FileInfoClass = FILE_BASIC_INFORMATION;
+	req->BufferLength = cpu_to_le32(sizeof(*binfo));
+	req->BufferOffset = cpu_to_le16(sizeof(struct smb2_set_info_req));
+	req->AdditionalInformation = 0;
+	req->PersistentFileId = fid.persistent;
+	req->VolatileFileId = fid.volatile_id;
+	memcpy(req->Buffer, binfo, sizeof(*binfo));
+
+	pdu_len = sizeof(struct smb2_set_info_req) + sizeof(*binfo);
+
+	ret = vmsmb_smb2_transact(sess, pdu_buf, pdu_len,
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	kfree(pdu_buf);
+	if (ret)
+		goto free_resp;
+
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
+	if (!hdr) {
+		ret = -EPROTO;
+		goto free_resp;
+	}
+
+	ret = vmsmb_check_status(hdr, "SET_INFO(basic)");
+
+free_resp:
+	kfree(resp_buf);
+close:
+	vmsmb_smb2_close(sess, tree_id, &fid);
+	return ret;
+}
