@@ -337,6 +337,41 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 	return ret;
 }
 
+static int vmsmb_rename(struct mnt_idmap *idmap,
+			struct inode *old_dir, struct dentry *old_dentry,
+			struct inode *new_dir, struct dentry *new_dentry,
+			unsigned int flags)
+{
+	struct vmsmb_sb_info *sbi = VMSMB_SB(old_dir->i_sb);
+	struct vmsmb_session *sess = sbi->sess;
+	char *old_path, *new_path;
+	bool replace;
+	int ret;
+
+	if (flags & ~RENAME_NOREPLACE)
+		return -EINVAL;
+
+	old_path = vmsmb_build_path(old_dentry);
+	if (IS_ERR(old_path))
+		return PTR_ERR(old_path);
+
+	new_path = vmsmb_build_path(new_dentry);
+	if (IS_ERR(new_path)) {
+		kfree(old_path);
+		return PTR_ERR(new_path);
+	}
+
+	replace = !(flags & RENAME_NOREPLACE);
+
+	mutex_lock(&sess->transport_mutex);
+	ret = vmsmb_smb2_rename(sess, old_path, new_path, replace);
+	mutex_unlock(&sess->transport_mutex);
+
+	kfree(old_path);
+	kfree(new_path);
+	return ret;
+}
+
 const struct inode_operations vmsmb_dir_inode_ops = {
 	.lookup		= vmsmb_lookup,
 	.getattr	= vmsmb_getattr,
@@ -344,6 +379,7 @@ const struct inode_operations vmsmb_dir_inode_ops = {
 	.mkdir		= vmsmb_mkdir,
 	.unlink		= vmsmb_unlink,
 	.rmdir		= vmsmb_rmdir,
+	.rename		= vmsmb_rename,
 };
 
 const struct inode_operations vmsmb_file_inode_ops = {
