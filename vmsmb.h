@@ -197,14 +197,6 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 			void *smb2_resp, u32 resp_buf_size,
 			u32 *resp_len);
 
-/* FSCTL codes for reparse point operations (smbfsctl.h) */
-#define FSCTL_SET_REPARSE_POINT		0x000900a4
-#define FSCTL_GET_REPARSE_POINT		0x000900a8
-
-/* Reparse point tags (smbfsctl.h) */
-#define IO_REPARSE_TAG_MOUNT_POINT	0xa0000003
-#define IO_REPARSE_TAG_SYMLINK		0xa000000c
-
 /* vmsmb_smb2.c */
 int vmsmb_smb2_negotiate(struct vmsmb_session *sess);
 int vmsmb_smb2_session_setup(struct vmsmb_session *sess);

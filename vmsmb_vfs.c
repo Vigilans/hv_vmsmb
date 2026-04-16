@@ -21,9 +21,11 @@
 #include <linux/fs_parser.h>
 #include "vmsmb.h"
 #include "smb2pdu.h"
+#include "smb1pdu.h"
+#include "smbfsctl.h"
 #include "fscc.h"
 
-/* SMB2 access masks */
+/* SMB2 access masks (combinations of standard constants from smb2pdu.h) */
 #define VMSMB_READ_ACCESS	(FILE_READ_DATA | FILE_READ_ATTRIBUTES | \
 				 GENERIC_READ)
 #define VMSMB_WRITE_ACCESS	(FILE_WRITE_DATA | FILE_APPEND_DATA | \
@@ -31,18 +33,6 @@
 #define VMSMB_RW_ACCESS		(VMSMB_READ_ACCESS | VMSMB_WRITE_ACCESS)
 #define VMSMB_DIR_ACCESS	(FILE_READ_DATA | FILE_READ_ATTRIBUTES | \
 				 GENERIC_READ)
-
-/* SMB2 create dispositions */
-#define VMSMB_FILE_OPEN		0x01
-#define VMSMB_FILE_CREATE	0x02
-#define VMSMB_FILE_OPEN_IF	0x03
-#define VMSMB_FILE_OVERWRITE_IF	0x05
-
-/* SMB2 create options */
-#define VMSMB_FILE_DIRECTORY		0x00000001
-#define VMSMB_FILE_NON_DIRECTORY	0x00000040
-#define VMSMB_FILE_DELETE_ON_CLOSE	0x00001000
-#define VMSMB_FILE_OPEN_REPARSE_POINT	0x00200000
 
 /* Inode number counter */
 static atomic64_t vmsmb_ino_counter = ATOMIC64_INIT(2);
@@ -260,8 +250,8 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 
 	mutex_lock(&sess->transport_mutex);
 	ret = vmsmb_smb2_create(sess, path, FILE_READ_ATTRIBUTES,
-				VMSMB_FILE_OPEN,
-				VMSMB_FILE_OPEN_REPARSE_POINT,
+				FILE_OPEN,
+				OPEN_REPARSE_POINT,
 				&fid, &info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, &fid);
@@ -355,8 +345,8 @@ static int vmsmb_create(struct mnt_idmap *idmap, struct inode *dir,
 
 	mutex_lock(&sess->transport_mutex);
 	ret = vmsmb_smb2_create(sess, path, VMSMB_RW_ACCESS,
-				excl ? VMSMB_FILE_CREATE : VMSMB_FILE_OPEN_IF,
-				VMSMB_FILE_NON_DIRECTORY, &fid, &info);
+				excl ? FILE_CREATE : FILE_OPEN_IF,
+				CREATE_NOT_DIR, &fid, &info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, &fid);
 	mutex_unlock(&sess->transport_mutex);
@@ -394,7 +384,7 @@ static struct dentry *vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 
 	mutex_lock(&sess->transport_mutex);
 	ret = vmsmb_smb2_create(sess, path, VMSMB_DIR_ACCESS,
-				VMSMB_FILE_CREATE, VMSMB_FILE_DIRECTORY,
+				FILE_CREATE, CREATE_NOT_FILE,
 				&fid, &info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, &fid);
@@ -453,9 +443,9 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 
 	mutex_lock(&sess->transport_mutex);
 	ret = vmsmb_smb2_create(sess, path, 0x00010000 /* DELETE */,
-				VMSMB_FILE_OPEN,
-				VMSMB_FILE_DELETE_ON_CLOSE |
-				VMSMB_FILE_DIRECTORY,
+				FILE_OPEN,
+				CREATE_DELETE_ON_CLOSE |
+				CREATE_NOT_FILE,
 				&fid, NULL);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, &fid);
@@ -561,8 +551,8 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	/* Re-stat to get inode attributes */
 	mutex_lock(&sess->transport_mutex);
 	ret = vmsmb_smb2_create(sess, path, FILE_READ_ATTRIBUTES,
-				VMSMB_FILE_OPEN,
-				VMSMB_FILE_OPEN_REPARSE_POINT,
+				FILE_OPEN,
+				OPEN_REPARSE_POINT,
 				&fid, &info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, &fid);
@@ -672,7 +662,7 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 		}
 		mutex_lock(&sess->transport_mutex);
 		ret = vmsmb_smb2_create(sess, path, VMSMB_READ_ACCESS,
-					VMSMB_FILE_OPEN, VMSMB_FILE_NON_DIRECTORY,
+					FILE_OPEN, CREATE_NOT_DIR,
 					&temp_fid, NULL);
 		mutex_unlock(&sess->transport_mutex);
 		kfree(path);
@@ -776,7 +766,7 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 		}
 		mutex_lock(&sess->transport_mutex);
 		ret = vmsmb_smb2_create(sess, path, VMSMB_WRITE_ACCESS,
-					VMSMB_FILE_OPEN, VMSMB_FILE_NON_DIRECTORY,
+					FILE_OPEN, CREATE_NOT_DIR,
 					&temp_fid, NULL);
 		mutex_unlock(&sess->transport_mutex);
 		kfree(path);
@@ -869,20 +859,20 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 
 	if (file->f_flags & O_CREAT) {
 		if (file->f_flags & O_EXCL)
-			disposition = VMSMB_FILE_CREATE;
+			disposition = FILE_CREATE;
 		else if (file->f_flags & O_TRUNC)
-			disposition = VMSMB_FILE_OVERWRITE_IF;
+			disposition = FILE_OVERWRITE_IF;
 		else
-			disposition = VMSMB_FILE_OPEN_IF;
+			disposition = FILE_OPEN_IF;
 	} else if (file->f_flags & O_TRUNC) {
-		disposition = VMSMB_FILE_OVERWRITE_IF;
+		disposition = FILE_OVERWRITE_IF;
 	} else {
-		disposition = VMSMB_FILE_OPEN;
+		disposition = FILE_OPEN;
 	}
 
 	mutex_lock(&sess->transport_mutex);
 	ret = vmsmb_smb2_create(sess, path, access, disposition,
-				VMSMB_FILE_NON_DIRECTORY,
+				CREATE_NOT_DIR,
 				&ctx->fid, &info);
 	mutex_unlock(&sess->transport_mutex);
 
@@ -1011,7 +1001,7 @@ static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 	/* Open directory */
 	mutex_lock(&sess->transport_mutex);
 	ret = vmsmb_smb2_create(sess, path, VMSMB_DIR_ACCESS,
-				VMSMB_FILE_OPEN, VMSMB_FILE_DIRECTORY,
+				FILE_OPEN, CREATE_NOT_FILE,
 				&fid, NULL);
 	if (ret) {
 		mutex_unlock(&sess->transport_mutex);
@@ -1170,7 +1160,7 @@ static int vmsmb_fill_super(struct super_block *sb, struct fs_context *fc)
 	/* Query root directory attributes — empty path = share root */
 	mutex_lock(&sess->transport_mutex);
 	ret = vmsmb_smb2_create(sess, "", FILE_READ_ATTRIBUTES,
-				VMSMB_FILE_OPEN, VMSMB_FILE_DIRECTORY,
+				FILE_OPEN, CREATE_NOT_FILE,
 				&root_fid, &root_info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, &root_fid);

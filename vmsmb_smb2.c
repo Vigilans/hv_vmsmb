@@ -12,6 +12,8 @@
 #include <linux/nls.h>
 #include "vmsmb.h"
 #include "smb2pdu.h"
+#include "smb1pdu.h"
+#include "smbfsctl.h"
 #include "smb2status.h"
 #include "fscc.h"
 
@@ -858,8 +860,8 @@ int vmsmb_smb2_rename(struct vmsmb_session *sess,
 	int ret;
 
 	/* Step 1: Open source with DELETE access */
-	ret = vmsmb_smb2_create(sess, old_path, 0x00010000 /* DELETE */,
-				0x01 /* FILE_OPEN */, 0, &fid, NULL);
+	ret = vmsmb_smb2_create(sess, old_path, DELETE,
+				FILE_OPEN, 0, &fid, NULL);
 	if (ret)
 		return ret;
 
@@ -946,9 +948,9 @@ int vmsmb_smb2_unlink(struct vmsmb_session *sess, const char *path)
 	struct vmsmb_fid fid;
 	int ret;
 
-	ret = vmsmb_smb2_create(sess, path, 0x00010000 /* DELETE */,
-				0x01 /* FILE_OPEN */,
-				0x00201000 /* DELETE_ON_CLOSE | OPEN_REPARSE_POINT */,
+	ret = vmsmb_smb2_create(sess, path, DELETE,
+				FILE_OPEN,
+				CREATE_DELETE_ON_CLOSE | OPEN_REPARSE_POINT,
 				&fid, NULL);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, &fid);
@@ -996,7 +998,7 @@ int vmsmb_smb2_ioctl(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 	req->OutputOffset = 0;
 	req->OutputCount = 0;
 	req->MaxOutputResponse = cpu_to_le32(out_size);
-	req->Flags = cpu_to_le32(0x00000001); /* SMB2_0_IOCTL_IS_FSCTL */
+	req->Flags = cpu_to_le32(SMB2_0_IOCTL_IS_FSCTL);
 	req->Reserved2 = 0;
 
 	if (in_len)
@@ -1055,8 +1057,8 @@ int vmsmb_smb2_get_reparse(struct vmsmb_session *sess, const char *path,
 	int ret;
 
 	ret = vmsmb_smb2_create(sess, path, FILE_READ_ATTRIBUTES,
-				0x01 /* FILE_OPEN */,
-				0x00200000 /* FILE_OPEN_REPARSE_POINT */,
+				FILE_OPEN,
+				OPEN_REPARSE_POINT,
 				&fid, NULL);
 	if (ret)
 		return ret;
@@ -1135,9 +1137,9 @@ int vmsmb_smb2_create_symlink(struct vmsmb_session *sess,
 
 	/* CREATE new file */
 	ret = vmsmb_smb2_create(sess, path,
-				0x40000000 | 0x00010000, /* GENERIC_WRITE | DELETE */
-				0x02 /* FILE_CREATE */,
-				0x00200000 /* FILE_OPEN_REPARSE_POINT */,
+				GENERIC_WRITE | DELETE,
+				FILE_CREATE,
+				OPEN_REPARSE_POINT,
 				&fid, NULL);
 	if (ret) {
 		kfree(target_utf16);
