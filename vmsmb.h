@@ -217,6 +217,8 @@ int vmsmb_smb2_rename(struct vmsmb_session *sess,
 		       const char *old_path, const char *new_path,
 		       bool replace);
 int vmsmb_smb2_unlink(struct vmsmb_session *sess, const char *path);
+int vmsmb_smb2_hardlink(struct vmsmb_session *sess,
+			 const char *src_path, const char *link_path);
 int vmsmb_smb2_ioctl(struct vmsmb_session *sess, struct vmsmb_fid *fid,
 		      u32 ctl_code, const void *in, u32 in_len,
 		      void *out, u32 out_size, u32 *out_len);

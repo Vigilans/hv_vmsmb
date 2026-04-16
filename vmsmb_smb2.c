@@ -937,6 +937,98 @@ close:
 }
 
 /*
+ * SMB2 SET_INFO (FileLinkInformation) — create a hard link.
+ *
+ * Port of CIFS smb2_create_hardlink() (fs/smb/client/smb2inode.c:1254):
+ * opens source with FILE_READ_ATTRIBUTES, sends SET_INFO with
+ * FILE_LINK_INFORMATION (level 11). Same wire format as rename
+ * (FILE_RENAME_INFORMATION, level 10) but ReplaceIfExists is always 0.
+ */
+int vmsmb_smb2_hardlink(struct vmsmb_session *sess,
+			 const char *src_path, const char *link_path)
+{
+	struct vmsmb_fid fid;
+	u8 *pdu_buf, *resp_buf;
+	struct smb2_set_info_req *req;
+	struct smb2_file_link_info *link_info;
+	const struct smb2_hdr *hdr;
+	__le16 *link_name_utf16;
+	int link_name_len;
+	u32 link_info_len, buf_len, pdu_len, resp_len;
+	int ret;
+
+	ret = vmsmb_smb2_create(sess, src_path, FILE_READ_ATTRIBUTES,
+				FILE_OPEN, 0, &fid, NULL);
+	if (ret)
+		return ret;
+
+	link_name_utf16 = vmsmb_path_to_utf16(link_path, &link_name_len);
+	if (!link_name_utf16) {
+		ret = -ENOMEM;
+		goto hclose;
+	}
+
+	link_info_len = sizeof(struct smb2_file_link_info) + link_name_len;
+	buf_len = sizeof(struct smb2_set_info_req) + link_info_len;
+	pdu_buf = kzalloc(buf_len, GFP_KERNEL);
+	if (!pdu_buf) {
+		kfree(link_name_utf16);
+		ret = -ENOMEM;
+		goto hclose;
+	}
+
+	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
+	if (!resp_buf) {
+		kfree(pdu_buf);
+		kfree(link_name_utf16);
+		ret = -ENOMEM;
+		goto hclose;
+	}
+
+	req = (struct smb2_set_info_req *)pdu_buf;
+	vmsmb_fill_hdr(&req->hdr, SMB2_SET_INFO_HE, sess);
+	req->StructureSize = cpu_to_le16(33);
+	req->InfoType = SMB2_O_INFO_FILE;
+	req->FileInfoClass = FILE_LINK_INFORMATION;
+	req->BufferLength = cpu_to_le32(link_info_len);
+	req->BufferOffset = cpu_to_le16(sizeof(struct smb2_set_info_req));
+	req->AdditionalInformation = 0;
+	req->PersistentFileId = fid.persistent;
+	req->VolatileFileId = fid.volatile_id;
+
+	link_info = (struct smb2_file_link_info *)req->Buffer;
+	link_info->ReplaceIfExists = 0;
+	memset(link_info->Reserved, 0, sizeof(link_info->Reserved));
+	link_info->RootDirectory = 0;
+	link_info->FileNameLength = cpu_to_le32(link_name_len);
+	memcpy(link_info->FileName, link_name_utf16, link_name_len);
+
+	kfree(link_name_utf16);
+
+	pdu_len = sizeof(struct smb2_set_info_req) + link_info_len;
+
+	ret = vmsmb_smb2_transact(sess, pdu_buf, pdu_len,
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	kfree(pdu_buf);
+	if (ret)
+		goto hfree_resp;
+
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
+	if (!hdr) {
+		ret = -EPROTO;
+		goto hfree_resp;
+	}
+
+	ret = vmsmb_check_status(hdr, "SET_INFO(hardlink)");
+
+hfree_resp:
+	kfree(resp_buf);
+hclose:
+	vmsmb_smb2_close(sess, &fid);
+	return ret;
+}
+
+/*
  * SMB2 unlink — delete a file or reparse point.
  *
  * Port of CIFS smb2_unlink() (fs/smb/client/smb2inode.c:1108-1110):

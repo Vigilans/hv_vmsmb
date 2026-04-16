@@ -496,6 +496,54 @@ static int vmsmb_rename(struct mnt_idmap *idmap,
 }
 
 /*
+ * Create a hard link.
+ *
+ * Port of CIFS cifs_hardlink() (fs/smb/client/link.c:441):
+ * d_drop() forces server re-lookup for the new dentry,
+ * inc_nlink() updates the source inode link count locally.
+ */
+static int vmsmb_link(struct dentry *old_dentry, struct inode *dir,
+		       struct dentry *new_dentry)
+{
+	struct vmsmb_sb_info *sbi = VMSMB_SB(dir->i_sb);
+	struct vmsmb_session *sess = sbi->sess;
+	char *old_path, *new_path;
+	int ret;
+
+	old_path = vmsmb_build_path(old_dentry);
+	if (IS_ERR(old_path))
+		return PTR_ERR(old_path);
+
+	new_path = vmsmb_build_path(new_dentry);
+	if (IS_ERR(new_path)) {
+		kfree(old_path);
+		return PTR_ERR(new_path);
+	}
+
+	mutex_lock(&sess->transport_mutex);
+	ret = vmsmb_smb2_hardlink(sess, old_path, new_path);
+	mutex_unlock(&sess->transport_mutex);
+
+	if ((ret == -EIO) || (ret == -EINVAL))
+		ret = -EOPNOTSUPP;
+
+	/* Force lookup from server for new dentry (CIFS cifs_hardlink pattern) */
+	d_drop(new_dentry);
+
+	if (ret == 0) {
+		struct inode *inode = d_inode(old_dentry);
+
+		spin_lock(&inode->i_lock);
+		inc_nlink(inode);
+		spin_unlock(&inode->i_lock);
+	}
+
+	kfree(old_path);
+	kfree(new_path);
+	return ret;
+}
+
+/*
  * Read cached symlink target.
  *
  * Matches CIFS cifs_get_link() (fs/smb/client/cifsfs.c): the target
@@ -589,6 +637,7 @@ const struct inode_operations vmsmb_dir_inode_ops = {
 	.rmdir		= vmsmb_rmdir,
 	.rename		= vmsmb_rename,
 	.symlink	= vmsmb_symlink,
+	.link		= vmsmb_link,
 };
 
 const struct inode_operations vmsmb_file_inode_ops = {
