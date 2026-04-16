@@ -4,12 +4,11 @@
  *
  * Handles channel open/close and synchronous send/receive over VMBus.
  *
- * Framing: The VSMB host uses two response framing modes:
- *   1) PipeHdr(8) + DirectTCP(4) + SMB2 — standard after drain
- *   2) pkt_type=0 notification(9) + 7-byte-header + SMB2 — at boot
- *
- * Mode 2 may deliver the notification and response in the same or
- * separate VMBus packets. This file handles both transparently.
+ * Receive path follows the hvsock (hyperv_transport.c) pattern: iterate
+ * ring buffer entries with hv_pkt_iter, parse the vmpipe_proto_header
+ * in each entry, skip notifications (pkt_type=0), accumulate data
+ * payloads (pkt_type=1). No overflow buffer, no magic scanning —
+ * each VMBus ring entry is one self-contained pipe message.
  */
 
 #define pr_fmt(fmt) "hv_vmsmb: " fmt
@@ -44,12 +43,6 @@ int vmsmb_open_channel(struct vmsmb_session *sess)
 	spin_lock_init(&sess->recv_lock);
 	init_completion(&sess->recv_done);
 
-	sess->overflow_cap = 65536;
-	sess->overflow_buf = kmalloc(sess->overflow_cap, GFP_KERNEL);
-	if (!sess->overflow_buf)
-		return -ENOMEM;
-	sess->overflow_len = 0;
-
 	ret = vmbus_open(ch, VMSMB_RING_SIZE, VMSMB_RING_SIZE,
 			 NULL, 0, vmsmb_channel_cb, sess);
 	if (ret) {
@@ -68,174 +61,120 @@ void vmsmb_close_channel(struct vmsmb_session *sess)
 		sess->channel = NULL;
 		pr_info("channel closed\n");
 	}
-	kfree(sess->overflow_buf);
-	sess->overflow_buf = NULL;
 }
 
 /*
- * Scan a buffer for the SMB2 ProtocolId magic (0xFE 'SMB').
- * Returns offset of the magic, or buf_len if not found.
+ * Receive one response by iterating VMBus ring buffer entries.
+ *
+ * Each ring entry contains one vmpipe_proto_header (8 bytes) followed
+ * by data_size bytes of payload. Like hvsock, we use hv_pkt_iter to
+ * walk entries without copying alignment padding.
+ *
+ * pkt_type=0 entries are notifications (skip).
+ * pkt_type=1 entries carry response data (DirectTCP + SMB2).
+ *
+ * Data payloads are accumulated into recv_buf starting at offset
+ * sizeof(vmpipe_hdr) to leave room for a synthetic PipeHdr that
+ * callers expect.
  */
-static u32 vmsmb_find_smb2_magic(const u8 *buf, u32 buf_len)
+static int vmsmb_recv_response(struct vmsmb_session *sess,
+			       void *recv_buf, u32 recv_buf_size,
+			       u32 *recv_len)
 {
-	u32 i;
+	struct vmbus_channel *ch = sess->channel;
+	/* Reserve space for synthetic PipeHdr at recv_buf[0..7] */
+	const u32 hdr_reserve = sizeof(struct vmpipe_hdr);
+	u32 offset = hdr_reserve;
+	u32 expected_total = 0; /* 0 = unknown, set once DirectTCP parsed */
+	unsigned long deadline = jiffies +
+		msecs_to_jiffies(VMSMB_TIMEOUT_MS);
 
-	for (i = 0; i + 4 <= buf_len; i++) {
-		u32 magic;
+	while (1) {
+		struct vmpacket_descriptor *desc;
+		bool got_data = false;
 
-		memcpy(&magic, buf + i, 4);
-		if (magic == SMB2_PROTO_NUMBER)
-			return i;
-	}
-	return buf_len;
-}
+		foreach_vmbus_pkt(desc, ch) {
+			const struct vmpipe_hdr *ph;
+			u32 pkt_payload_len, ptype, dsize, copy;
+			const u8 *data;
 
-/*
- * Gather data from overflow + ring buffer into raw_buf.
- * Read until SMB2 magic is found or timeout.
- */
-static int vmsmb_gather_raw(struct vmsmb_session *sess,
-			     u8 **out_buf, u32 *out_len)
-{
-	u8 *buf;
-	u32 len = 0, cap;
-	int ret, i;
+			pkt_payload_len = hv_pkt_datalen(desc);
+			if (pkt_payload_len < sizeof(struct vmpipe_hdr))
+				continue;
 
-	cap = max(sess->overflow_len + 8192, (u32)16384);
-	buf = kvmalloc(cap, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
+			ph = (const struct vmpipe_hdr *)
+				((const u8 *)desc + (desc->offset8 << 3));
+			ptype = le32_to_cpu(ph->pkt_type);
+			dsize = le32_to_cpu(ph->data_size);
 
-	/* Start with overflow data */
-	if (sess->overflow_len > 0) {
-		memcpy(buf, sess->overflow_buf, sess->overflow_len);
-		len = sess->overflow_len;
-		sess->overflow_len = 0;
-	}
+			if (ptype == 0) {
+				/* Notification — skip */
+				continue;
+			}
 
-	/* Read from ring until we find SMB2 magic */
-	for (i = 0; i < 100; i++) {
-		u32 chunk_len = 0;
-		u64 req_id;
+			if (ptype != VMPIPE_TYPE_DATA || dsize == 0)
+				continue;
 
-		if (vmsmb_find_smb2_magic(buf, len) < len)
+			/* Validate data_size against actual packet payload */
+			if (sizeof(struct vmpipe_hdr) + dsize > pkt_payload_len)
+				dsize = pkt_payload_len -
+					sizeof(struct vmpipe_hdr);
+
+			data = (const u8 *)ph + sizeof(struct vmpipe_hdr);
+			copy = min(dsize, recv_buf_size - offset);
+			if (copy > 0) {
+				memcpy(recv_buf + offset, data, copy);
+				offset += copy;
+			}
+			got_data = true;
+
+			if (expected_total == 0 &&
+			    offset - hdr_reserve >=
+					sizeof(struct smb2_direct_tcp_hdr)) {
+				const struct smb2_direct_tcp_hdr *tcp =
+					recv_buf + hdr_reserve;
+				u32 body_size =
+					smb2_direct_tcp_get_size(tcp);
+
+				expected_total = hdr_reserve +
+					sizeof(struct smb2_direct_tcp_hdr) +
+					body_size;
+			}
+		}
+
+		/* Check if response is complete */
+		if (expected_total > 0 && offset >= expected_total)
 			break;
 
-		/* Grow buffer if needed */
-		if (len + 4096 > cap) {
-			u32 new_cap = cap * 2;
-			u8 *new_buf = kvmalloc(new_cap, GFP_KERNEL);
-
-			if (!new_buf) {
-				kvfree(buf);
-				return -ENOMEM;
-			}
-			memcpy(new_buf, buf, len);
-			kvfree(buf);
-			buf = new_buf;
-			cap = new_cap;
-		}
-
-		ret = vmbus_recvpacket(sess->channel, buf + len,
-				       cap - len, &chunk_len, &req_id);
-		if (ret == -ENOBUFS) {
-			u32 new_cap = cap * 2;
-			u8 *new_buf = kvmalloc(new_cap, GFP_KERNEL);
-
-			if (!new_buf) {
-				kvfree(buf);
-				return -ENOMEM;
-			}
-			memcpy(new_buf, buf, len);
-			kvfree(buf);
-			buf = new_buf;
-			cap = new_cap;
+		if (got_data)
 			continue;
+
+		/* No data — wait briefly, then recheck.
+		 * Short waits avoid completion races: if the
+		 * callback fired before we entered wait, we just
+		 * spin again after the short timeout.
+		 */
+		if (time_after(jiffies, deadline)) {
+			pr_err("recv timeout (offset=%u expected=%u)\n",
+			       offset - hdr_reserve, expected_total);
+			return -ETIMEDOUT;
 		}
-		if (ret < 0) {
-			kvfree(buf);
-			return ret;
-		}
-		if (chunk_len == 0) {
-			ret = wait_for_completion_timeout(
-				&sess->recv_done,
-				msecs_to_jiffies(VMSMB_TIMEOUT_MS));
-			if (ret == 0) {
-				pr_err("gather timeout waiting for SMB2\n");
-				kvfree(buf);
-				return -ETIMEDOUT;
-			}
-			reinit_completion(&sess->recv_done);
-			continue;
-		}
-		len += chunk_len;
+
+		wait_for_completion_timeout(&sess->recv_done,
+					    msecs_to_jiffies(50));
+		reinit_completion(&sess->recv_done);
 	}
 
-	*out_buf = buf;
-	*out_len = len;
-	return 0;
-}
-
-/*
- * Handle a pkt_type=0 notification response: gather overflow+ring data,
- * find the first SMB2 response, and synthesize PipeHdr+DirectTCP framing.
- *
- * Any data after the first SMB2 response is discarded — it's unsolicited
- * host data that we don't need (we send our own requests).
- */
-static int vmsmb_handle_notification(struct vmsmb_session *sess,
-				     void *recv_buf, u32 recv_buf_size,
-				     u32 *recv_len)
-{
-	u8 *raw;
-	u32 raw_len, smb2_off;
-	u32 smb2_size, synth_hdr;
-	int ret;
-
-	ret = vmsmb_gather_raw(sess, &raw, &raw_len);
-	if (ret)
-		return ret;
-
-	/* Find first SMB2 magic */
-	smb2_off = vmsmb_find_smb2_magic(raw, raw_len);
-	if (smb2_off + sizeof(struct smb2_hdr) > raw_len) {
-		pr_err("SMB2 magic not found (%u bytes gathered)\n", raw_len);
-		kvfree(raw);
-		return -EPROTO;
-	}
-
-	/* Take everything from SMB2 magic to end as the response.
-	 * Discard any excess (unsolicited host data).
-	 */
-	smb2_size = raw_len - smb2_off;
-
-	/* Discard leftover overflow — it's unsolicited data */
-	sess->overflow_len = 0;
-
-	/* Build synthetic: PipeHdr(8) + DirectTCP(4) + SMB2 */
-	synth_hdr = sizeof(struct vmpipe_hdr) + sizeof(struct smb2_direct_tcp_hdr);
-	if (synth_hdr + smb2_size > recv_buf_size) {
-		pr_err("synth response too large: %u > %u\n",
-		       synth_hdr + smb2_size, recv_buf_size);
-		kvfree(raw);
-		return -EPROTO;
-	}
-
+	/* Write synthetic PipeHdr at the front */
 	{
 		struct vmpipe_hdr *ph = recv_buf;
-		struct smb2_direct_tcp_hdr *tcp =
-			recv_buf + sizeof(struct vmpipe_hdr);
+		u32 data_len = offset - hdr_reserve;
 
 		ph->pkt_type = cpu_to_le32(VMPIPE_TYPE_DATA);
-		ph->data_size = cpu_to_le32(
-			sizeof(struct smb2_direct_tcp_hdr) + smb2_size);
-		tcp->type = SMB2_DIRECT_TYPE_SMB2;
-		smb2_direct_tcp_set_size(tcp, smb2_size);
-		memcpy(recv_buf + synth_hdr, raw + smb2_off, smb2_size);
+		ph->data_size = cpu_to_le32(data_len);
 	}
 
-	kvfree(raw);
-	*recv_len = synth_hdr + smb2_size;
+	*recv_len = offset;
 	return 0;
 }
 
@@ -249,8 +188,6 @@ int vmsmb_send_recv(struct vmsmb_session *sess,
 		u8 data[];
 	} __packed *pkt;
 	u32 pkt_len;
-	u32 offset = 0;
-	u32 expected_total = 0;
 	int ret;
 
 	pkt_len = sizeof(struct vmpipe_hdr) + send_len;
@@ -284,121 +221,7 @@ int vmsmb_send_recv(struct vmsmb_session *sess,
 		return ret;
 	}
 
-	/* Read response packets until we have the full message */
-
-	/* Start with any leftover data from the previous response */
-	if (sess->overflow_len > 0) {
-		u32 copy = min(sess->overflow_len, recv_buf_size);
-
-		memcpy(recv_buf, sess->overflow_buf, copy);
-		offset = copy;
-		if (copy < sess->overflow_len) {
-			memmove(sess->overflow_buf,
-				sess->overflow_buf + copy,
-				sess->overflow_len - copy);
-			sess->overflow_len -= copy;
-		} else {
-			sess->overflow_len = 0;
-		}
-	}
-
-	while (1) {
-		u32 chunk_len = 0;
-		u64 request_id;
-		u32 space;
-
-		/* Parse PipeHeader as soon as we have enough data */
-		if (expected_total == 0 && offset >= sizeof(struct vmpipe_hdr)) {
-			const struct vmpipe_hdr *ph = recv_buf;
-			u32 ptype = le32_to_cpu(ph->pkt_type);
-			u32 dsize = le32_to_cpu(ph->data_size);
-
-			if (ptype != VMPIPE_TYPE_DATA ||
-			    dsize > 16 * 1024 * 1024) {
-				/*
-				 * Non-DATA type or unreasonably large size.
-				 * Save recv_buf data back to overflow so
-				 * the notification handler can find it.
-				 */
-				if (offset > 0 && offset <= sess->overflow_cap) {
-					memcpy(sess->overflow_buf, recv_buf,
-					       offset);
-					sess->overflow_len = offset;
-				}
-				return vmsmb_handle_notification(sess,
-					recv_buf, recv_buf_size, recv_len);
-			}
-
-			expected_total = sizeof(struct vmpipe_hdr) + dsize;
-		}
-
-		if (expected_total > 0 && offset >= expected_total)
-			break;
-
-		space = recv_buf_size - offset;
-
-		ret = vmbus_recvpacket(sess->channel,
-				       recv_buf + offset, space,
-				       &chunk_len, &request_id);
-
-		if (ret == -ENOBUFS) {
-			if (expected_total > 0 && offset >= expected_total)
-				break;
-			pr_err("vmbus_recvpacket ENOBUFS (offset=%u expected=%u space=%u)\n",
-			       offset, expected_total, space);
-			return -ENOBUFS;
-		}
-		if (ret < 0) {
-			pr_err("vmbus_recvpacket failed: %d\n", ret);
-			return ret;
-		}
-
-		if (chunk_len == 0) {
-			ret = wait_for_completion_timeout(
-				&sess->recv_done,
-				msecs_to_jiffies(VMSMB_TIMEOUT_MS));
-			if (ret == 0) {
-				pr_err("recv timeout (offset=%u expected=%u)\n",
-				       offset, expected_total);
-				return -ETIMEDOUT;
-			}
-			reinit_completion(&sess->recv_done);
-			continue;
-		}
-
-		offset += chunk_len;
-	}
-
-	/* Save any overflow data for the next response */
-	if (expected_total > 0 && offset > expected_total) {
-		u32 excess = offset - expected_total;
-
-		if (excess <= sess->overflow_cap) {
-			memcpy(sess->overflow_buf,
-			       recv_buf + expected_total, excess);
-			sess->overflow_len = excess;
-		}
-		offset = expected_total;
-	}
-
-	/*
-	 * Check PipeHeader pkt_type. Non-DATA messages (pkt_type != 1)
-	 * use alternate framing. Hand off to the notification handler
-	 * which gathers data, finds SMB2 magic, and synthesizes a
-	 * standard PipeHdr+DirectTCP response.
-	 */
-	if (offset >= sizeof(struct vmpipe_hdr)) {
-		const struct vmpipe_hdr *ph = recv_buf;
-		u32 ptype = le32_to_cpu(ph->pkt_type);
-
-		if (ptype != VMPIPE_TYPE_DATA)
-			return vmsmb_handle_notification(sess, recv_buf,
-							 recv_buf_size,
-							 recv_len);
-	}
-
-	*recv_len = offset;
-	return 0;
+	return vmsmb_recv_response(sess, recv_buf, recv_buf_size, recv_len);
 }
 
 /*
@@ -459,32 +282,22 @@ int vmsmb_negotiate_version(struct vmsmb_session *sess)
 
 	/*
 	 * After version negotiation, the host may send asynchronous
-	 * notifications and pre-emptive data. Wait briefly then drain
-	 * all pending data before the SMB2 handshake.
+	 * notifications. Wait briefly then drain all pending entries.
 	 */
 	{
-		u8 *drain;
-		u32 drain_len;
-		u64 drain_req;
-		int drain_total = 0;
+		struct vmpacket_descriptor *desc;
+		int drain_count = 0;
 
 		wait_for_completion_timeout(&sess->recv_done,
 					    msecs_to_jiffies(500));
 		reinit_completion(&sess->recv_done);
 
-		sess->overflow_len = 0;
-		drain = kmalloc(4096, GFP_KERNEL);
-		if (drain) {
-			while (vmbus_recvpacket(sess->channel, drain, 4096,
-						&drain_len, &drain_req) == 0 &&
-			       drain_len > 0) {
-				drain_total += drain_len;
-			}
-			kfree(drain);
-		}
-		if (drain_total > 0)
-			pr_info("drained %d bytes of pending data\n",
-				drain_total);
+		foreach_vmbus_pkt(desc, sess->channel)
+			drain_count++;
+
+		if (drain_count > 0)
+			pr_info("drained %d pending ring entries\n",
+				drain_count);
 	}
 
 	return 0;

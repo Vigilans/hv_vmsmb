@@ -121,16 +121,8 @@ struct vmsmb_session {
 	/* Transport serialization */
 	struct mutex transport_mutex;
 
-	/* Receive overflow buffer — leftover bytes from coalesced VMBus packets */
-	u8 *overflow_buf;
-	u32 overflow_len;
-	u32 overflow_cap;
-
-	/* Synchronous transport (protected by recv_lock) */
+	/* Synchronous receive completion */
 	struct completion recv_done;
-	u8 *recv_buf;
-	u32 recv_buf_size;
-	u32 recv_len;
 	spinlock_t recv_lock;
 };
 
