@@ -152,6 +152,7 @@ struct vmsmb_sb_info {
 	kgid_t gid;		/* owner gid for all inodes (mount-time) */
 	umode_t file_mode;	/* permission bits for files */
 	umode_t dir_mode;	/* permission bits for directories */
+	bool noperm;		/* skip VFS permission checks */
 };
 
 /*

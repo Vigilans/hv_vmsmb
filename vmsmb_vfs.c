@@ -18,6 +18,7 @@
 #include <linux/namei.h>
 #include <linux/backing-dev.h>
 #include <linux/nls.h>
+#include <linux/fs_parser.h>
 #include "vmsmb.h"
 #include "smb2pdu.h"
 #include "fscc.h"
@@ -972,8 +973,84 @@ static int vmsmb_fill_super(struct super_block *sb, struct fs_context *fc)
 	return 0;
 }
 
+/* ---- Mount option parsing (fs_context API) ---- */
+
+enum vmsmb_param {
+	Opt_uid,
+	Opt_gid,
+	Opt_file_mode,
+	Opt_dir_mode,
+	Opt_noperm,
+};
+
+static const struct fs_parameter_spec vmsmb_fs_parameters[] = {
+	fsparam_u32("uid",		Opt_uid),
+	fsparam_u32("gid",		Opt_gid),
+	fsparam_u32oct("file_mode",	Opt_file_mode),
+	fsparam_u32oct("dir_mode",	Opt_dir_mode),
+	fsparam_flag("noperm",		Opt_noperm),
+	{}
+};
+
+/*
+ * Mount context — holds parsed options until get_tree applies them.
+ * Modelled after CIFS smb3_fs_context (fs/smb/client/fs_context.c).
+ */
+struct vmsmb_fs_context {
+	kuid_t uid;
+	kgid_t gid;
+	umode_t file_mode;
+	umode_t dir_mode;
+	bool uid_set;
+	bool gid_set;
+	bool file_mode_set;
+	bool dir_mode_set;
+	bool noperm;
+};
+
+static int vmsmb_parse_param(struct fs_context *fc,
+			     struct fs_parameter *param)
+{
+	struct vmsmb_fs_context *ctx = fc->fs_private;
+	struct fs_parse_result result;
+	int opt;
+
+	opt = fs_parse(fc, vmsmb_fs_parameters, param, &result);
+	if (opt < 0)
+		return opt;
+
+	switch (opt) {
+	case Opt_uid:
+		ctx->uid = make_kuid(current_user_ns(), result.uint_32);
+		if (!uid_valid(ctx->uid))
+			return invalfc(fc, "invalid uid");
+		ctx->uid_set = true;
+		break;
+	case Opt_gid:
+		ctx->gid = make_kgid(current_user_ns(), result.uint_32);
+		if (!gid_valid(ctx->gid))
+			return invalfc(fc, "invalid gid");
+		ctx->gid_set = true;
+		break;
+	case Opt_file_mode:
+		ctx->file_mode = result.uint_32 & 0777;
+		ctx->file_mode_set = true;
+		break;
+	case Opt_dir_mode:
+		ctx->dir_mode = result.uint_32 & 0777;
+		ctx->dir_mode_set = true;
+		break;
+	case Opt_noperm:
+		ctx->noperm = true;
+		break;
+	}
+
+	return 0;
+}
+
 static int vmsmb_get_tree(struct fs_context *fc)
 {
+	struct vmsmb_fs_context *ctx = fc->fs_private;
 	struct vmsmb_sb_info *sbi;
 	struct vmsmb_session *sess = vmsmb_global_session;
 	const char *dev_name = fc->source;
@@ -994,10 +1071,22 @@ static int vmsmb_get_tree(struct fs_context *fc)
 		return -ENOMEM;
 
 	sbi->sess = sess;
-	sbi->uid = current_fsuid();
-	sbi->gid = current_fsgid();
-	sbi->file_mode = S_IRUGO | S_IXUGO | S_IWUSR; /* 0755 */
-	sbi->dir_mode = S_IRUGO | S_IXUGO | S_IWUSR;  /* 0755 */
+
+	/* Apply parsed mount options, with defaults */
+	sbi->uid = ctx->uid_set ? ctx->uid : current_fsuid();
+	sbi->gid = ctx->gid_set ? ctx->gid : current_fsgid();
+	sbi->file_mode = ctx->file_mode_set ? ctx->file_mode :
+					       (S_IRUGO | S_IXUGO | S_IWUSR);
+	sbi->dir_mode = ctx->dir_mode_set ? ctx->dir_mode :
+					     (S_IRUGO | S_IXUGO | S_IWUSR);
+	sbi->noperm = ctx->noperm;
+
+	/* noperm: open all permissions so VFS checks always pass */
+	if (sbi->noperm) {
+		sbi->file_mode = 0777;
+		sbi->dir_mode = 0777;
+	}
+
 	sbi->share_name = kstrdup(dev_name, GFP_KERNEL);
 	if (!sbi->share_name) {
 		kfree(sbi);
@@ -1024,16 +1113,24 @@ static int vmsmb_get_tree(struct fs_context *fc)
 
 static void vmsmb_free_fc(struct fs_context *fc)
 {
-	/* sbi is freed in kill_sb if mount succeeded */
+	kfree(fc->fs_private);
 }
 
 static const struct fs_context_operations vmsmb_context_ops = {
+	.parse_param	= vmsmb_parse_param,
 	.get_tree	= vmsmb_get_tree,
 	.free		= vmsmb_free_fc,
 };
 
 static int vmsmb_init_fs_context(struct fs_context *fc)
 {
+	struct vmsmb_fs_context *ctx;
+
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+
+	fc->fs_private = ctx;
 	fc->ops = &vmsmb_context_ops;
 	return 0;
 }
@@ -1055,5 +1152,6 @@ struct file_system_type vmsmb_fs_type = {
 	.owner			= THIS_MODULE,
 	.name			= "vsmb",
 	.init_fs_context	= vmsmb_init_fs_context,
+	.parameters		= vmsmb_fs_parameters,
 	.kill_sb		= vmsmb_kill_sb,
 };
