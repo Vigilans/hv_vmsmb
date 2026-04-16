@@ -28,8 +28,15 @@
 /* Max I/O response buffer (header overhead + MaxReadSize) */
 #define VMSMB_MAX_IO_RESPONSE	(1048576 + 256)
 
-/* Max I/O chunk per VMBus send — must fit in ring buffer with headers */
-#define VMSMB_MAX_IO_CHUNK	(192 * 1024)
+/*
+ * VMBus pipe-mode guest→host packets must fit within 64K.
+ * Total VMBus payload = vmpipe_hdr(8) + DirectTCP(4) + SMB2 header + data.
+ * READ requests are small so the limit only constrains WRITE data.
+ * READ chunk controls how much data we ask the server to return per request;
+ * the response travels host→guest and is not subject to this limit.
+ */
+#define VMSMB_MAX_WRITE_CHUNK	(65536 - 256)	/* 65280 — under 64K pipe MTU */
+#define VMSMB_MAX_READ_CHUNK	(192 * 1024)	/* limited by ring buffer size */
 
 /* Timeout for synchronous send/recv (ms) */
 #define VMSMB_TIMEOUT_MS	10000

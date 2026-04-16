@@ -408,14 +408,14 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 		temp_open = true;
 	}
 
-	buf = kvmalloc(min_t(size_t, remain, VMSMB_MAX_IO_CHUNK), GFP_KERNEL);
+	buf = kvmalloc(min_t(size_t, remain, VMSMB_MAX_READ_CHUNK), GFP_KERNEL);
 	if (!buf) {
 		subreq->error = -ENOMEM;
 		goto close;
 	}
 
 	while (remain > 0) {
-		u32 chunk = min_t(size_t, remain, VMSMB_MAX_IO_CHUNK);
+		u32 chunk = min_t(size_t, remain, VMSMB_MAX_READ_CHUNK);
 		u32 bytes_read = 0;
 
 		mutex_lock(&sess->transport_mutex);
@@ -467,7 +467,7 @@ static void vmsmb_begin_writeback(struct netfs_io_request *wreq)
 		wreq->netfs_priv = vi->active_ctx;
 
 	wreq->io_streams[0].avail = true;
-	wreq->io_streams[0].sreq_max_len = VMSMB_MAX_IO_CHUNK;
+	wreq->io_streams[0].sreq_max_len = VMSMB_MAX_WRITE_CHUNK;
 }
 
 static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
@@ -510,14 +510,14 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 		temp_open = true;
 	}
 
-	buf = kvmalloc(min_t(size_t, remain, VMSMB_MAX_IO_CHUNK), GFP_KERNEL);
+	buf = kvmalloc(min_t(size_t, remain, VMSMB_MAX_WRITE_CHUNK), GFP_KERNEL);
 	if (!buf) {
 		ret = -ENOMEM;
 		goto close;
 	}
 
 	while (remain > 0) {
-		u32 chunk = min_t(size_t, remain, VMSMB_MAX_IO_CHUNK);
+		u32 chunk = min_t(size_t, remain, VMSMB_MAX_WRITE_CHUNK);
 		u32 bytes_written = 0;
 		size_t copied;
 
@@ -652,12 +652,29 @@ static loff_t vmsmb_file_llseek(struct file *file, loff_t offset, int whence)
 					i_size_read(inode));
 }
 
+/*
+ * Flush dirty pages to server.
+ * VSMB writes are synchronous, so once netfs writeback completes
+ * the data is on the host.  Modelled after cifs_fsync.
+ */
+static int vmsmb_fsync(struct file *file, loff_t start, loff_t end,
+		       int datasync)
+{
+	int ret;
+
+	ret = file_write_and_wait_range(file, start, end);
+	if (ret)
+		pr_debug("fsync: write_and_wait error %d\n", ret);
+	return ret;
+}
+
 const struct file_operations vmsmb_file_ops = {
 	.open		= vmsmb_file_open,
 	.release	= vmsmb_file_release,
 	.read_iter	= netfs_file_read_iter,
 	.write_iter	= netfs_unbuffered_write_iter,
 	.llseek		= vmsmb_file_llseek,
+	.fsync		= vmsmb_fsync,
 };
 
 /* ---- Directory operations ---- */
