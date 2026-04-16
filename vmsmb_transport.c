@@ -98,7 +98,7 @@ static void vmsmb_process_data(struct vmsmb_session *sess,
 				(sess->scratch + sizeof(struct smb2_stream_hdr));
 			mid = le64_to_cpu(smb2h->MessageId);
 
-			/* Find matching pending request */
+			/* Find matching pending request (softirq context — no _bh) */
 			spin_lock(&sess->pending_lock);
 			req = vmsmb_find_request(sess, mid);
 			if (req)
@@ -500,10 +500,10 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 	memcpy(send_buf + sizeof(struct vmpipe_hdr) + stream_hdr_size,
 	       smb2_req, req_len);
 
-	/* Register in pending list before sending */
-	spin_lock(&sess->pending_lock);
+	/* Register in pending list before sending (bh: lock shared with tasklet) */
+	spin_lock_bh(&sess->pending_lock);
 	list_add_tail(&req.list, &sess->pending_requests);
-	spin_unlock(&sess->pending_lock);
+	spin_unlock_bh(&sess->pending_lock);
 
 	/* Send with EAGAIN retry (ring buffer may be full) */
 	mutex_lock(&sess->send_mutex);
@@ -524,9 +524,9 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 
 	if (ret) {
 		pr_err("vmbus_sendpacket failed: %d\n", ret);
-		spin_lock(&sess->pending_lock);
+		spin_lock_bh(&sess->pending_lock);
 		list_del_init(&req.list);
-		spin_unlock(&sess->pending_lock);
+		spin_unlock_bh(&sess->pending_lock);
 		kvfree(recv_buf);
 		return ret;
 	}
@@ -539,10 +539,10 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 		 * Timeout. Remove from pending list if still there.
 		 * The channel_cb might have completed us in a race.
 		 */
-		spin_lock(&sess->pending_lock);
+		spin_lock_bh(&sess->pending_lock);
 		if (!list_empty(&req.list))
 			list_del_init(&req.list);
-		spin_unlock(&sess->pending_lock);
+		spin_unlock_bh(&sess->pending_lock);
 
 		if (req.status == -EINPROGRESS) {
 			pr_err("transact timeout (mid=%llu)\n",
