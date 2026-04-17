@@ -1036,6 +1036,158 @@ out:
 }
 
 /*
+ * SMB2 CREATE+SET_INFO+CLOSE compound — folds "open, set one info class,
+ * close" into a single VMBus transact.
+ *
+ * Ported from CIFS smb2_compound_op() (fs/smb/client/smb2inode.c), same
+ * chaining pattern as vmsmb_smb2_create_ioctl_close. Used for set_eof
+ * (FileEndOfFileInformation) and set_basic_info (FileBasicInformation).
+ *
+ * Simplified: fixed disposition=FILE_OPEN; AdditionalInformation=0 (callers
+ * here don't need security descriptors); CLOSE failure non-fatal.
+ */
+static int vmsmb_smb2_create_setinfo_close(struct vmsmb_session *sess, u32 tree_id,
+					   const char *path,
+					   u32 desired_access, u32 create_options,
+					   u8 info_type, u8 info_class,
+					   const void *data, u32 data_len,
+					   const char *debug_tag)
+{
+	u8 *pdu_buf, *resp_buf;
+	struct smb2_create_req *creq;
+	struct smb2_set_info_req *sreq;
+	struct smb2_close_req *clreq;
+	const struct smb2_hdr *hdr1, *hdr2, *hdr3;
+	__le16 *name_utf16;
+	int name_len;
+	u32 resp_len;
+	u32 create_pdu_len, setinfo_pdu_off, setinfo_pdu_len, close_pdu_off, total_len;
+	u32 next1, next2;
+	int ret;
+
+	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
+	if (!resp_buf)
+		return -ENOMEM;
+
+	name_utf16 = vmsmb_path_to_utf16(path, &name_len);
+	if (!name_utf16) {
+		kfree(resp_buf);
+		return -ENOMEM;
+	}
+
+	create_pdu_len = sizeof(struct smb2_create_req) + max_t(int, name_len, 1);
+	setinfo_pdu_off = ALIGN(create_pdu_len, 8);
+	setinfo_pdu_len = sizeof(struct smb2_set_info_req) + data_len;
+	close_pdu_off = setinfo_pdu_off + ALIGN(setinfo_pdu_len, 8);
+	total_len = close_pdu_off + sizeof(struct smb2_close_req);
+
+	pdu_buf = kzalloc(total_len, GFP_KERNEL);
+	if (!pdu_buf) {
+		kfree(name_utf16);
+		kfree(resp_buf);
+		return -ENOMEM;
+	}
+
+	/* PDU #1: CREATE */
+	creq = (struct smb2_create_req *)pdu_buf;
+	vmsmb_fill_hdr(&creq->hdr, SMB2_CREATE_HE, sess, tree_id);
+	creq->hdr.NextCommand = cpu_to_le32(setinfo_pdu_off);
+	creq->StructureSize = cpu_to_le16(57);
+	creq->ImpersonationLevel = cpu_to_le32(0x02);
+	creq->DesiredAccess = cpu_to_le32(desired_access);
+	creq->FileAttributes = cpu_to_le32(FILE_ATTRIBUTE_NORMAL);
+	creq->ShareAccess = cpu_to_le32(0x07);
+	creq->CreateDisposition = cpu_to_le32(FILE_OPEN);
+	creq->CreateOptions = cpu_to_le32(create_options);
+	creq->NameOffset = cpu_to_le16(sizeof(struct smb2_create_req));
+	creq->NameLength = cpu_to_le16(name_len);
+	if (name_len > 0)
+		memcpy(pdu_buf + sizeof(struct smb2_create_req), name_utf16, name_len);
+	kfree(name_utf16);
+
+	/* PDU #2: SET_INFO, RELATED, COMPOUND_FID */
+	sreq = (struct smb2_set_info_req *)(pdu_buf + setinfo_pdu_off);
+	vmsmb_fill_hdr(&sreq->hdr, SMB2_SET_INFO_HE, sess, tree_id);
+	sreq->hdr.NextCommand = cpu_to_le32(close_pdu_off - setinfo_pdu_off);
+	sreq->hdr.Flags |= SMB2_FLAGS_RELATED_OPERATIONS;
+	sreq->StructureSize = cpu_to_le16(33);
+	sreq->InfoType = info_type;
+	sreq->FileInfoClass = info_class;
+	sreq->BufferLength = cpu_to_le32(data_len);
+	sreq->BufferOffset = cpu_to_le16(sizeof(struct smb2_set_info_req));
+	sreq->AdditionalInformation = 0;
+	sreq->PersistentFileId = COMPOUND_FID;
+	sreq->VolatileFileId = COMPOUND_FID;
+	if (data_len)
+		memcpy(sreq->Buffer, data, data_len);
+
+	/* PDU #3: CLOSE, RELATED, COMPOUND_FID */
+	clreq = (struct smb2_close_req *)(pdu_buf + close_pdu_off);
+	vmsmb_fill_hdr(&clreq->hdr, SMB2_CLOSE_HE, sess, tree_id);
+	clreq->hdr.Flags |= SMB2_FLAGS_RELATED_OPERATIONS;
+	clreq->StructureSize = cpu_to_le16(24);
+	clreq->PersistentFileId = COMPOUND_FID;
+	clreq->VolatileFileId = COMPOUND_FID;
+
+	pr_debug("CREATE+SET_INFO+CLOSE compound: path='%s' tag=%s total=%u\n",
+		 path, debug_tag, total_len);
+
+	ret = vmsmb_smb2_transact(sess, pdu_buf, total_len,
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	kfree(pdu_buf);
+	if (ret)
+		goto out;
+
+	/* CREATE response */
+	hdr1 = vmsmb_check_resp(resp_buf, resp_len);
+	if (!hdr1) {
+		ret = -EPROTO;
+		goto out;
+	}
+	ret = vmsmb_check_status(hdr1, "CREATE");
+	if (ret)
+		goto out;
+
+	/* SET_INFO response at hdr1->NextCommand */
+	next1 = le32_to_cpu(hdr1->NextCommand);
+	if (!next1 || next1 >= resp_len ||
+	    resp_len - next1 < sizeof(struct smb2_hdr)) {
+		pr_warn_ratelimited("hv_vmsmb: compound: missing SET_INFO resp (next=%u resp=%u)\n",
+				    next1, resp_len);
+		ret = -EPROTO;
+		goto out;
+	}
+	hdr2 = (const struct smb2_hdr *)(resp_buf + next1);
+	if (hdr2->ProtocolId != SMB2_PROTO_NUMBER) {
+		ret = -EPROTO;
+		goto out;
+	}
+	ret = vmsmb_check_status(hdr2, debug_tag);
+	if (ret)
+		goto out;
+
+	/* CLOSE response (non-fatal) */
+	next2 = le32_to_cpu(hdr2->NextCommand);
+	if (!next2 || next1 + next2 >= resp_len ||
+	    resp_len - next1 - next2 < sizeof(struct smb2_hdr)) {
+		pr_debug("compound: missing/short CLOSE response\n");
+		goto out;
+	}
+	hdr3 = (const struct smb2_hdr *)(resp_buf + next1 + next2);
+	if (hdr3->ProtocolId != SMB2_PROTO_NUMBER) {
+		pr_debug("compound: CLOSE bad magic\n");
+		goto out;
+	}
+	if (hdr3->Status != STATUS_SUCCESS)
+		pr_debug("compound CLOSE NTSTATUS 0x%08x\n",
+			 le32_to_cpu(hdr3->Status));
+
+out:
+	kfree(resp_buf);
+	return ret;
+}
+
+/*
  * SMB2 READ — read data from an open file.
  *
  * Simplified: CIFS smb2_async_readv() (fs/smb/client/smb2pdu.c)
@@ -1818,65 +1970,12 @@ int vmsmb_smb2_set_basic_info(struct vmsmb_session *sess, u32 tree_id,
 			      const char *path,
 			      const FILE_BASIC_INFO *binfo)
 {
-	struct vmsmb_fid fid;
-	u8 *pdu_buf, *resp_buf;
-	struct smb2_set_info_req *req;
-	const struct smb2_hdr *hdr;
-	u32 buf_len, pdu_len, resp_len;
-	int ret;
-
-	ret = vmsmb_smb2_create(sess, tree_id, path, FILE_WRITE_ATTRIBUTES,
-				FILE_OPEN, 0, &fid, NULL);
-	if (ret)
-		return ret;
-
-	buf_len = sizeof(struct smb2_set_info_req) + sizeof(*binfo);
-	pdu_buf = kzalloc(buf_len, GFP_KERNEL);
-	if (!pdu_buf) {
-		ret = -ENOMEM;
-		goto close;
-	}
-
-	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
-	if (!resp_buf) {
-		kfree(pdu_buf);
-		ret = -ENOMEM;
-		goto close;
-	}
-
-	req = (struct smb2_set_info_req *)pdu_buf;
-	vmsmb_fill_hdr(&req->hdr, SMB2_SET_INFO_HE, sess, tree_id);
-	req->StructureSize = cpu_to_le16(33);
-	req->InfoType = SMB2_O_INFO_FILE;
-	req->FileInfoClass = FILE_BASIC_INFORMATION;
-	req->BufferLength = cpu_to_le32(sizeof(*binfo));
-	req->BufferOffset = cpu_to_le16(sizeof(struct smb2_set_info_req));
-	req->AdditionalInformation = 0;
-	req->PersistentFileId = fid.persistent;
-	req->VolatileFileId = fid.volatile_id;
-	memcpy(req->Buffer, binfo, sizeof(*binfo));
-
-	pdu_len = sizeof(struct smb2_set_info_req) + sizeof(*binfo);
-
-	ret = vmsmb_smb2_transact(sess, pdu_buf, pdu_len,
-				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
-	kfree(pdu_buf);
-	if (ret)
-		goto free_resp;
-
-	hdr = vmsmb_check_resp(resp_buf, resp_len);
-	if (!hdr) {
-		ret = -EPROTO;
-		goto free_resp;
-	}
-
-	ret = vmsmb_check_status(hdr, "SET_INFO(basic)");
-
-free_resp:
-	kfree(resp_buf);
-close:
-	vmsmb_smb2_close(sess, tree_id, &fid);
-	return ret;
+	return vmsmb_smb2_create_setinfo_close(sess, tree_id, path,
+					       FILE_WRITE_ATTRIBUTES, 0,
+					       SMB2_O_INFO_FILE,
+					       FILE_BASIC_INFORMATION,
+					       binfo, sizeof(*binfo),
+					       "SET_INFO(basic)");
 }
 /*
  * SMB2 SET_INFO (FileEndOfFileInformation) — truncate/extend a file.
@@ -1890,66 +1989,14 @@ close:
 int vmsmb_smb2_set_eof(struct vmsmb_session *sess, u32 tree_id,
 		       const char *path, u64 eof)
 {
-	struct vmsmb_fid fid;
-	u8 *pdu_buf, *resp_buf;
-	struct smb2_set_info_req *req;
-	const struct smb2_hdr *hdr;
 	__le64 eof_le = cpu_to_le64(eof);
-	u32 buf_len, pdu_len, resp_len;
-	int ret;
 
-	ret = vmsmb_smb2_create(sess, tree_id, path, FILE_WRITE_DATA,
-				FILE_OPEN, 0, &fid, NULL);
-	if (ret)
-		return ret;
-
-	buf_len = sizeof(struct smb2_set_info_req) + sizeof(eof_le);
-	pdu_buf = kzalloc(buf_len, GFP_KERNEL);
-	if (!pdu_buf) {
-		ret = -ENOMEM;
-		goto close;
-	}
-
-	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
-	if (!resp_buf) {
-		kfree(pdu_buf);
-		ret = -ENOMEM;
-		goto close;
-	}
-
-	req = (struct smb2_set_info_req *)pdu_buf;
-	vmsmb_fill_hdr(&req->hdr, SMB2_SET_INFO_HE, sess, tree_id);
-	req->StructureSize = cpu_to_le16(33);
-	req->InfoType = SMB2_O_INFO_FILE;
-	req->FileInfoClass = FILE_END_OF_FILE_INFORMATION;
-	req->BufferLength = cpu_to_le32(sizeof(eof_le));
-	req->BufferOffset = cpu_to_le16(sizeof(struct smb2_set_info_req));
-	req->AdditionalInformation = 0;
-	req->PersistentFileId = fid.persistent;
-	req->VolatileFileId = fid.volatile_id;
-	memcpy(req->Buffer, &eof_le, sizeof(eof_le));
-
-	pdu_len = sizeof(struct smb2_set_info_req) + sizeof(eof_le);
-
-	ret = vmsmb_smb2_transact(sess, pdu_buf, pdu_len,
-				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
-	kfree(pdu_buf);
-	if (ret)
-		goto free_resp;
-
-	hdr = vmsmb_check_resp(resp_buf, resp_len);
-	if (!hdr) {
-		ret = -EPROTO;
-		goto free_resp;
-	}
-
-	ret = vmsmb_check_status(hdr, "SET_INFO(eof)");
-
-free_resp:
-	kfree(resp_buf);
-close:
-	vmsmb_smb2_close(sess, tree_id, &fid);
-	return ret;
+	return vmsmb_smb2_create_setinfo_close(sess, tree_id, path,
+					       FILE_WRITE_DATA, 0,
+					       SMB2_O_INFO_FILE,
+					       FILE_END_OF_FILE_INFORMATION,
+					       &eof_le, sizeof(eof_le),
+					       "SET_INFO(eof)");
 }
 
 /*
