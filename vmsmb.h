@@ -189,6 +189,7 @@ struct vmsmb_sb_info {
 	umode_t dir_mode;	/* permission bits for directories */
 	bool noperm;		/* skip VFS permission checks */
 	char *symlinkroot;	/* mount option: translate Windows abs symlinks to {symlinkroot}/x/... */
+	unsigned long actimeo;	/* metadata cache TTL in jiffies (mount option, default 1s) */
 };
 
 /*
@@ -206,6 +207,8 @@ struct vmsmb_inode_info {
 	struct netfs_inode netfs;	/* Must be first — contains struct inode */
 	struct vmsmb_file_ctx *active_ctx; /* Open file context for writeback */
 	char *symlink_target;		/* Cached readlink target, or NULL */
+	u64 index_number;		/* NTFS file reference (dedup key); 0 if unavailable */
+	unsigned long meta_expires;	/* jiffies after which metadata is stale */
 };
 
 static inline struct vmsmb_inode_info *VMSMB_I(struct inode *inode)

@@ -108,6 +108,118 @@ static void vmsmb_fill_inode(struct inode *inode,
 	 * filling all inode attributes.
 	 */
 	netfs_inode_init(&VMSMB_I(inode)->netfs, &vmsmb_netfs_ops, false);
+
+	VMSMB_I(inode)->meta_expires = jiffies + sbi->actimeo;
+}
+
+/*
+ * Refresh mutable metadata on an existing inode from a new CREATE/QUERY
+ * response. Called when iget5_locked finds an already-hashed inode —
+ * type/ops/uid/gid are immutable, but size/times may have changed.
+ *
+ * Port of CIFS cifs_fattr_to_inode() update-path (fs/smb/client/inode.c).
+ */
+static void vmsmb_refresh_inode(struct inode *inode,
+				const struct vmsmb_file_info *info)
+{
+	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
+	struct vmsmb_inode_info *vi = VMSMB_I(inode);
+	loff_t old_size = i_size_read(inode);
+	loff_t new_size = info->size;
+	struct timespec64 old_mtime = inode_get_mtime(inode);
+	struct timespec64 new_mtime = vmsmb_time_to_ts(info->last_write_time);
+
+	if (old_size != new_size) {
+		/* Truncate page cache beyond new EOF to avoid serving stale data */
+		i_size_write(inode, new_size);
+		if (new_size < old_size)
+			truncate_pagecache(inode, new_size);
+	}
+	inode->i_blocks = (info->alloc_size + 511) / 512;
+	inode_set_atime_to_ts(inode, vmsmb_time_to_ts(info->last_access_time));
+	inode_set_mtime_to_ts(inode, new_mtime);
+	inode_set_ctime_to_ts(inode, vmsmb_time_to_ts(info->change_time));
+
+	/*
+	 * If mtime advanced on the server, the file content has changed;
+	 * invalidate cached pages to force re-read. Port of CIFS
+	 * cifs_revalidate_mapping (fs/smb/client/inode.c).
+	 */
+	if (S_ISREG(inode->i_mode) &&
+	    timespec64_compare(&new_mtime, &old_mtime) != 0) {
+		invalidate_inode_pages2(inode->i_mapping);
+	}
+
+	vi->meta_expires = jiffies + sbi->actimeo;
+}
+
+struct vmsmb_iget_args {
+	u64 index_number;
+	const struct vmsmb_file_info *info;
+};
+
+static int vmsmb_iget_test(struct inode *inode, void *opaque)
+{
+	struct vmsmb_iget_args *args = opaque;
+	struct vmsmb_inode_info *vi = VMSMB_I(inode);
+
+	return vi->index_number != 0 && vi->index_number == args->index_number;
+}
+
+static int vmsmb_iget_set(struct inode *inode, void *opaque)
+{
+	struct vmsmb_iget_args *args = opaque;
+	struct vmsmb_inode_info *vi = VMSMB_I(inode);
+
+	vi->index_number = args->index_number;
+	inode->i_ino = args->index_number ?
+		args->index_number :
+		atomic64_inc_return(&vmsmb_ino_counter);
+	return 0;
+}
+
+/*
+ * Look up or allocate an inode keyed on the NTFS file reference number
+ * (index_number from the QFid create context). Two dentries pointing at
+ * the same underlying file (hardlinks) get the same inode, so dentry
+ * cache and i_nlink are accurate.
+ *
+ * If index_number is 0 (server didn't return QFid), fall back to an
+ * anonymous inode with a fresh counter-allocated ino — no dedup, but
+ * still correct single-dentry semantics.
+ *
+ * Port of CIFS cifs_iget() (fs/smb/client/inode.c) using iget5_locked.
+ */
+static struct inode *vmsmb_iget(struct super_block *sb,
+				const struct vmsmb_file_info *info)
+{
+	struct vmsmb_iget_args args = {
+		.index_number = info->index_number,
+		.info = info,
+	};
+	struct inode *inode;
+
+	if (!info->index_number) {
+		inode = new_inode(sb);
+		if (!inode)
+			return ERR_PTR(-ENOMEM);
+		inode->i_ino = atomic64_inc_return(&vmsmb_ino_counter);
+		vmsmb_fill_inode(inode, info);
+		return inode;
+	}
+
+	inode = iget5_locked(sb, (unsigned long)info->index_number,
+			     vmsmb_iget_test, vmsmb_iget_set, &args);
+	if (!inode)
+		return ERR_PTR(-ENOMEM);
+
+	if (inode_state_read(inode) & I_NEW) {
+		vmsmb_fill_inode(inode, info);
+		unlock_new_inode(inode);
+	} else {
+		vmsmb_refresh_inode(inode, info);
+	}
+	return inode;
 }
 
 /*
@@ -299,6 +411,50 @@ out_no_translate:
 	return smb_target;
 }
 
+/* ---- Dentry operations ---- */
+
+/*
+ * Revalidate a dentry by checking whether its inode's metadata TTL has
+ * expired. Returning 0 invalidates the dentry and forces VFS to re-invoke
+ * lookup, which goes through iget5_locked → vmsmb_refresh_inode to pull
+ * fresh size/mtime from the server.
+ *
+ * Port of CIFS cifs_d_revalidate() (fs/smb/client/dir.c) minus the
+ * oplock / lease machinery we don't have.
+ */
+static int vmsmb_d_revalidate(struct inode *dir, const struct qstr *name,
+			      struct dentry *dentry, unsigned int flags)
+{
+	struct inode *inode;
+	struct vmsmb_inode_info *vi;
+
+	if (flags & LOOKUP_RCU)
+		return -ECHILD;
+
+	inode = d_inode(dentry);
+	if (!inode) {
+		/* Negative dentry: trust it only while parent's TTL is valid.
+		 * Otherwise the host may have created the file and we'd never
+		 * notice. */
+		if (dir) {
+			vi = VMSMB_I(dir);
+			if (time_after(jiffies, vi->meta_expires))
+				return 0;
+		}
+		return 1;
+	}
+
+	vi = VMSMB_I(inode);
+	if (time_after(jiffies, vi->meta_expires))
+		return 0;		/* stale — force re-lookup */
+
+	return 1;
+}
+
+static const struct dentry_operations vmsmb_dentry_ops = {
+	.d_revalidate	= vmsmb_d_revalidate,
+};
+
 /* ---- Inode operations ---- */
 
 static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
@@ -332,12 +488,9 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 	if (ret)
 		return ERR_PTR(ret);
 
-	inode = new_inode(dir->i_sb);
-	if (!inode)
-		return ERR_PTR(-ENOMEM);
-
-	inode->i_ino = atomic64_inc_return(&vmsmb_ino_counter);
-	vmsmb_fill_inode(inode, &info);
+	inode = vmsmb_iget(dir->i_sb, &info);
+	if (IS_ERR(inode))
+		return ERR_CAST(inode);
 
 	/* Resolve symlink target for reparse points (CIFS caches at lookup) */
 	if (S_ISLNK(inode->i_mode)) {
@@ -392,6 +545,32 @@ static int vmsmb_getattr(struct mnt_idmap *idmap,
 			 unsigned int query_flags)
 {
 	struct inode *inode = d_inode(path->dentry);
+	struct vmsmb_inode_info *vi = VMSMB_I(inode);
+	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
+
+	/*
+	 * Refresh metadata from the server if the TTL has expired.
+	 * Port of CIFS cifs_getattr (fs/smb/client/inode.c) without
+	 * the oplock-held fast path.
+	 */
+	if (time_after(jiffies, vi->meta_expires)) {
+		struct vmsmb_fid fid;
+		struct vmsmb_file_info info;
+		char *spath;
+		int ret;
+
+		spath = vmsmb_build_path(path->dentry);
+		if (!IS_ERR(spath)) {
+			ret = vmsmb_smb2_create(sbi->sess, sbi->tree_id, spath,
+						FILE_READ_ATTRIBUTES, FILE_OPEN,
+						OPEN_REPARSE_POINT, &fid, &info);
+			if (ret == 0) {
+				vmsmb_smb2_close(sbi->sess, sbi->tree_id, &fid);
+				vmsmb_refresh_inode(inode, &info);
+			}
+			kfree(spath);
+		}
+	}
 
 	generic_fillattr(idmap, request_mask, inode, stat);
 	return 0;
@@ -425,12 +604,9 @@ static int vmsmb_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		return ret;
 
-	inode = new_inode(dir->i_sb);
-	if (!inode)
-		return -ENOMEM;
-
-	inode->i_ino = atomic64_inc_return(&vmsmb_ino_counter);
-	vmsmb_fill_inode(inode, &info);
+	inode = vmsmb_iget(dir->i_sb, &info);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
 
 	d_instantiate(dentry, inode);
 	return 0;
@@ -464,12 +640,9 @@ static struct dentry *vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		return ERR_PTR(ret);
 
-	inode = new_inode(dir->i_sb);
-	if (!inode)
-		return ERR_PTR(-ENOMEM);
-
-	inode->i_ino = atomic64_inc_return(&vmsmb_ino_counter);
-	vmsmb_fill_inode(inode, &info);
+	inode = vmsmb_iget(dir->i_sb, &info);
+	if (IS_ERR(inode))
+		return ERR_CAST(inode);
 	inc_nlink(dir);
 
 	d_instantiate(dentry, inode);
@@ -680,12 +853,9 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		return ret;
 
-	inode = new_inode(dir->i_sb);
-	if (!inode)
-		return -ENOMEM;
-
-	inode->i_ino = atomic64_inc_return(&vmsmb_ino_counter);
-	vmsmb_fill_inode(inode, &info);
+	inode = vmsmb_iget(dir->i_sb, &info);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
 	VMSMB_I(inode)->symlink_target = kstrdup(target, GFP_KERNEL);
 
 	d_instantiate(dentry, inode);
@@ -1296,6 +1466,7 @@ static struct inode *vmsmb_alloc_inode(struct super_block *sb)
 
 	vi->active_ctx = NULL;
 	vi->symlink_target = NULL;
+	vi->index_number = 0;
 	return &vi->netfs.inode;
 }
 
@@ -1374,6 +1545,7 @@ static int vmsmb_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_blocksize_bits = 12;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_op = &vmsmb_super_ops;
+	set_default_d_op(sb, &vmsmb_dentry_ops);
 	sb->s_time_gran = 100; /* 100ns Windows FILETIME granularity */
 
 	/* Set up writeback-capable BDI so netfs writepages works */
@@ -1396,12 +1568,9 @@ static int vmsmb_fill_super(struct super_block *sb, struct fs_context *fc)
 		return ret;
 	}
 
-	root_inode = new_inode(sb);
-	if (!root_inode)
-		return -ENOMEM;
-
-	root_inode->i_ino = 1;
-	vmsmb_fill_inode(root_inode, &root_info);
+	root_inode = vmsmb_iget(sb, &root_info);
+	if (IS_ERR(root_inode))
+		return PTR_ERR(root_inode);
 
 	sb->s_root = d_make_root(root_inode);
 	if (!sb->s_root)
@@ -1419,6 +1588,7 @@ enum vmsmb_param {
 	Opt_dir_mode,
 	Opt_noperm,
 	Opt_symlinkroot,
+	Opt_actimeo,
 };
 
 static const struct fs_parameter_spec vmsmb_fs_parameters[] = {
@@ -1428,6 +1598,7 @@ static const struct fs_parameter_spec vmsmb_fs_parameters[] = {
 	fsparam_u32oct("dir_mode",	Opt_dir_mode),
 	fsparam_flag("noperm",		Opt_noperm),
 	fsparam_string("symlinkroot",	Opt_symlinkroot),
+	fsparam_u32("actimeo",		Opt_actimeo),
 	{}
 };
 
@@ -1446,6 +1617,7 @@ struct vmsmb_fs_context {
 	bool dir_mode_set;
 	bool noperm;
 	char *symlinkroot;
+	unsigned int actimeo_secs;	/* 0 = use default */
 };
 
 static int vmsmb_parse_param(struct fs_context *fc,
@@ -1490,6 +1662,9 @@ static int vmsmb_parse_param(struct fs_context *fc,
 		ctx->symlinkroot = param->string;
 		param->string = NULL;
 		break;
+	case Opt_actimeo:
+		ctx->actimeo_secs = result.uint_32;
+		break;
 	}
 
 	return 0;
@@ -1527,6 +1702,9 @@ static int vmsmb_get_tree(struct fs_context *fc)
 	sbi->dir_mode = ctx->dir_mode_set ? ctx->dir_mode :
 					     (S_IRUGO | S_IXUGO | S_IWUSR);
 	sbi->noperm = ctx->noperm;
+
+	/* Default 1 second — matches CIFS actimeo default */
+	sbi->actimeo = ctx->actimeo_secs ? (ctx->actimeo_secs * HZ) : HZ;
 
 	/* noperm: open all permissions so VFS checks always pass */
 	if (sbi->noperm) {
