@@ -1058,25 +1058,47 @@ static char *vmsmb_inode_path(struct inode *inode)
  * issue_write can use the existing fid without reopening.
  *
  * Port of CIFS cifs_init_request() (fs/smb/client/file.c): CIFS stashes
- * a cifsFileInfo; we stash vmsmb_file_ctx via rreq->netfs_priv.
+ * a cifsFileInfo; we stash vmsmb_file_ctx via rreq->netfs_priv. Also
+ * advertises the per-subrequest max chunk size so netfs splits large
+ * reads into chunks we can each fulfil in one async SMB2 round-trip.
  */
 static int vmsmb_init_request(struct netfs_io_request *rreq, struct file *file)
 {
 	if (file)
 		rreq->netfs_priv = file->private_data; /* vmsmb_file_ctx */
+	rreq->io_streams[0].sreq_max_len = VMSMB_MAX_READ_CHUNK;
 	return 0;
+}
+
+/*
+ * Async completion for issue_read — invoked from workqueue context by
+ * vmsmb_read_async_complete. Safe to copy_to_iter() / sleep here.
+ *
+ * Port of CIFS smb2_readv_callback() → cifs_readahead_to_fscache finish path.
+ */
+static void vmsmb_issue_read_complete(void *priv, int status,
+				      const void *data, u32 len)
+{
+	struct netfs_io_subrequest *subreq = priv;
+
+	if (status) {
+		subreq->error = status;
+	} else if (len && copy_to_iter(data, len, &subreq->io_iter) != len) {
+		subreq->error = -EFAULT;
+	} else {
+		subreq->transferred = len;
+	}
+	netfs_read_subreq_terminated(subreq);
 }
 
 /*
  * netfs issue_read hook — fulfil one subrequest by issuing SMB2 READ.
  *
- * Port of CIFS cifs_issue_read() (fs/smb/client/file.c): if no fid is
- * available (readahead outside an open()), open a transient fid
- * (CREATE+CLOSE around the read). copy_to_iter() into the subreq's folio
- * queue, then netfs_read_subreq_terminated() to hand the subreq back.
- *
- * Still synchronous — async pipelining (matching CIFS smb2_async_readv)
- * is a follow-up task (see hv_vmsmb_todos.md).
+ * Port of CIFS cifs_issue_read() (fs/smb/client/file.c). Fast path uses
+ * vmsmb_smb2_read_async: netfs has bounded subreq->len to sreq_max_len
+ * (VMSMB_MAX_READ_CHUNK), so a single async READ covers it. When no fid
+ * is available (readahead outside an open()), fall back to the synchronous
+ * CREATE+READ+CLOSE path.
  */
 static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 {
@@ -1086,82 +1108,62 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 	struct vmsmb_session *sess = sbi->sess;
 	struct vmsmb_file_ctx *ctx = rreq->netfs_priv;
 	struct vmsmb_fid temp_fid;
-	struct vmsmb_fid *fid;
-	bool temp_open = false;
 	void *buf;
-	size_t remain = subreq->len;
-	loff_t pos = subreq->start;
-	size_t total = 0;
-	int ret = 0;
+	u32 bytes_read = 0;
+	char *path;
+	int ret;
 
-	/* Get file handle — use cached or open temporary */
-	if (ctx) {
-		fid = &ctx->fid;
-	} else {
-		char *path = vmsmb_inode_path(inode);
+	pr_info("issue_read: ctx=%p pos=%lld len=%zu\n",
+		ctx, (long long)subreq->start, subreq->len);
 
-		if (IS_ERR(path)) {
-			subreq->error = PTR_ERR(path);
-			goto out;
-		}
-	
-		ret = vmsmb_smb2_create(sess, sbi->tree_id, path, VMSMB_READ_ACCESS,
-					FILE_OPEN, CREATE_NOT_DIR,
-					&temp_fid, NULL);
-	
-		kfree(path);
-		if (ret) {
-			subreq->error = ret;
-			goto out;
-		}
-		fid = &temp_fid;
-		temp_open = true;
+	/* Fast path: open fid + subreq fits in one chunk → async single-shot */
+	if (ctx && subreq->len <= VMSMB_MAX_READ_CHUNK) {
+		ret = vmsmb_smb2_read_async(sess, sbi->tree_id, &ctx->fid,
+					    subreq->start, subreq->len,
+					    vmsmb_issue_read_complete, subreq);
+		if (ret == 0)
+			return;
+		/* Submit failed — fall through to sync path for graceful error */
+		subreq->error = ret;
+		netfs_read_subreq_terminated(subreq);
+		return;
 	}
 
-	buf = kvmalloc(min_t(size_t, remain, VMSMB_MAX_READ_CHUNK), GFP_KERNEL);
+	/* Slow path: no fid → transient CREATE+READ+CLOSE */
+	path = vmsmb_inode_path(inode);
+	if (IS_ERR(path)) {
+		subreq->error = PTR_ERR(path);
+		goto out;
+	}
+	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, VMSMB_READ_ACCESS,
+				FILE_OPEN, CREATE_NOT_DIR, &temp_fid, NULL);
+	kfree(path);
+	if (ret) {
+		subreq->error = ret;
+		goto out;
+	}
+
+	buf = kvmalloc(min_t(size_t, subreq->len, VMSMB_MAX_READ_CHUNK),
+		       GFP_KERNEL);
 	if (!buf) {
 		subreq->error = -ENOMEM;
 		goto close;
 	}
 
-	while (remain > 0) {
-		u32 chunk = min_t(size_t, remain, VMSMB_MAX_READ_CHUNK);
-		u32 bytes_read = 0;
-
-	
-		ret = vmsmb_smb2_read(sess, sbi->tree_id, fid, pos, chunk, buf, &bytes_read);
-	
-
-		if (ret)
-			break;
-		if (bytes_read == 0)
-			break;
-
-		if (copy_to_iter(buf, bytes_read, &subreq->io_iter) != bytes_read) {
-			ret = -EFAULT;
-			break;
-		}
-
-		pos += bytes_read;
-		total += bytes_read;
-		remain -= bytes_read;
-
-		if (bytes_read < chunk)
-			break;
+	ret = vmsmb_smb2_read(sess, sbi->tree_id, &temp_fid,
+			      subreq->start, subreq->len, buf, &bytes_read);
+	if (ret) {
+		subreq->error = ret;
+	} else if (bytes_read &&
+		   copy_to_iter(buf, bytes_read, &subreq->io_iter) != bytes_read) {
+		subreq->error = -EFAULT;
+	} else {
+		subreq->transferred = bytes_read;
 	}
 
 	kvfree(buf);
-
-	if (ret)
-		subreq->error = ret;
-	subreq->transferred = total;
-
 close:
-	if (temp_open) {
-	
-		vmsmb_smb2_close(sess, sbi->tree_id, &temp_fid);
-	
-	}
+	vmsmb_smb2_close(sess, sbi->tree_id, &temp_fid);
 out:
 	netfs_read_subreq_terminated(subreq);
 }
@@ -1188,12 +1190,24 @@ static void vmsmb_begin_writeback(struct netfs_io_request *wreq)
 }
 
 /*
+ * Async completion for issue_write. Port of CIFS smb2_writev_callback().
+ */
+static void vmsmb_issue_write_complete(void *priv, int status,
+				       u32 bytes_written)
+{
+	struct netfs_io_subrequest *subreq = priv;
+
+	netfs_write_subrequest_terminated(subreq,
+					  status ? status : (ssize_t)bytes_written);
+}
+
+/*
  * netfs issue_write hook — fulfil one subrequest by issuing SMB2 WRITE.
  *
- * Port of CIFS cifs_issue_write() (fs/smb/client/file.c): reuses the
- * writeback fid stashed by begin_writeback, iterates folio queue entries
- * into WRITE PDUs (≤ VMSMB_MAX_WRITE_CHUNK each), and calls
- * netfs_write_subrequest_terminated() on completion.
+ * Port of CIFS cifs_issue_write() (fs/smb/client/file.c). Fast path uses
+ * vmsmb_smb2_write_async: begin_writeback bounded sreq_max_len so one
+ * async WRITE covers the subreq. Falls back to synchronous CREATE+WRITE+CLOSE
+ * when no fid is available.
  */
 static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 {
@@ -1203,88 +1217,93 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 	struct vmsmb_session *sess = sbi->sess;
 	struct vmsmb_file_ctx *ctx = wreq->netfs_priv;
 	struct vmsmb_fid temp_fid;
-	struct vmsmb_fid *fid;
-	bool temp_open = false;
 	void *buf;
-	size_t remain = subreq->len;
-	loff_t pos = subreq->start;
-	size_t total = 0;
-	int ret = 0;
+	size_t copied;
+	u32 bytes_written = 0;
+	char *path;
+	int ret;
 
-	pr_debug("issue_write: pos=%lld len=%zu\n", pos, remain);
+	pr_debug("issue_write: pos=%lld len=%zu\n", subreq->start, subreq->len);
 
-	/* Get file handle — use cached or open temporary */
-	if (ctx) {
-		fid = &ctx->fid;
-	} else {
-		char *path = vmsmb_inode_path(inode);
-
-		if (IS_ERR(path)) {
-			ret = PTR_ERR(path);
-			goto fail;
+	/* Fast path: open fid + subreq fits in one chunk → async single-shot */
+	if (ctx && subreq->len <= VMSMB_MAX_WRITE_CHUNK) {
+		pr_info("issue_write: ASYNC ctx=%p pos=%lld len=%zu\n",
+			ctx, (long long)subreq->start, subreq->len);
+		buf = kvmalloc(subreq->len, GFP_KERNEL);
+		if (!buf) {
+			netfs_write_subrequest_terminated(subreq, -ENOMEM);
+			return;
 		}
-	
-		ret = vmsmb_smb2_create(sess, sbi->tree_id, path, VMSMB_WRITE_ACCESS,
-					FILE_OPEN, CREATE_NOT_DIR,
-					&temp_fid, NULL);
-	
-		kfree(path);
-		if (ret)
-			goto fail;
-		fid = &temp_fid;
-		temp_open = true;
+		copied = copy_from_iter(buf, subreq->len, &subreq->io_iter);
+		if (copied == 0) {
+			kvfree(buf);
+			netfs_write_subrequest_terminated(subreq, -EFAULT);
+			return;
+		}
+		ret = vmsmb_smb2_write_async(sess, sbi->tree_id, &ctx->fid,
+					     subreq->start, buf, copied,
+					     vmsmb_issue_write_complete, subreq);
+		kvfree(buf);
+		if (ret == 0)
+			return;
+		netfs_write_subrequest_terminated(subreq, ret);
+		return;
 	}
 
-	buf = kvmalloc(min_t(size_t, remain, VMSMB_MAX_WRITE_CHUNK), GFP_KERNEL);
+	/* Slow path: no fid → transient CREATE+WRITE+CLOSE */
+	path = vmsmb_inode_path(inode);
+	if (IS_ERR(path)) {
+		netfs_write_subrequest_terminated(subreq, PTR_ERR(path));
+		return;
+	}
+	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, VMSMB_WRITE_ACCESS,
+				FILE_OPEN, CREATE_NOT_DIR, &temp_fid, NULL);
+	kfree(path);
+	if (ret) {
+		netfs_write_subrequest_terminated(subreq, ret);
+		return;
+	}
+
+	buf = kvmalloc(min_t(size_t, subreq->len, VMSMB_MAX_WRITE_CHUNK),
+		       GFP_KERNEL);
 	if (!buf) {
 		ret = -ENOMEM;
 		goto close;
 	}
-
-	while (remain > 0) {
-		u32 chunk = min_t(size_t, remain, VMSMB_MAX_WRITE_CHUNK);
-		u32 bytes_written = 0;
-		size_t copied;
-
-		copied = copy_from_iter(buf, chunk, &subreq->io_iter);
-		if (copied == 0) {
-			ret = -EFAULT;
-			break;
-		}
-
-	
-		ret = vmsmb_smb2_write(sess, sbi->tree_id, fid, pos, buf, copied,
-				       &bytes_written);
-	
-
-		if (ret)
-			break;
-
-		pos += bytes_written;
-		total += bytes_written;
-		remain -= bytes_written;
-
-		if (bytes_written < copied)
-			break;
+	copied = copy_from_iter(buf, subreq->len, &subreq->io_iter);
+	if (copied == 0) {
+		ret = -EFAULT;
+		kvfree(buf);
+		goto close;
 	}
-
+	ret = vmsmb_smb2_write(sess, sbi->tree_id, &temp_fid, subreq->start,
+			       buf, copied, &bytes_written);
 	kvfree(buf);
 
 close:
-	if (temp_open) {
-	
-		vmsmb_smb2_close(sess, sbi->tree_id, &temp_fid);
-	
-	}
-fail:
+	vmsmb_smb2_close(sess, sbi->tree_id, &temp_fid);
 	netfs_write_subrequest_terminated(subreq,
-					  ret ? ret : (ssize_t)total);
+					  ret ? ret : (ssize_t)bytes_written);
+}
+
+/*
+ * netfs prepare_write hook — bound each subrequest to our max write chunk
+ * so netfs splits large unbuffered writes into chunks we can send in a
+ * single VMBus packet. Port of CIFS cifs_prepare_write().
+ */
+static void vmsmb_prepare_write(struct netfs_io_subrequest *subreq)
+{
+	struct netfs_io_stream *stream =
+		&subreq->rreq->io_streams[subreq->stream_nr];
+
+	stream->sreq_max_len = VMSMB_MAX_WRITE_CHUNK;
 }
 
 const struct netfs_request_ops vmsmb_netfs_ops = {
 	.init_request	= vmsmb_init_request,
 	.issue_read	= vmsmb_issue_read,
 	.begin_writeback = vmsmb_begin_writeback,
+	.prepare_write	= vmsmb_prepare_write,
 	.issue_write	= vmsmb_issue_write,
 };
 
