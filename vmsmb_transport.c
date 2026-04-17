@@ -38,6 +38,36 @@
 #define VMSMB_SPIN_USEC		10
 
 /*
+ * Workqueue handler: runs the per-request async callback in process
+ * context. channel_cb schedules this when a response arrives for a
+ * request whose async_cb is set.
+ */
+static void vmsmb_async_work(struct work_struct *work)
+{
+	struct vmsmb_request *req = container_of(work, struct vmsmb_request, work);
+
+	req->async_cb(req);
+	/* async_cb owns req from here — it must kfree. */
+}
+
+/*
+ * Called from channel_cb (softirq) when a response for @req is complete.
+ * Routes to either the sync completion (wakes wait_for_completion_timeout)
+ * or the async workqueue (runs async_cb in process context).
+ */
+static inline void vmsmb_complete_req(struct vmsmb_request *req)
+{
+	req->response_len = req->recv_offset;
+	req->status = 0;
+	if (req->async_cb) {
+		INIT_WORK(&req->work, vmsmb_async_work);
+		schedule_work(&req->work);
+	} else {
+		complete(&req->done);
+	}
+}
+
+/*
  * Find a pending request by SMB2 MessageId.
  * Must be called with sess->pending_lock held.
  *
@@ -146,9 +176,7 @@ static void vmsmb_process_data(struct vmsmb_session *sess,
 
 			/* Check if already complete (small response) */
 			if (req->recv_offset >= req->expected_total) {
-				req->response_len = req->recv_offset;
-				req->status = 0;
-				complete(&req->done);
+				vmsmb_complete_req(req);
 				sess->current_recv = NULL;
 			}
 			continue;
@@ -169,9 +197,7 @@ static void vmsmb_process_data(struct vmsmb_session *sess,
 			len -= min(len, remaining);
 
 			if (req->recv_offset >= req->expected_total) {
-				req->response_len = req->recv_offset;
-				req->status = 0;
-				complete(&req->done);
+				vmsmb_complete_req(req);
 				sess->current_recv = NULL;
 			}
 		}
@@ -434,6 +460,123 @@ static int vmsmb_send_recv_sync(struct vmsmb_session *sess,
 }
 
 /*
+ * Send an SMB2 PDU over VMBus. Allocates + frames + registers the request
+ * in the pending list, then transmits. On success the request sits in
+ * sess->pending_requests waiting for a response; channel_cb will either
+ * complete() (sync) or schedule the async work (async).
+ *
+ * Lifetime: @req must remain valid until the completion fires. For sync
+ * callers it's on the stack; async callers allocate it and hand ownership
+ * to async_cb.
+ */
+static int vmsmb_submit(struct vmsmb_session *sess,
+			const void *smb2_req, u32 req_len,
+			struct vmsmb_request *req)
+{
+	const u32 stream_hdr_size = sizeof(struct smb2_stream_hdr);
+	struct smb2_stream_hdr *sh;
+	struct vmpipe_hdr *pipe;
+	const struct smb2_hdr *smb2h;
+	u8 *send_buf;
+	u32 send_pkt_len;
+	int ret, send_retries;
+
+	if (req_len < sizeof(struct smb2_hdr))
+		return -EINVAL;
+	smb2h = (const struct smb2_hdr *)smb2_req;
+	req->message_id = le64_to_cpu(smb2h->MessageId);
+
+	send_pkt_len = sizeof(struct vmpipe_hdr) + stream_hdr_size + req_len;
+	send_buf = kmalloc(send_pkt_len, GFP_KERNEL);
+	if (!send_buf)
+		return -ENOMEM;
+
+	pipe = (struct vmpipe_hdr *)send_buf;
+	pipe->pkt_type = cpu_to_le32(VMPIPE_TYPE_DATA);
+	pipe->data_size = cpu_to_le32(stream_hdr_size + req_len);
+
+	sh = (struct smb2_stream_hdr *)(send_buf + sizeof(struct vmpipe_hdr));
+	sh->type = SMB2_STREAM_TYPE_SMB2;
+	smb2_stream_set_size(sh, req_len);
+
+	memcpy(send_buf + sizeof(struct vmpipe_hdr) + stream_hdr_size,
+	       smb2_req, req_len);
+
+	spin_lock_bh(&sess->pending_lock);
+	list_add_tail(&req->list, &sess->pending_requests);
+	spin_unlock_bh(&sess->pending_lock);
+
+	mutex_lock(&sess->send_mutex);
+	for (send_retries = 0; send_retries < 100; send_retries++) {
+		ret = vmbus_sendpacket(sess->channel, send_buf, send_pkt_len,
+				       0, VM_PKT_DATA_INBAND, 0);
+		if (ret != -EAGAIN)
+			break;
+		usleep_range(100, 500);
+	}
+	mutex_unlock(&sess->send_mutex);
+	kfree(send_buf);
+
+	if (ret) {
+		pr_err("vmbus_sendpacket failed: %d\n", ret);
+		spin_lock_bh(&sess->pending_lock);
+		list_del_init(&req->list);
+		spin_unlock_bh(&sess->pending_lock);
+	}
+	return ret;
+}
+
+/*
+ * Async SMB2 submit — allocates request + response buffer, transmits, and
+ * returns immediately. On completion, channel_cb schedules a workqueue
+ * that calls async_cb(req) in process context. async_cb owns the request
+ * and response buffers from that point and must kfree them.
+ *
+ * On failure (send error / OOM) nothing is scheduled and the caller sees
+ * the error synchronously; @req_out is not populated.
+ *
+ * Model: CIFS cifs_call_async() (fs/smb/client/transport.c).
+ */
+int vmsmb_smb2_submit_async(struct vmsmb_session *sess,
+			    const void *smb2_req, u32 req_len,
+			    u32 resp_buf_size,
+			    void (*async_cb)(struct vmsmb_request *),
+			    void *async_priv,
+			    struct vmsmb_request **req_out)
+{
+	const u32 stream_hdr_size = sizeof(struct smb2_stream_hdr);
+	struct vmsmb_request *req;
+	int ret;
+
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	req->response_buf_size = stream_hdr_size + resp_buf_size;
+	req->response_buf = kvmalloc(req->response_buf_size, GFP_KERNEL);
+	if (!req->response_buf) {
+		kfree(req);
+		return -ENOMEM;
+	}
+	INIT_LIST_HEAD(&req->list);
+	init_completion(&req->done);
+	req->status = -EINPROGRESS;
+	req->async_cb = async_cb;
+	req->async_priv = async_priv;
+
+	ret = vmsmb_submit(sess, smb2_req, req_len, req);
+	if (ret) {
+		kvfree(req->response_buf);
+		kfree(req);
+		return ret;
+	}
+
+	if (req_out)
+		*req_out = req;
+	return 0;
+}
+
+/*
  * SMB2-level transact: send a pure SMB2 PDU, receive a pure SMB2 response.
  *
  * Handles all transport framing (PipeHdr + StreamHdr) internally so the
@@ -454,30 +597,13 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 			u32 *resp_len)
 {
 	const u32 stream_hdr_size = sizeof(struct smb2_stream_hdr);
-	struct vmsmb_request req;
+	struct vmsmb_request req = {};
 	struct smb2_stream_hdr *sh;
-	struct vmpipe_hdr *pipe;
-	u8 *send_buf;
-	u32 send_pkt_len;
 	void *recv_buf;
 	u32 recv_buf_size;
-	const struct smb2_hdr *smb2h;
 	u32 smb2_size;
 	unsigned long remaining;
 	int ret;
-
-	/* Extract MessageId from SMB2 header */
-	if (req_len < sizeof(struct smb2_hdr))
-		return -EINVAL;
-	smb2h = (const struct smb2_hdr *)smb2_req;
-
-	/* Initialize per-request state */
-	INIT_LIST_HEAD(&req.list);
-	req.message_id = le64_to_cpu(smb2h->MessageId);
-	init_completion(&req.done);
-	req.status = -EINPROGRESS;
-	req.recv_offset = 0;
-	req.expected_total = 0;
 
 	/*
 	 * Allocate response buffer with room for StreamHdr.
@@ -488,56 +614,14 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 	if (!recv_buf)
 		return -ENOMEM;
 
+	INIT_LIST_HEAD(&req.list);
+	init_completion(&req.done);
+	req.status = -EINPROGRESS;
 	req.response_buf = recv_buf;
 	req.response_buf_size = recv_buf_size;
-	req.response_len = 0;
 
-	/* Build send packet: PipeHdr + StreamHdr + SMB2 PDU */
-	send_pkt_len = sizeof(struct vmpipe_hdr) + stream_hdr_size + req_len;
-	send_buf = kmalloc(send_pkt_len, GFP_KERNEL);
-	if (!send_buf) {
-		kvfree(recv_buf);
-		return -ENOMEM;
-	}
-
-	pipe = (struct vmpipe_hdr *)send_buf;
-	pipe->pkt_type = cpu_to_le32(VMPIPE_TYPE_DATA);
-	pipe->data_size = cpu_to_le32(stream_hdr_size + req_len);
-
-	sh = (struct smb2_stream_hdr *)(send_buf + sizeof(struct vmpipe_hdr));
-	sh->type = SMB2_STREAM_TYPE_SMB2;
-	smb2_stream_set_size(sh, req_len);
-
-	memcpy(send_buf + sizeof(struct vmpipe_hdr) + stream_hdr_size,
-	       smb2_req, req_len);
-
-	/* Register in pending list before sending (bh: lock shared with tasklet) */
-	spin_lock_bh(&sess->pending_lock);
-	list_add_tail(&req.list, &sess->pending_requests);
-	spin_unlock_bh(&sess->pending_lock);
-
-	/* Send with EAGAIN retry (ring buffer may be full) */
-	mutex_lock(&sess->send_mutex);
-	{
-		int send_retries;
-
-		for (send_retries = 0; send_retries < 100; send_retries++) {
-			ret = vmbus_sendpacket(sess->channel, send_buf,
-					       send_pkt_len, 0,
-					       VM_PKT_DATA_INBAND, 0);
-			if (ret != -EAGAIN)
-				break;
-			usleep_range(100, 500);
-		}
-	}
-	mutex_unlock(&sess->send_mutex);
-	kfree(send_buf);
-
+	ret = vmsmb_submit(sess, smb2_req, req_len, &req);
 	if (ret) {
-		pr_err("vmbus_sendpacket failed: %d\n", ret);
-		spin_lock_bh(&sess->pending_lock);
-		list_del_init(&req.list);
-		spin_unlock_bh(&sess->pending_lock);
 		kvfree(recv_buf);
 		return ret;
 	}
