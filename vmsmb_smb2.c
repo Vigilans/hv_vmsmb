@@ -859,6 +859,181 @@ out:
 	kfree(resp_buf);
 	return ret;
 }
+/*
+ * SMB2 CREATE+IOCTL+CLOSE compound — folds a 3-round-trip probe into one
+ * VMBus transact. Used for FSCTL_GET_REPARSE_POINT (symlink readlink).
+ *
+ * Ported from CIFS smb2_compound_op() (fs/smb/client/smb2inode.c): three
+ * PDUs chained via NextCommand; PDUs 2 and 3 set SMB2_FLAGS_RELATED_OPERATIONS
+ * and inherit the CREATE'd fid via COMPOUND_FID.
+ *
+ * Simplified: fixed disposition=FILE_OPEN; no QFid context (callers here
+ * don't need index_number); CLOSE failure non-fatal.
+ */
+int vmsmb_smb2_create_ioctl_close(struct vmsmb_session *sess, u32 tree_id,
+				  const char *path,
+				  u32 desired_access, u32 create_options,
+				  u32 ctl_code,
+				  const void *in, u32 in_len,
+				  void *out, u32 out_size, u32 *out_len)
+{
+	u8 *pdu_buf, *resp_buf;
+	struct smb2_create_req *creq;
+	struct smb2_ioctl_req *ireq;
+	struct smb2_close_req *clreq;
+	const struct smb2_ioctl_rsp *irsp;
+	const struct smb2_hdr *hdr1, *hdr2, *hdr3;
+	__le16 *name_utf16;
+	int name_len;
+	u32 resp_len;
+	u32 create_pdu_len, ioctl_pdu_off, ioctl_pdu_len, close_pdu_off, total_len;
+	u32 pdu2_resp_off, pdu2_resp_remaining, rsp_out_off, rsp_out_len;
+	u32 next1, next2;
+	int ret;
+
+	resp_buf = kmalloc(VMSMB_MAX_IO_RESPONSE, GFP_KERNEL);
+	if (!resp_buf)
+		return -ENOMEM;
+
+	name_utf16 = vmsmb_path_to_utf16(path, &name_len);
+	if (!name_utf16) {
+		kfree(resp_buf);
+		return -ENOMEM;
+	}
+
+	create_pdu_len = sizeof(struct smb2_create_req) + max_t(int, name_len, 1);
+	ioctl_pdu_off = ALIGN(create_pdu_len, 8);
+	ioctl_pdu_len = sizeof(struct smb2_ioctl_req) + in_len;
+	close_pdu_off = ioctl_pdu_off + ALIGN(ioctl_pdu_len, 8);
+	total_len = close_pdu_off + sizeof(struct smb2_close_req);
+
+	pdu_buf = kzalloc(total_len, GFP_KERNEL);
+	if (!pdu_buf) {
+		kfree(name_utf16);
+		kfree(resp_buf);
+		return -ENOMEM;
+	}
+
+	/* PDU #1: CREATE */
+	creq = (struct smb2_create_req *)pdu_buf;
+	vmsmb_fill_hdr(&creq->hdr, SMB2_CREATE_HE, sess, tree_id);
+	creq->hdr.NextCommand = cpu_to_le32(ioctl_pdu_off);
+	creq->StructureSize = cpu_to_le16(57);
+	creq->ImpersonationLevel = cpu_to_le32(0x02);
+	creq->DesiredAccess = cpu_to_le32(desired_access);
+	creq->FileAttributes = cpu_to_le32(FILE_ATTRIBUTE_NORMAL);
+	creq->ShareAccess = cpu_to_le32(0x07);
+	creq->CreateDisposition = cpu_to_le32(FILE_OPEN);
+	creq->CreateOptions = cpu_to_le32(create_options);
+	creq->NameOffset = cpu_to_le16(sizeof(struct smb2_create_req));
+	creq->NameLength = cpu_to_le16(name_len);
+	if (name_len > 0)
+		memcpy(pdu_buf + sizeof(struct smb2_create_req), name_utf16, name_len);
+	kfree(name_utf16);
+
+	/* PDU #2: IOCTL, RELATED, COMPOUND_FID */
+	ireq = (struct smb2_ioctl_req *)(pdu_buf + ioctl_pdu_off);
+	vmsmb_fill_hdr(&ireq->hdr, SMB2_IOCTL_HE, sess, tree_id);
+	ireq->hdr.NextCommand = cpu_to_le32(close_pdu_off - ioctl_pdu_off);
+	ireq->hdr.Flags |= SMB2_FLAGS_RELATED_OPERATIONS;
+	ireq->StructureSize = cpu_to_le16(57);
+	ireq->CtlCode = cpu_to_le32(ctl_code);
+	ireq->PersistentFileId = COMPOUND_FID;
+	ireq->VolatileFileId = COMPOUND_FID;
+	ireq->InputOffset = cpu_to_le32(sizeof(struct smb2_ioctl_req));
+	ireq->InputCount = cpu_to_le32(in_len);
+	ireq->MaxInputResponse = 0;
+	ireq->OutputOffset = 0;
+	ireq->OutputCount = 0;
+	ireq->MaxOutputResponse = cpu_to_le32(out_size);
+	ireq->Flags = cpu_to_le32(SMB2_0_IOCTL_IS_FSCTL);
+	ireq->Reserved2 = 0;
+	if (in_len)
+		memcpy(ireq->Buffer, in, in_len);
+
+	/* PDU #3: CLOSE, RELATED, COMPOUND_FID */
+	clreq = (struct smb2_close_req *)(pdu_buf + close_pdu_off);
+	vmsmb_fill_hdr(&clreq->hdr, SMB2_CLOSE_HE, sess, tree_id);
+	clreq->hdr.Flags |= SMB2_FLAGS_RELATED_OPERATIONS;
+	clreq->StructureSize = cpu_to_le16(24);
+	clreq->PersistentFileId = COMPOUND_FID;
+	clreq->VolatileFileId = COMPOUND_FID;
+
+	pr_debug("CREATE+IOCTL+CLOSE compound: path='%s' ctl=0x%x total=%u\n",
+		 path, ctl_code, total_len);
+
+	ret = vmsmb_smb2_transact(sess, pdu_buf, total_len,
+				  resp_buf, VMSMB_MAX_IO_RESPONSE, &resp_len);
+	kfree(pdu_buf);
+	if (ret)
+		goto out;
+
+	/* CREATE response */
+	hdr1 = vmsmb_check_resp(resp_buf, resp_len);
+	if (!hdr1) {
+		ret = -EPROTO;
+		goto out;
+	}
+	ret = vmsmb_check_status(hdr1, "CREATE");
+	if (ret)
+		goto out;
+
+	/* IOCTL response at hdr1->NextCommand */
+	next1 = le32_to_cpu(hdr1->NextCommand);
+	if (!next1 || next1 >= resp_len ||
+	    resp_len - next1 < sizeof(struct smb2_ioctl_rsp)) {
+		pr_warn_ratelimited("hv_vmsmb: compound: missing IOCTL resp (next=%u resp=%u)\n",
+				    next1, resp_len);
+		ret = -EPROTO;
+		goto out;
+	}
+	hdr2 = (const struct smb2_hdr *)(resp_buf + next1);
+	if (hdr2->ProtocolId != SMB2_PROTO_NUMBER) {
+		ret = -EPROTO;
+		goto out;
+	}
+	ret = vmsmb_check_status(hdr2, "IOCTL");
+	if (ret)
+		goto out;
+
+	irsp = (const struct smb2_ioctl_rsp *)(resp_buf + next1);
+	pdu2_resp_off = next1;
+	pdu2_resp_remaining = resp_len - next1;
+	rsp_out_off = le32_to_cpu(irsp->OutputOffset);	/* from start of SMB2 hdr */
+	rsp_out_len = le32_to_cpu(irsp->OutputCount);
+
+	if (rsp_out_off > pdu2_resp_remaining ||
+	    rsp_out_len > pdu2_resp_remaining - rsp_out_off) {
+		ret = -EPROTO;
+		goto out;
+	}
+	if (rsp_out_len > out_size)
+		rsp_out_len = out_size;
+	if (out && rsp_out_len)
+		memcpy(out, resp_buf + pdu2_resp_off + rsp_out_off, rsp_out_len);
+	if (out_len)
+		*out_len = rsp_out_len;
+
+	/* CLOSE response (non-fatal) */
+	next2 = le32_to_cpu(hdr2->NextCommand);
+	if (!next2 || pdu2_resp_off + next2 >= resp_len ||
+	    resp_len - pdu2_resp_off - next2 < sizeof(struct smb2_hdr)) {
+		pr_debug("compound: missing/short CLOSE response\n");
+		goto out;
+	}
+	hdr3 = (const struct smb2_hdr *)(resp_buf + pdu2_resp_off + next2);
+	if (hdr3->ProtocolId != SMB2_PROTO_NUMBER) {
+		pr_debug("compound: CLOSE bad magic\n");
+		goto out;
+	}
+	if (hdr3->Status != STATUS_SUCCESS)
+		pr_debug("compound CLOSE NTSTATUS 0x%08x\n",
+			 le32_to_cpu(hdr3->Status));
+
+out:
+	kfree(resp_buf);
+	return ret;
+}
 
 /*
  * SMB2 READ — read data from an open file.
@@ -1414,21 +1589,11 @@ int vmsmb_smb2_get_reparse(struct vmsmb_session *sess, u32 tree_id,
 			    const char *path,
 			    void *buf, u32 buf_size, u32 *data_len)
 {
-	struct vmsmb_fid fid;
-	int ret;
-
-	ret = vmsmb_smb2_create(sess, tree_id, path, FILE_READ_ATTRIBUTES,
-				FILE_OPEN,
-				OPEN_REPARSE_POINT,
-				&fid, NULL);
-	if (ret)
-		return ret;
-
-	ret = vmsmb_smb2_ioctl(sess, tree_id, &fid, FSCTL_GET_REPARSE_POINT,
-			       NULL, 0, buf, buf_size, data_len);
-
-	vmsmb_smb2_close(sess, tree_id, &fid);
-	return ret;
+	return vmsmb_smb2_create_ioctl_close(sess, tree_id, path,
+					     FILE_READ_ATTRIBUTES,
+					     OPEN_REPARSE_POINT,
+					     FSCTL_GET_REPARSE_POINT,
+					     NULL, 0, buf, buf_size, data_len);
 }
 
 /*

@@ -251,6 +251,12 @@ int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 			    const char *path,
 			    u32 desired_access, u32 create_options,
 			    struct vmsmb_file_info *info);
+int vmsmb_smb2_create_ioctl_close(struct vmsmb_session *sess, u32 tree_id,
+				  const char *path,
+				  u32 desired_access, u32 create_options,
+				  u32 ctl_code,
+				  const void *in, u32 in_len,
+				  void *out, u32 out_size, u32 *out_len);
 int vmsmb_smb2_read(struct vmsmb_session *sess, u32 tree_id,
 		    struct vmsmb_fid *fid,
 		    u64 offset, u32 length, void *data, u32 *bytes_read);
