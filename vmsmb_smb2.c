@@ -661,6 +661,192 @@ out:
 }
 
 /*
+ * SMB2 CREATE+CLOSE compound — halves round-trips for metadata probe paths
+ * (lookup, getattr cache-miss).
+ *
+ * Ported from CIFS smb2_compound_op() (fs/smb/client/smb2inode.c): two PDUs
+ * chained via hdr1->NextCommand (8-byte aligned offset to PDU2); PDU2 sets
+ * SMB2_FLAGS_RELATED_OPERATIONS and inherits the CREATE'd fid by passing
+ * COMPOUND_FID. MS-SMB2 §3.2.4.1.4 "Sending Compounded Requests".
+ *
+ * Simplified: fixed disposition=FILE_OPEN (probe only, no create/overwrite);
+ * no middle op (CIFS supports CREATE+{set_eof,set_basic_info,...}+CLOSE);
+ * CLOSE failure is non-fatal (host-side fid, no leak risk).
+ */
+int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
+			    const char *path,
+			    u32 desired_access, u32 create_options,
+			    struct vmsmb_file_info *info)
+{
+	u8 *pdu_buf, *resp_buf;
+	struct smb2_create_req *creq;
+	struct smb2_close_req *clreq;
+	const struct smb2_create_rsp *crsp;
+	const struct smb2_hdr *hdr1;
+	const struct smb2_hdr *hdr2;
+	__le16 *name_utf16;
+	int name_len;
+	u32 resp_len;
+	u32 name_end, ctx_offset, create_pdu_len, close_pdu_off, total_len;
+	u32 next_off;
+	struct create_context *qfid_ctx;
+	int ret;
+
+	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
+	if (!resp_buf)
+		return -ENOMEM;
+
+	name_utf16 = vmsmb_path_to_utf16(path, &name_len);
+	if (!name_utf16) {
+		kfree(resp_buf);
+		return -ENOMEM;
+	}
+
+	name_end = sizeof(struct smb2_create_req) + max_t(int, name_len, 1);
+	ctx_offset = ALIGN(name_end, 8);
+	create_pdu_len = ctx_offset + 24;		/* QFid ctx = 24 bytes */
+	close_pdu_off = ALIGN(create_pdu_len, 8);
+	total_len = close_pdu_off + sizeof(struct smb2_close_req);
+
+	pdu_buf = kzalloc(total_len, GFP_KERNEL);
+	if (!pdu_buf) {
+		kfree(name_utf16);
+		kfree(resp_buf);
+		return -ENOMEM;
+	}
+
+	/* PDU #1: CREATE with NextCommand = close_pdu_off */
+	creq = (struct smb2_create_req *)pdu_buf;
+	vmsmb_fill_hdr(&creq->hdr, SMB2_CREATE_HE, sess, tree_id);
+	creq->hdr.NextCommand = cpu_to_le32(close_pdu_off);
+	creq->StructureSize = cpu_to_le16(57);
+	creq->ImpersonationLevel = cpu_to_le32(0x02);
+	creq->DesiredAccess = cpu_to_le32(desired_access);
+	creq->FileAttributes = cpu_to_le32(FILE_ATTRIBUTE_NORMAL);
+	creq->ShareAccess = cpu_to_le32(0x07);
+	creq->CreateDisposition = cpu_to_le32(FILE_OPEN);
+	creq->CreateOptions = cpu_to_le32(create_options);
+	creq->NameOffset = cpu_to_le16(sizeof(struct smb2_create_req));
+	creq->NameLength = cpu_to_le16(name_len);
+	if (name_len > 0)
+		memcpy(pdu_buf + sizeof(struct smb2_create_req), name_utf16, name_len);
+	kfree(name_utf16);
+
+	qfid_ctx = (struct create_context *)(pdu_buf + ctx_offset);
+	qfid_ctx->hdr.Next = 0;
+	qfid_ctx->hdr.NameOffset = cpu_to_le16(16);
+	qfid_ctx->hdr.NameLength = cpu_to_le16(4);
+	qfid_ctx->hdr.DataOffset = 0;
+	qfid_ctx->hdr.DataLength = 0;
+	memcpy(qfid_ctx->Buffer, SMB2_CREATE_QUERY_ON_DISK_ID, 4);
+	creq->CreateContextsOffset = cpu_to_le32(ctx_offset);
+	creq->CreateContextsLength = cpu_to_le32(24);
+
+	/* PDU #2: CLOSE, RELATED, using COMPOUND_FID */
+	clreq = (struct smb2_close_req *)(pdu_buf + close_pdu_off);
+	vmsmb_fill_hdr(&clreq->hdr, SMB2_CLOSE_HE, sess, tree_id);
+	clreq->hdr.Flags |= SMB2_FLAGS_RELATED_OPERATIONS;
+	clreq->StructureSize = cpu_to_le16(24);
+	clreq->PersistentFileId = COMPOUND_FID;
+	clreq->VolatileFileId = COMPOUND_FID;
+
+	pr_debug("CREATE+CLOSE compound: path='%s' access=0x%x opts=0x%x total=%u\n",
+		 path, desired_access, create_options, total_len);
+
+	ret = vmsmb_smb2_transact(sess, pdu_buf, total_len,
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	kfree(pdu_buf);
+	if (ret)
+		goto out;
+
+	hdr1 = vmsmb_check_resp(resp_buf, resp_len);
+	if (!hdr1) {
+		ret = -EPROTO;
+		goto out;
+	}
+
+	ret = vmsmb_check_status(hdr1, "CREATE");
+	if (ret)
+		goto out;
+
+	if (resp_len < sizeof(struct smb2_create_rsp)) {
+		ret = -EPROTO;
+		goto out;
+	}
+
+	crsp = (const struct smb2_create_rsp *)resp_buf;
+
+	if (info) {
+		u32 rsp_ctx_off = le32_to_cpu(crsp->CreateContextsOffset);
+		u32 rsp_ctx_len = le32_to_cpu(crsp->CreateContextsLength);
+
+		info->size = le64_to_cpu(crsp->EndofFile);
+		info->alloc_size = le64_to_cpu(crsp->AllocationSize);
+		info->creation_time = le64_to_cpu(crsp->CreationTime);
+		info->last_access_time = le64_to_cpu(crsp->LastAccessTime);
+		info->last_write_time = le64_to_cpu(crsp->LastWriteTime);
+		info->change_time = le64_to_cpu(crsp->ChangeTime);
+		info->attributes = le32_to_cpu(crsp->FileAttributes);
+		info->index_number = 0;
+
+		if (rsp_ctx_off && rsp_ctx_len &&
+		    rsp_ctx_off + rsp_ctx_len <= resp_len) {
+			const u8 *p = resp_buf + rsp_ctx_off;
+			const u8 *end = p + rsp_ctx_len;
+
+			while (p + sizeof(struct create_context_hdr) <= end) {
+				const struct create_context *cc =
+					(const struct create_context *)p;
+				u32 next = le32_to_cpu(cc->hdr.Next);
+				u16 n_off = le16_to_cpu(cc->hdr.NameOffset);
+				u16 n_len = le16_to_cpu(cc->hdr.NameLength);
+				u16 d_off = le16_to_cpu(cc->hdr.DataOffset);
+				u32 d_len = le32_to_cpu(cc->hdr.DataLength);
+
+				if (n_len == 4 &&
+				    p + n_off + 4 <= end &&
+				    memcmp(p + n_off, SMB2_CREATE_QUERY_ON_DISK_ID, 4) == 0 &&
+				    d_len >= 8 &&
+				    p + d_off + 8 <= end) {
+					__le64 disk_id;
+
+					memcpy(&disk_id, p + d_off, 8);
+					info->index_number = le64_to_cpu(disk_id);
+					break;
+				}
+
+				if (!next)
+					break;
+				if (next < sizeof(struct create_context_hdr))
+					break;
+				p += next;
+			}
+		}
+	}
+
+	/* Validate CLOSE response (non-fatal — fid is host-side). */
+	next_off = le32_to_cpu(hdr1->NextCommand);
+	if (next_off == 0 || next_off >= resp_len ||
+	    resp_len - next_off < sizeof(struct smb2_hdr)) {
+		pr_debug("compound: missing/short CLOSE response (next=%u resp=%u)\n",
+			 next_off, resp_len);
+		goto out;
+	}
+	hdr2 = (const struct smb2_hdr *)(resp_buf + next_off);
+	if (hdr2->ProtocolId != SMB2_PROTO_NUMBER) {
+		pr_debug("compound: CLOSE response bad magic\n");
+		goto out;
+	}
+	if (hdr2->Status != STATUS_SUCCESS)
+		pr_debug("compound CLOSE NTSTATUS 0x%08x\n",
+			 le32_to_cpu(hdr2->Status));
+
+out:
+	kfree(resp_buf);
+	return ret;
+}
+
+/*
  * SMB2 READ — read data from an open file.
  *
  * Simplified: CIFS smb2_async_readv() (fs/smb/client/smb2pdu.c)

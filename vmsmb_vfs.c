@@ -462,7 +462,6 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 {
 	struct vmsmb_sb_info *sbi = VMSMB_SB(dir->i_sb);
 	struct vmsmb_session *sess = sbi->sess;
-	struct vmsmb_fid fid;
 	struct vmsmb_file_info info;
 	struct inode *inode;
 	char *path;
@@ -473,12 +472,10 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 		return ERR_CAST(path);
 
 
-	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, FILE_READ_ATTRIBUTES,
-				FILE_OPEN,
-				OPEN_REPARSE_POINT,
-				&fid, &info);
-	if (ret == 0)
-		vmsmb_smb2_close(sess, sbi->tree_id, &fid);
+	ret = vmsmb_smb2_create_close(sess, sbi->tree_id, path,
+				      FILE_READ_ATTRIBUTES,
+				      OPEN_REPARSE_POINT,
+				      &info);
 
 
 	kfree(path);
@@ -554,20 +551,17 @@ static int vmsmb_getattr(struct mnt_idmap *idmap,
 	 * the oplock-held fast path.
 	 */
 	if (time_after(jiffies, vi->meta_expires)) {
-		struct vmsmb_fid fid;
 		struct vmsmb_file_info info;
 		char *spath;
 		int ret;
 
 		spath = vmsmb_build_path(path->dentry);
 		if (!IS_ERR(spath)) {
-			ret = vmsmb_smb2_create(sbi->sess, sbi->tree_id, spath,
-						FILE_READ_ATTRIBUTES, FILE_OPEN,
-						OPEN_REPARSE_POINT, &fid, &info);
-			if (ret == 0) {
-				vmsmb_smb2_close(sbi->sess, sbi->tree_id, &fid);
+			ret = vmsmb_smb2_create_close(sbi->sess, sbi->tree_id, spath,
+						      FILE_READ_ATTRIBUTES,
+						      OPEN_REPARSE_POINT, &info);
+			if (ret == 0)
 				vmsmb_refresh_inode(inode, &info);
-			}
 			kfree(spath);
 		}
 	}

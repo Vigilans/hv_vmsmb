@@ -130,6 +130,14 @@
 #define SMB2_FLAGS_REPLAY_OPERATION	cpu_to_le32(0x20000000) /* SMB3 & up */
 
 /*
+ * Sentinel file id used in compound requests: when the second (or later)
+ * PDU in a chain carries this value, the server uses the fid produced by
+ * the prior operation in the chain. Ported from CIFS:
+ *   fs/smb/client/smb2pdu.h: #define COMPOUND_FID 0xFFFFFFFFFFFFFFFFULL
+ */
+#define COMPOUND_FID			0xFFFFFFFFFFFFFFFFULL
+
+/*
  *	Definitions for SMB2 Protocol Data Units (network frames)
  *
  *  See MS-SMB2.PDF specification for protocol details.
