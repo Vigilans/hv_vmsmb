@@ -114,6 +114,7 @@ struct vmsmb_file_info {
 	u64 last_write_time;
 	u64 change_time;
 	u32 attributes;		/* FILE_ATTRIBUTE_* */
+	u64 index_number;	/* NTFS file reference number (from QFid create context), 0 if unavailable */
 };
 
 /*

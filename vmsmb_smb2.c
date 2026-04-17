@@ -471,6 +471,9 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, u32 tree_id,
 	__le16 *name_utf16;
 	int name_len;
 	u32 pdu_len, resp_len;
+	u32 ctx_offset;		/* 8-byte aligned offset of QFid context */
+	u32 name_end;
+	struct create_context *qfid_ctx;
 	int ret;
 
 	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
@@ -483,7 +486,15 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, u32 tree_id,
 		return -ENOMEM;
 	}
 
-	pdu_len = sizeof(struct smb2_create_req) + max_t(int, name_len, 1);
+	/*
+	 * Layout: [fixed smb2_create_req][name][pad][QFid context].
+	 * QFid context requests the NTFS file reference number on the
+	 * CREATE response (MS-SMB2 2.2.13.2.9), avoiding a separate
+	 * QUERY_INFO round-trip. Port of CIFS smb2_open pattern.
+	 */
+	name_end = sizeof(struct smb2_create_req) + max_t(int, name_len, 1);
+	ctx_offset = ALIGN(name_end, 8);
+	pdu_len = ctx_offset + 24;	/* QFid context = 16 hdr + 4 name + 4 pad */
 	pdu_buf = kzalloc(pdu_len, GFP_KERNEL);
 	if (!pdu_buf) {
 		kfree(name_utf16);
@@ -511,9 +522,19 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, u32 tree_id,
 
 	kfree(name_utf16);
 
-	pr_debug("CREATE: path='%s' access=0x%x disp=0x%x opts=0x%x namelen=%d pdulen=%u nameoff=%u\n",
-		 path, desired_access, disposition, create_options, name_len, pdu_len,
-		 (unsigned)sizeof(struct smb2_create_req));
+	/* QFid request context — Name = "QFid", no data */
+	qfid_ctx = (struct create_context *)(pdu_buf + ctx_offset);
+	qfid_ctx->hdr.Next = 0;
+	qfid_ctx->hdr.NameOffset = cpu_to_le16(16);
+	qfid_ctx->hdr.NameLength = cpu_to_le16(4);
+	qfid_ctx->hdr.DataOffset = 0;
+	qfid_ctx->hdr.DataLength = 0;
+	memcpy(qfid_ctx->Buffer, SMB2_CREATE_QUERY_ON_DISK_ID, 4);
+	req->CreateContextsOffset = cpu_to_le32(ctx_offset);
+	req->CreateContextsLength = cpu_to_le32(24);
+
+	pr_debug("CREATE: path='%s' access=0x%x disp=0x%x opts=0x%x namelen=%d pdulen=%u\n",
+		 path, desired_access, disposition, create_options, name_len, pdu_len);
 
 	ret = vmsmb_smb2_transact(sess, pdu_buf, pdu_len,
 				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
@@ -543,6 +564,9 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, u32 tree_id,
 		fid->volatile_id = rsp->VolatileFileId;
 	}
 	if (info) {
+		u32 rsp_ctx_off = le32_to_cpu(rsp->CreateContextsOffset);
+		u32 rsp_ctx_len = le32_to_cpu(rsp->CreateContextsLength);
+
 		info->size = le64_to_cpu(rsp->EndofFile);
 		info->alloc_size = le64_to_cpu(rsp->AllocationSize);
 		info->creation_time = le64_to_cpu(rsp->CreationTime);
@@ -550,6 +574,42 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, u32 tree_id,
 		info->last_write_time = le64_to_cpu(rsp->LastWriteTime);
 		info->change_time = le64_to_cpu(rsp->ChangeTime);
 		info->attributes = le32_to_cpu(rsp->FileAttributes);
+		info->index_number = 0;
+
+		/* Walk create contexts looking for QFid response */
+		if (rsp_ctx_off && rsp_ctx_len &&
+		    rsp_ctx_off + rsp_ctx_len <= resp_len) {
+			const u8 *p = resp_buf + rsp_ctx_off;
+			const u8 *end = p + rsp_ctx_len;
+
+			while (p + sizeof(struct create_context_hdr) <= end) {
+				const struct create_context *cc =
+					(const struct create_context *)p;
+				u32 next = le32_to_cpu(cc->hdr.Next);
+				u16 n_off = le16_to_cpu(cc->hdr.NameOffset);
+				u16 n_len = le16_to_cpu(cc->hdr.NameLength);
+				u16 d_off = le16_to_cpu(cc->hdr.DataOffset);
+				u32 d_len = le32_to_cpu(cc->hdr.DataLength);
+
+				if (n_len == 4 &&
+				    p + n_off + 4 <= end &&
+				    memcmp(p + n_off, SMB2_CREATE_QUERY_ON_DISK_ID, 4) == 0 &&
+				    d_len >= 8 &&
+				    p + d_off + 8 <= end) {
+					__le64 disk_id;
+
+					memcpy(&disk_id, p + d_off, 8);
+					info->index_number = le64_to_cpu(disk_id);
+					break;
+				}
+
+				if (!next)
+					break;
+				if (next < sizeof(struct create_context_hdr))
+					break;
+				p += next;
+			}
+		}
 	}
 
 out:
