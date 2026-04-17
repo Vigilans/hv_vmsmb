@@ -18,6 +18,20 @@
 #include "fscc.h"
 
 /*
+ * Compound-request sentinel file id: the second (and later) PDU in a chain
+ * carries this value, and the server substitutes the fid produced by the
+ * prior operation in the chain.
+ *
+ * MS-SMB2 §3.2.4.1.4 (Sending Compounded Requests) specifies the value
+ * ({0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF}) but not a symbolic name. The
+ * name `COMPOUND_FID` comes from CIFS (fs/smb/client/smb2pdu.h); kept
+ * without an SMB2_ prefix to match upstream naming for easy grep. Lives in
+ * this .c instead of smb2pdu.h because our smb2pdu.h is a verbatim copy of
+ * fs/smb/common/smb2pdu.h and should stay upstream-clean.
+ */
+#define COMPOUND_FID		0xFFFFFFFFFFFFFFFFULL
+
+/*
  * Fill a common SMB2 header.
  *
  * Simplified version of CIFS smb2_plain_req_init() + fill_small_buf()
