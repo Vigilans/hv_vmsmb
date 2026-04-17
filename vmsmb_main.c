@@ -25,6 +25,14 @@ static const struct hv_vmbus_device_id vmsmb_id_table[] = {
 };
 MODULE_DEVICE_TABLE(vmbus, vmsmb_id_table);
 
+/*
+ * VMBus probe — attach to the VSMB channel, bring up the session.
+ *
+ * Analogous to hvsock hvs_probe() (net/vmw_vsock/hyperv_transport.c) for
+ * the channel-open half, and CIFS cifs_mount() (fs/smb/client/connect.c)
+ * for the SMB2 NEGOTIATE+SESSION_SETUP retry loop. Pre-SMB2 version
+ * handshake is VSMB-specific (see vmsmb_negotiate_version).
+ */
 static int vmsmb_probe(struct hv_device *dev,
 		       const struct hv_vmbus_device_id *id)
 {
@@ -87,6 +95,14 @@ err_free:
 	return ret;
 }
 
+/*
+ * VMBus remove — tear down the session and clear the global pointer.
+ *
+ * Analogous to hvsock hvs_remove() (net/vmw_vsock/hyperv_transport.c).
+ * Cannot reconnect after this runs: vmbus_close puts vmwp.exe's VsmbPipe
+ * in terminal state (see docs/vmbus-pipe-protocol.md), so module reload
+ * requires VM restart.
+ */
 static void vmsmb_remove(struct hv_device *dev)
 {
 	struct vmsmb_session *sess = hv_get_drvdata(dev);

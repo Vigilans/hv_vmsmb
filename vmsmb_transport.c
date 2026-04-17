@@ -41,6 +41,12 @@
  * Workqueue handler: runs the per-request async callback in process
  * context. channel_cb schedules this when a response arrives for a
  * request whose async_cb is set.
+ *
+ * CIFS runs async mid callbacks directly from cifs_demultiplex_thread
+ * (fs/smb/client/connect.c), which is already process context. Our
+ * channel_cb is a softirq callback, so we bounce through a workqueue
+ * before invoking async_cb — async_cb is then free to sleep (copy_to_iter,
+ * netfs_read_subreq_terminated, etc.).
  */
 static void vmsmb_async_work(struct work_struct *work)
 {
@@ -54,6 +60,12 @@ static void vmsmb_async_work(struct work_struct *work)
  * Called from channel_cb (softirq) when a response for @req is complete.
  * Routes to either the sync completion (wakes wait_for_completion_timeout)
  * or the async workqueue (runs async_cb in process context).
+ *
+ * Simplified from CIFS handle_mid() dispatch (fs/smb/client/connect.c):
+ * CIFS invokes a uniform mid->callback(mid) — sync mids register
+ * cifs_wake_up_task, async mids register the business callback. We collapse
+ * that to a boolean (async_cb set / unset) since the sync path here always
+ * wakes via struct completion.
  */
 static inline void vmsmb_complete_req(struct vmsmb_request *req)
 {
@@ -94,6 +106,12 @@ vmsmb_find_request(struct vmsmb_session *sess, u64 message_id)
  * sess->current_recv tracks the request currently being received.
  * When NULL, we're at the start of a new response and need to parse
  * StreamHdr + SMB2 header to extract MessageId for dispatch.
+ *
+ * Analogous to the response demux loop in CIFS cifs_demultiplex_thread()
+ * (fs/smb/client/connect.c): read_from_socket → check_rfc1002_header →
+ * find matching mid → copy body. We collapse it into a single pass over
+ * VMBus packet payload because the framing is fixed and there is no
+ * separate socket read step.
  */
 static void vmsmb_process_data(struct vmsmb_session *sess,
 				const u8 *data, u32 len)
@@ -271,6 +289,16 @@ static void vmsmb_channel_cb(void *ctx)
 	complete(&sess->recv_done);
 }
 
+/*
+ * Open the VMBus channel and prime session state.
+ *
+ * Analogous to hvsock hvs_open_connection() (net/vmw_vsock/hyperv_transport.c):
+ * sets channel->max_pkt_size before vmbus_open so hv_ringbuffer_init allocates
+ * a pkt_buffer that fits the largest expected response, then calls vmbus_open
+ * with our channel callback. The force-reset of ch->state exists because
+ * vmbus_close leaves the channel in a non-OPEN state that blocks reopening —
+ * module reload path only (see docs/vmbus-pipe-protocol.md).
+ */
 int vmsmb_open_channel(struct vmsmb_session *sess)
 {
 	struct vmbus_channel *ch = sess->dev->channel;
@@ -324,8 +352,11 @@ void vmsmb_close_channel(struct vmsmb_session *sess)
 /*
  * Synchronous send + receive for pre-SMB2 paths (version negotiation).
  *
- * Only used when no async requests are pending. Uses the sess->recv_done
- * completion signaled by the channel callback.
+ * VSMB-specific: the pre-SMB2 version exchange has no MessageId to dispatch
+ * on, so we cannot reuse the mid-matching path used for SMB2 traffic. This
+ * one-shot helper exists only until we transition into SMB2 framing; after
+ * that point all traffic goes through vmsmb_submit() / vmsmb_smb2_transact().
+ * No direct upstream analog — CIFS has no pre-SMB2 framing stage.
  */
 static int vmsmb_send_recv_sync(struct vmsmb_session *sess,
 				const void *send_buf, u32 send_len,
@@ -465,6 +496,9 @@ static int vmsmb_send_recv_sync(struct vmsmb_session *sess,
  * sess->pending_requests waiting for a response; channel_cb will either
  * complete() (sync) or schedule the async work (async).
  *
+ * Analogous to CIFS smb_send_rqst() + cifs_setup_async_request()
+ * (fs/smb/client/transport.c): builds on-wire frame, queues mid, sends.
+ *
  * Lifetime: @req must remain valid until the completion fires. For sync
  * callers it's on the stack; async callers allocate it and hand ownership
  * to async_cb.
@@ -587,6 +621,12 @@ int vmsmb_smb2_submit_async(struct vmsmb_session *sess,
  * list, sends via vmbus_sendpacket (serialized by send_mutex), then
  * waits on its own completion.
  *
+ * Analogous to CIFS compound_send_recv() (fs/smb/client/transport.c)
+ * for the single-PDU case: build request, queue mid, send, wait on
+ * per-request completion, extract response. We do not support multi-PDU
+ * rqst arrays at this layer — the SMB2 layer builds compound PDUs into
+ * one flat buffer before calling this.
+ *
  * @smb2_req / @req_len:       SMB2 request PDU (no framing headers)
  * @smb2_resp / @resp_buf_size: caller-allocated buffer for SMB2 response
  * @resp_len:                  actual SMB2 response length on success
@@ -700,8 +740,12 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 /*
  * VSMB version negotiation (pre-SMB2).
  *
- * Uses the synchronous send_recv_sync path since there is no
- * concurrency at this point (probe is single-threaded).
+ * VSMB-specific handshake with no CIFS/SMB2 analog — the protocol exchanges
+ * {version, capabilities} over DirectTCP-style framing before any SMB2
+ * traffic. Wire format and semantics reverse-engineered from vmwp.exe /
+ * mrxsmb.sys; see docs/vmbus-pipe-protocol.md. Uses the synchronous
+ * send_recv_sync path since there is no concurrency at this point (probe
+ * is single-threaded).
  */
 int vmsmb_negotiate_version(struct vmsmb_session *sess)
 {

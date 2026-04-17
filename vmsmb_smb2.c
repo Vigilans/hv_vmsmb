@@ -196,6 +196,10 @@ static int vmsmb_status_to_errno(__le32 status)
 
 /*
  * Check SMB2 response status.
+ *
+ * Thin wrapper over vmsmb_status_to_errno() + pr_debug. Equivalent to the
+ * status-handling branch of CIFS smb2_check_receive() (fs/smb/client/smb2ops.c),
+ * minus signing / compounded response handling which we don't support.
  */
 static int vmsmb_check_status(const struct smb2_hdr *hdr, const char *cmd_name)
 {
@@ -1732,10 +1736,10 @@ free_resp:
 /*
  * Read reparse point data for a path.
  *
- * Port of CIFS smb2_query_reparse_point()
- * (fs/smb/client/smb2ops.c). Opens with FILE_OPEN_REPARSE_POINT
- * so CREATE returns metadata about the reparse point itself
- * instead of following it.
+ * Port of CIFS smb2_query_reparse_point() (fs/smb/client/smb2ops.c). Issues
+ * compound CREATE+IOCTL+CLOSE via vmsmb_smb2_create_ioctl_close(). Opens
+ * with FILE_OPEN_REPARSE_POINT so CREATE returns metadata about the reparse
+ * point itself instead of following it.
  */
 int vmsmb_smb2_get_reparse(struct vmsmb_session *sess, u32 tree_id,
 			    const char *path,
@@ -1956,9 +1960,9 @@ close:
 /*
  * SMB2 SET_INFO (FileBasicInformation) — push timestamps + file attributes.
  *
- * Simplified from CIFS smb2_set_file_info_compound() / set_basic_info path
- * (fs/smb/client/smb2inode.c). CIFS issues a compound CREATE+SET_INFO+CLOSE;
- * we do three separate round-trips.
+ * Ported from CIFS smb2_set_file_info_compound() / set_basic_info path
+ * (fs/smb/client/smb2inode.c). Issues compound CREATE+SET_INFO+CLOSE via
+ * vmsmb_smb2_create_setinfo_close().
  *
  * Per MS-FSCC 2.4.7: timestamp value 0 means "do not change", -1 means
  * "maintain current". FileAttributes = 0 also means "do not change".
@@ -1980,9 +1984,8 @@ int vmsmb_smb2_set_basic_info(struct vmsmb_session *sess, u32 tree_id,
 /*
  * SMB2 SET_INFO (FileEndOfFileInformation) — truncate/extend a file.
  *
- * Simplified from CIFS smb2_set_file_size() (fs/smb/client/smb2ops.c). CIFS
- * may issue this as part of a compound; we do a CREATE+SET_INFO+CLOSE
- * sequence.
+ * Ported from CIFS smb2_set_file_size() (fs/smb/client/smb2ops.c). Issues
+ * compound CREATE+SET_INFO+CLOSE via vmsmb_smb2_create_setinfo_close().
  *
  * Payload is an 8-byte LE __le64 EndOfFile value (MS-FSCC 2.4.13).
  */

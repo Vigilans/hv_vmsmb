@@ -69,6 +69,10 @@ static inline struct vmsmb_sb_info *VMSMB_SB(struct super_block *sb)
 
 /*
  * Fill an inode with SMB2 file attributes.
+ *
+ * Port of CIFS cifs_fattr_to_inode() (fs/smb/client/inode.c) initial-fill
+ * path: set mode/ops by attribute bits, size, times, then attach the netfs
+ * context (cifs_set_netfs_context() → netfs_inode_init() equivalent).
  */
 static void vmsmb_fill_inode(struct inode *inode,
 			     const struct vmsmb_file_info *info)
@@ -225,6 +229,11 @@ static struct inode *vmsmb_iget(struct super_block *sb,
 /*
  * Build the SMB2 path from a dentry.
  * Returns a kmalloc'd string like "" (root), "file.txt", "dir/file.txt".
+ *
+ * Simplified from CIFS build_path_from_dentry() (fs/smb/client/dir.c):
+ * CIFS handles DFS tree prefixes and backslash conversion here; VSMB uses
+ * forward slashes on the wire (the server accepts both) so we only strip
+ * the leading '/' from dentry_path_raw().
  */
 static char *vmsmb_build_path(struct dentry *dentry)
 {
@@ -457,6 +466,15 @@ static const struct dentry_operations vmsmb_dentry_ops = {
 
 /* ---- Inode operations ---- */
 
+/*
+ * Look up a dentry in a directory.
+ *
+ * Port of CIFS cifs_lookup() (fs/smb/client/dir.c): issues a compound
+ * CREATE+CLOSE probe to test existence and fetch metadata; on ENOENT
+ * returns a negative dentry (so VFS caches the miss under actimeo TTL).
+ * Reparse points trigger a follow-up FSCTL_GET_REPARSE_POINT to resolve
+ * and cache the symlink target.
+ */
 static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 				   unsigned int flags)
 {
@@ -536,6 +554,13 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 	return NULL;
 }
 
+/*
+ * Return file attributes for stat()-family syscalls.
+ *
+ * Port of CIFS cifs_getattr() (fs/smb/client/inode.c): if the inode's
+ * metadata TTL expired, refresh from the server via CREATE+CLOSE probe
+ * before calling generic_fillattr(). Otherwise the cached attrs suffice.
+ */
 static int vmsmb_getattr(struct mnt_idmap *idmap,
 			 const struct path *path,
 			 struct kstat *stat, u32 request_mask,
@@ -570,6 +595,13 @@ static int vmsmb_getattr(struct mnt_idmap *idmap,
 	return 0;
 }
 
+/*
+ * Create a regular file.
+ *
+ * Port of CIFS cifs_create() (fs/smb/client/dir.c): CREATE with
+ * FILE_CREATE disposition, then CLOSE — we don't keep the handle open
+ * since generic open() will reopen it through vmsmb_file_open.
+ */
 static int vmsmb_create(struct mnt_idmap *idmap, struct inode *dir,
 			struct dentry *dentry, umode_t mode, bool excl)
 {
@@ -606,6 +638,12 @@ static int vmsmb_create(struct mnt_idmap *idmap, struct inode *dir,
 	return 0;
 }
 
+/*
+ * Create a directory.
+ *
+ * Port of CIFS cifs_mkdir() (fs/smb/client/inode.c): CREATE with
+ * FILE_DIRECTORY_FILE + FILE_CREATE, then CLOSE.
+ */
 static struct dentry *vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		       struct dentry *dentry, umode_t mode)
 {
@@ -643,6 +681,12 @@ static struct dentry *vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	return NULL;
 }
 
+/*
+ * Remove a file.
+ *
+ * Port of CIFS cifs_unlink() (fs/smb/client/inode.c), delegates to
+ * vmsmb_smb2_unlink() which issues CREATE(DELETE_ON_CLOSE)+CLOSE.
+ */
 static int vmsmb_unlink(struct inode *dir, struct dentry *dentry)
 {
 	struct vmsmb_sb_info *sbi = VMSMB_SB(dir->i_sb);
@@ -665,6 +709,12 @@ static int vmsmb_unlink(struct inode *dir, struct dentry *dentry)
 	return ret;
 }
 
+/*
+ * Remove a directory.
+ *
+ * Port of CIFS cifs_rmdir() (fs/smb/client/inode.c): same DELETE_ON_CLOSE
+ * path as unlink; server enforces "directory must be empty".
+ */
 static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 {
 	struct vmsmb_sb_info *sbi = VMSMB_SB(dir->i_sb);
@@ -696,6 +746,13 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 	return ret;
 }
 
+/*
+ * Rename/move a file or directory.
+ *
+ * Port of CIFS cifs_rename2() (fs/smb/client/inode.c): delegates to
+ * vmsmb_smb2_rename() which issues CREATE(DELETE)+SET_INFO(rename)+CLOSE.
+ * RENAME_NOREPLACE flag inverts the ReplaceIfExists field.
+ */
 static int vmsmb_rename(struct mnt_idmap *idmap,
 			struct inode *old_dir, struct dentry *old_dentry,
 			struct inode *new_dir, struct dentry *new_dentry,
@@ -805,6 +862,10 @@ static const char *vmsmb_get_link(struct dentry *dentry, struct inode *inode,
 /*
  * Create a symlink.
  *
+ * Port of CIFS cifs_symlink() (fs/smb/client/cifsfs.c) reparse-point path:
+ * create the file then IOCTL(SET_REPARSE_POINT) to install the symlink
+ * target. See vmsmb_smb2_create_symlink() for the wire format.
+ *
  * Note: VSMB host currently denies FSCTL_SET_REPARSE_POINT with
  * STATUS_ACCESS_DENIED (0xC0000022), so this will fail in practice.
  */
@@ -864,6 +925,8 @@ const struct inode_operations vmsmb_symlink_inode_ops = {
 /*
  * Convert a Linux timespec64 to a Windows FILETIME (100-ns intervals
  * since 1601-01-01). Inverse of vmsmb_time_to_ts().
+ *
+ * Equivalent to CIFS cifs_UnixTimeToNT() (fs/smb/client/netmisc.c).
  */
 static inline u64 vmsmb_ts_to_filetime(struct timespec64 ts)
 {
@@ -971,6 +1034,10 @@ const struct address_space_operations vmsmb_aops = {
 /*
  * Get dentry path from an inode (for handle-less readahead/writeback).
  * Returns a kmalloc'd path or ERR_PTR. Caller must kfree.
+ *
+ * Analogous to CIFS build_path_from_dentry() called from the writeback
+ * path (fs/smb/client/file.c) when the write is not tied to an open
+ * file — wraps d_find_alias + vmsmb_build_path.
  */
 static char *vmsmb_inode_path(struct inode *inode)
 {
@@ -986,6 +1053,13 @@ static char *vmsmb_inode_path(struct inode *inode)
 	return path;
 }
 
+/*
+ * netfs init_request hook — stash the open file context so issue_read /
+ * issue_write can use the existing fid without reopening.
+ *
+ * Port of CIFS cifs_init_request() (fs/smb/client/file.c): CIFS stashes
+ * a cifsFileInfo; we stash vmsmb_file_ctx via rreq->netfs_priv.
+ */
 static int vmsmb_init_request(struct netfs_io_request *rreq, struct file *file)
 {
 	if (file)
@@ -993,6 +1067,17 @@ static int vmsmb_init_request(struct netfs_io_request *rreq, struct file *file)
 	return 0;
 }
 
+/*
+ * netfs issue_read hook — fulfil one subrequest by issuing SMB2 READ.
+ *
+ * Port of CIFS cifs_issue_read() (fs/smb/client/file.c): if no fid is
+ * available (readahead outside an open()), open a transient fid
+ * (CREATE+CLOSE around the read). copy_to_iter() into the subreq's folio
+ * queue, then netfs_read_subreq_terminated() to hand the subreq back.
+ *
+ * Still synchronous — async pipelining (matching CIFS smb2_async_readv)
+ * is a follow-up task (see hv_vmsmb_todos.md).
+ */
 static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 {
 	struct netfs_io_request *rreq = subreq->rreq;
@@ -1081,6 +1166,13 @@ out:
 	netfs_read_subreq_terminated(subreq);
 }
 
+/*
+ * netfs begin_writeback hook — stash the active fid and advertise the
+ * per-subrequest max chunk size.
+ *
+ * Port of CIFS cifs_begin_writeback() (fs/smb/client/file.c): set up
+ * io_streams[0] with avail=true and sreq_max_len = max_write_chunk.
+ */
 static void vmsmb_begin_writeback(struct netfs_io_request *wreq)
 {
 	struct inode *inode = wreq->inode;
@@ -1095,6 +1187,14 @@ static void vmsmb_begin_writeback(struct netfs_io_request *wreq)
 	wreq->io_streams[0].sreq_max_len = VMSMB_MAX_WRITE_CHUNK;
 }
 
+/*
+ * netfs issue_write hook — fulfil one subrequest by issuing SMB2 WRITE.
+ *
+ * Port of CIFS cifs_issue_write() (fs/smb/client/file.c): reuses the
+ * writeback fid stashed by begin_writeback, iterates folio queue entries
+ * into WRITE PDUs (≤ VMSMB_MAX_WRITE_CHUNK each), and calls
+ * netfs_write_subrequest_terminated() on completion.
+ */
 static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 {
 	struct netfs_io_request *wreq = subreq->rreq;
@@ -1190,6 +1290,13 @@ const struct netfs_request_ops vmsmb_netfs_ops = {
 
 /* ---- File operations ---- */
 
+/*
+ * Open a file — allocate a per-file context and send SMB2 CREATE.
+ *
+ * Port of CIFS cifs_open() (fs/smb/client/file.c): map VFS open flags
+ * to DesiredAccess + disposition, CREATE, stash the returned fid in
+ * file->private_data for read/write/close.
+ */
 static int vmsmb_file_open(struct inode *inode, struct file *file)
 {
 	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
@@ -1250,6 +1357,11 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
+/*
+ * Close a file — SMB2 CLOSE + free per-file context.
+ *
+ * Port of CIFS cifs_close() (fs/smb/client/file.c).
+ */
 static int vmsmb_file_release(struct inode *inode, struct file *file)
 {
 	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
@@ -1279,7 +1391,10 @@ static loff_t vmsmb_file_llseek(struct file *file, loff_t offset, int whence)
 
 /*
  * Flush dirty pages to server, then force host-side flush via SMB2 FLUSH.
- * Modelled after cifs_fsync.
+ *
+ * Port of CIFS cifs_fsync() (fs/smb/client/file.c): filemap_write_and_wait
+ * to drain the page cache, then SMB2 FLUSH PDU to force the server to
+ * persist.
  */
 static int vmsmb_fsync(struct file *file, loff_t start, loff_t end,
 		       int datasync)
@@ -1335,6 +1450,14 @@ static int vmsmb_utf16_name_to_utf8(char *dst, size_t dst_size,
 	return ret;
 }
 
+/*
+ * Enumerate a directory — SMB2 QUERY_DIRECTORY with FileDirectoryInformation.
+ *
+ * Port of CIFS cifs_readdir() (fs/smb/client/readdir.c): open the dir with
+ * FILE_LIST_DIRECTORY, loop QUERY_DIRECTORY until STATUS_NO_MORE_FILES,
+ * feed each FILE_DIRECTORY_INFO into dir_emit(). Simplified: no
+ * resumption via FileIndex, always restart scans.
+ */
 static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
@@ -1450,6 +1573,13 @@ const struct file_operations vmsmb_dir_ops = {
 
 /* ---- Superblock operations ---- */
 
+/*
+ * Allocate an inode via the vmsmb_inode_info slab cache.
+ *
+ * Port of CIFS cifs_alloc_inode() (fs/smb/client/cifsfs.c): slab-allocate
+ * the wrapping struct, zero fields that are not re-initialized by
+ * vmsmb_fill_inode.
+ */
 static struct inode *vmsmb_alloc_inode(struct super_block *sb)
 {
 	struct vmsmb_inode_info *vi;
@@ -1469,6 +1599,12 @@ static void vmsmb_free_inode(struct inode *inode)
 	kmem_cache_free(vmsmb_inode_cachep, VMSMB_I(inode));
 }
 
+/*
+ * statfs — fetch filesystem capacity via SMB2 QUERY_INFO
+ * FS_FULL_SIZE_INFORMATION.
+ *
+ * Port of CIFS cifs_statfs() (fs/smb/client/cifsfs.c).
+ */
 static int vmsmb_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	struct vmsmb_sb_info *sbi = VMSMB_SB(dentry->d_sb);
@@ -1504,6 +1640,14 @@ static int vmsmb_statfs(struct dentry *dentry, struct kstatfs *buf)
 	return 0;
 }
 
+/*
+ * Evict an inode — drop cached symlink target, wait for outstanding netfs
+ * I/O, truncate pages, clear the inode.
+ *
+ * Port of CIFS cifs_evict_inode() (fs/smb/client/cifsfs.c): the
+ * netfs_wait_for_outstanding_io + truncate_inode_pages_final sequence is
+ * standard for netfs-backed filesystems.
+ */
 static void vmsmb_evict_inode(struct inode *inode)
 {
 	kfree(VMSMB_I(inode)->symlink_target);
@@ -1525,6 +1669,13 @@ static const struct super_operations vmsmb_super_ops = {
 	.statfs		= vmsmb_statfs,
 };
 
+/*
+ * Populate the super_block at mount: TREE_CONNECT to the share, set
+ * s_op / s_root / default BDI, install the root inode.
+ *
+ * Port of CIFS cifs_read_super() (fs/smb/client/cifsfs.c): super_setup_bdi
+ * is required for netfs writeback (see vmsmb_begin_writeback).
+ */
 static int vmsmb_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct vmsmb_sb_info *sbi = sb->s_fs_info;
@@ -1614,6 +1765,13 @@ struct vmsmb_fs_context {
 	unsigned int actimeo_secs;	/* 0 = use default */
 };
 
+/*
+ * Parse a single mount option.
+ *
+ * Port of CIFS smb3_fs_context_parse_param() (fs/smb/client/fs_context.c):
+ * fs_parse() dispatch on the Opt_* enum. Supports: uid, gid, file_mode,
+ * dir_mode, noperm, symlinkroot, actimeo.
+ */
 static int vmsmb_parse_param(struct fs_context *fc,
 			     struct fs_parameter *param)
 {
@@ -1664,6 +1822,13 @@ static int vmsmb_parse_param(struct fs_context *fc,
 	return 0;
 }
 
+/*
+ * fs_context get_tree: validate state, materialize sbi from the parsed
+ * context, then hand off to get_tree_nodev + vmsmb_fill_super.
+ *
+ * Port of CIFS smb3_get_tree() (fs/smb/client/fs_context.c), minus the
+ * DFS referral / per-share auth paths we don't support.
+ */
 static int vmsmb_get_tree(struct fs_context *fc)
 {
 	struct vmsmb_fs_context *ctx = fc->fs_private;
@@ -1764,6 +1929,14 @@ static int vmsmb_init_fs_context(struct fs_context *fc)
 	return 0;
 }
 
+/*
+ * Release superblock resources on unmount — free sbi's strings + the
+ * sbi struct. The session / tree_id are shared across mounts of the
+ * same share so they aren't torn down here.
+ *
+ * Port of CIFS cifs_kill_sb() (fs/smb/client/cifsfs.c) simplified: no
+ * per-sb cifs_sb_tlink_tree / tcon teardown.
+ */
 static void vmsmb_kill_sb(struct super_block *sb)
 {
 	struct vmsmb_sb_info *sbi = sb->s_fs_info;
