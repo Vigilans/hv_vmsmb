@@ -282,6 +282,17 @@ int vmsmb_smb2_write(struct vmsmb_session *sess, u32 tree_id,
 		     struct vmsmb_fid *fid,
 		     u64 offset, const void *data, u32 length,
 		     u32 *bytes_written);
+int vmsmb_smb2_read_async(struct vmsmb_session *sess, u32 tree_id,
+			  struct vmsmb_fid *fid,
+			  u64 offset, u32 length,
+			  void (*cb)(void *priv, int status,
+				     const void *data, u32 len),
+			  void *priv);
+int vmsmb_smb2_write_async(struct vmsmb_session *sess, u32 tree_id,
+			   struct vmsmb_fid *fid,
+			   u64 offset, const void *data, u32 length,
+			   void (*cb)(void *priv, int status, u32 bytes_written),
+			   void *priv);
 int vmsmb_smb2_query_dir(struct vmsmb_session *sess, u32 tree_id,
 			 struct vmsmb_fid *fid,
 			 const char *pattern, void *buf, u32 buf_size,

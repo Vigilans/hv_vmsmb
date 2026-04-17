@@ -1339,6 +1339,233 @@ out:
 }
 
 /*
+ * Async SMB2 READ.
+ *
+ * Port of CIFS smb2_async_readv() (fs/smb/client/smb2pdu.c): build READ PDU,
+ * submit via the async transport (vmsmb_smb2_submit_async), and on
+ * response invoke the caller's callback in workqueue context.
+ *
+ * The @data pointer handed to @cb aliases the response buffer and is only
+ * valid for the duration of the call — caller must copy or consume
+ * in-place (e.g. copy_to_iter into a netfs subrequest).
+ *
+ * On synchronous submit failure (OOM / EAGAIN exhausted) returns -errno
+ * without invoking @cb. On response-time failures @cb is invoked with
+ * non-zero status and @data/@len set to NULL/0.
+ */
+struct vmsmb_read_async_ctx {
+	void (*cb)(void *priv, int status, const void *data, u32 len);
+	void *priv;
+	u32 max_length;
+};
+
+static void vmsmb_read_async_complete(struct vmsmb_request *req)
+{
+	struct vmsmb_read_async_ctx *rctx = req->async_priv;
+	const u32 stream_hdr_size = sizeof(struct smb2_stream_hdr);
+	const struct smb2_hdr *hdr;
+	const struct smb2_read_rsp *rsp;
+	const u8 *smb2_buf;
+	u32 smb2_len;
+	u32 data_offset, data_len;
+	int ret;
+
+	if (req->status) {
+		rctx->cb(rctx->priv, req->status, NULL, 0);
+		goto done;
+	}
+
+	if (req->response_len < stream_hdr_size) {
+		rctx->cb(rctx->priv, -EPROTO, NULL, 0);
+		goto done;
+	}
+	smb2_buf = (const u8 *)req->response_buf + stream_hdr_size;
+	smb2_len = req->response_len - stream_hdr_size;
+
+	hdr = vmsmb_check_resp(smb2_buf, smb2_len);
+	if (!hdr) {
+		rctx->cb(rctx->priv, -EPROTO, NULL, 0);
+		goto done;
+	}
+
+	ret = vmsmb_check_status(hdr, "READ(async)");
+	if (ret) {
+		rctx->cb(rctx->priv, ret, NULL, 0);
+		goto done;
+	}
+
+	rsp = (const struct smb2_read_rsp *)smb2_buf;
+	data_offset = le16_to_cpu(rsp->DataOffset);
+	data_len = le32_to_cpu(rsp->DataLength);
+
+	if ((u64)data_offset + data_len > smb2_len) {
+		rctx->cb(rctx->priv, -EPROTO, NULL, 0);
+		goto done;
+	}
+	if (data_len > rctx->max_length)
+		data_len = rctx->max_length;
+
+	rctx->cb(rctx->priv, 0, smb2_buf + data_offset, data_len);
+
+done:
+	kvfree(req->response_buf);
+	kfree(req);
+	kfree(rctx);
+}
+
+int vmsmb_smb2_read_async(struct vmsmb_session *sess, u32 tree_id,
+			  struct vmsmb_fid *fid,
+			  u64 offset, u32 length,
+			  void (*cb)(void *priv, int status,
+				     const void *data, u32 len),
+			  void *priv)
+{
+	struct vmsmb_read_async_ctx *rctx;
+	struct smb2_read_req pdu;
+	u32 resp_buf_size;
+	int ret;
+
+	if (length > sess->max_read_size)
+		length = sess->max_read_size;
+
+	rctx = kmalloc(sizeof(*rctx), GFP_KERNEL);
+	if (!rctx)
+		return -ENOMEM;
+	rctx->cb = cb;
+	rctx->priv = priv;
+	rctx->max_length = length;
+
+	memset(&pdu, 0, sizeof(pdu));
+	vmsmb_fill_hdr(&pdu.hdr, SMB2_READ_HE, sess, tree_id);
+	pdu.StructureSize = cpu_to_le16(49);
+	pdu.Length = cpu_to_le32(length);
+	pdu.Offset = cpu_to_le64(offset);
+	pdu.PersistentFileId = fid->persistent;
+	pdu.VolatileFileId = fid->volatile_id;
+	pdu.MinimumCount = cpu_to_le32(0);
+	pdu.RemainingBytes = cpu_to_le32(0);
+
+	resp_buf_size = sizeof(struct smb2_read_rsp) + length + 4096;
+	ret = vmsmb_smb2_submit_async(sess, &pdu, sizeof(pdu), resp_buf_size,
+				      vmsmb_read_async_complete, rctx, NULL);
+	if (ret) {
+		kfree(rctx);
+		return ret;
+	}
+	return 0;
+}
+
+/*
+ * Async SMB2 WRITE.
+ *
+ * Port of CIFS smb2_async_writev() (fs/smb/client/smb2pdu.c): build WRITE
+ * PDU with data inlined after the fixed header, submit async, and on
+ * response invoke the caller's callback with bytes_written.
+ *
+ * The caller's @data buffer is copied into the send PDU before submit, so
+ * the caller may free/reuse it as soon as this function returns.
+ */
+struct vmsmb_write_async_ctx {
+	void (*cb)(void *priv, int status, u32 bytes_written);
+	void *priv;
+};
+
+static void vmsmb_write_async_complete(struct vmsmb_request *req)
+{
+	struct vmsmb_write_async_ctx *wctx = req->async_priv;
+	const u32 stream_hdr_size = sizeof(struct smb2_stream_hdr);
+	const struct smb2_hdr *hdr;
+	const struct smb2_write_rsp *rsp;
+	const u8 *smb2_buf;
+	u32 smb2_len;
+	int ret;
+
+	if (req->status) {
+		wctx->cb(wctx->priv, req->status, 0);
+		goto done;
+	}
+
+	if (req->response_len < stream_hdr_size) {
+		wctx->cb(wctx->priv, -EPROTO, 0);
+		goto done;
+	}
+	smb2_buf = (const u8 *)req->response_buf + stream_hdr_size;
+	smb2_len = req->response_len - stream_hdr_size;
+
+	hdr = vmsmb_check_resp(smb2_buf, smb2_len);
+	if (!hdr) {
+		wctx->cb(wctx->priv, -EPROTO, 0);
+		goto done;
+	}
+
+	ret = vmsmb_check_status(hdr, "WRITE(async)");
+	if (ret) {
+		wctx->cb(wctx->priv, ret, 0);
+		goto done;
+	}
+
+	rsp = (const struct smb2_write_rsp *)smb2_buf;
+	wctx->cb(wctx->priv, 0, le32_to_cpu(rsp->DataLength));
+
+done:
+	kvfree(req->response_buf);
+	kfree(req);
+	kfree(wctx);
+}
+
+int vmsmb_smb2_write_async(struct vmsmb_session *sess, u32 tree_id,
+			   struct vmsmb_fid *fid,
+			   u64 offset, const void *data, u32 length,
+			   void (*cb)(void *priv, int status, u32 bytes_written),
+			   void *priv)
+{
+	struct vmsmb_write_async_ctx *wctx;
+	struct smb2_write_req *req;
+	u8 *pdu_buf;
+	u32 pdu_len, data_offset;
+	int ret;
+
+	if (length > sess->max_write_size)
+		length = sess->max_write_size;
+
+	wctx = kmalloc(sizeof(*wctx), GFP_KERNEL);
+	if (!wctx)
+		return -ENOMEM;
+	wctx->cb = cb;
+	wctx->priv = priv;
+
+	data_offset = sizeof(struct smb2_write_req);
+	pdu_len = data_offset + length;
+	pdu_buf = kvmalloc(pdu_len, GFP_KERNEL);
+	if (!pdu_buf) {
+		kfree(wctx);
+		return -ENOMEM;
+	}
+
+	memset(pdu_buf, 0, data_offset);
+	req = (struct smb2_write_req *)pdu_buf;
+	vmsmb_fill_hdr(&req->hdr, SMB2_WRITE_HE, sess, tree_id);
+	req->StructureSize = cpu_to_le16(49);
+	req->DataOffset = cpu_to_le16(data_offset);
+	req->Length = cpu_to_le32(length);
+	req->Offset = cpu_to_le64(offset);
+	req->PersistentFileId = fid->persistent;
+	req->VolatileFileId = fid->volatile_id;
+	req->RemainingBytes = cpu_to_le32(0);
+	req->Flags = cpu_to_le32(0);
+	memcpy(pdu_buf + data_offset, data, length);
+
+	ret = vmsmb_smb2_submit_async(sess, pdu_buf, pdu_len, VMSMB_MAX_RESPONSE,
+				      vmsmb_write_async_complete, wctx, NULL);
+	kvfree(pdu_buf);
+	if (ret) {
+		kfree(wctx);
+		return ret;
+	}
+	return 0;
+}
+
+/*
  * SMB2 QUERY_DIRECTORY — enumerate directory entries.
  * Returns the raw output buffer; caller parses FILE_DIRECTORY_INFO entries.
  *
