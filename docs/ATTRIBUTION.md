@@ -25,14 +25,14 @@ projects use GPL-2.0-compatible licenses.
 | `foreach_vmbus_pkt` recv loop | **Ported** from hvsock `hyperv_transport.c` | `hv_pkt_iter` API, `vmpipe_proto_header` parsing |
 | `max_pkt_size` setup | **Ported** from storvsc/netvsc | Standard VMBus driver pattern |
 | `vmbus_open` / `vmbus_close` | **Standard** VMBus API | |
-| `vmsmb_channel_cb` (parse + dispatch) | **Original** | Design inspired by libsmb2 pdu/callback model; implementation is VMBus tasklet-based, no code ported |
-| `vmsmb_process_data` (stream reassembly) | **Original** | DirectTCP frame splitting + SMB2 MessageId matching + per-request dispatch |
-| `vmsmb_request` struct | **Original** | Analogous to libsmb2 `smb2_pdu` / CIFS `mid_q_entry`; fields designed for VMBus transport |
-| `vmsmb_smb2_transact` (async) | **Original** | Per-request send + `wait_for_completion`; `send_mutex` only protects `vmbus_sendpacket`; `spin_lock_bh` for pending_lock (shared with tasklet) |
-| Adaptive spinning (`VMSMB_SPIN_USEC`) | **Original** | `completion_done()` busy-poll before `wait_for_completion`; concept from NVMe `nvme_poll_cq()`, no code ported |
-| `vmsmb_send_recv_sync` | **Original** | Synchronous path retained for version negotiation only |
-| `vmsmb_negotiate_version` | **Original** | VSMB version protocol is entirely reverse-engineered |
-| EAGAIN retry + post-negotiate drain | **Original** | Discovered empirically |
+| `vmsmb_channel_cb` (parse + dispatch) | **Modeled on** libsmb2 pdu/callback model | Implementation is VMBus tasklet-based, no code ported |
+| `vmsmb_process_data` (stream reassembly) | **Modeled on** CIFS `cifs_demultiplex_thread` | DirectTCP frame splitting + SMB2 MessageId matching + per-request dispatch; reimplemented for VMBus pipe framing |
+| `vmsmb_request` struct | **Modeled on** libsmb2 `smb2_pdu` / CIFS `mid_q_entry` | Fields designed for VMBus transport |
+| `vmsmb_smb2_transact` | **Modeled on** CIFS `compound_send_recv` | Single-PDU case: build request, queue mid, send, wait, extract response; reimplemented for VMBus |
+| Adaptive spinning (`VMSMB_SPIN_USEC`) | **Modeled on** NVMe `nvme_poll_cq()` | `completion_done()` busy-poll before `wait_for_completion`; no code ported |
+| `vmsmb_send_recv_sync` | **VSMB-specific** | Synchronous path retained for version negotiation only |
+| `vmsmb_negotiate_version` | **VSMB-specific** | VSMB version protocol is entirely reverse-engineered |
+| EAGAIN retry + post-negotiate drain | **VSMB-specific** | Discovered empirically |
 
 ### vmsmb_smb2.c
 
@@ -44,7 +44,7 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_check_resp` | **Simplified** from CIFS `smb2_check_message()` | Skips StructureSize, command match, signing validation |
 | `vmsmb_status_to_errno` | **Ported** from CIFS `smb2maperror.c` | ~40 NTSTATUS-to-errno entries |
 | NEGOTIATE / SESSION_SETUP | **Simplified** from CIFS | Single dialect, no auth (VSMB-specific) |
-| TREE_CONNECT | **Original** | UNC path `\\vsmb\<ShareName>` discovered via reverse engineering |
+| TREE_CONNECT | **VSMB-specific** | UNC path `\\vsmb\<ShareName>` discovered via reverse engineering |
 | `vmsmb_path_to_utf16` | **Ported** from kernel `utf8s_to_utf16s()` | Corresponds to CIFS `cifs_strtoUTF16()`, without NLS/SFU/SFM |
 | CREATE | **Simplified** from CIFS `SMB2_open()` | No create contexts, oplock, lease, compound |
 | CLOSE | **Ported** from CIFS `SMB2_close_flags()` | Skips optional `POSTQUERY_ATTRIB` flag |
@@ -76,13 +76,14 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_fsync` | **Ported** from CIFS `cifs_fsync` pattern | `file_write_and_wait_range` + SMB2 FLUSH via `vmsmb_smb2_flush()` |
 | `super_setup_bdi` | **Ported** from CIFS | Required for netfs writeback |
 | `fs_context` / mount options | **Standard** VFS `fs_context` API | `fs_parameter_spec` + `parse_param` |
-| `vmsmb_fill_inode` | **Original** | SMB2 attrs to inode; CIFS `cifs_fattr_to_inode` is much more complex |
-| `vmsmb_build_path` | **Original** | CIFS has `build_path_from_dentry`, similar but simpler |
-| `vmsmb_lookup` | **Original** | Uses CREATE to probe; CIFS uses compound ops |
-| `vmsmb_create` / `vmsmb_mkdir` | **Original** | |
-| `vmsmb_unlink` | **Ported** from CIFS `smb2_unlink()` | Uses `vmsmb_smb2_unlink()`; same `DELETE_ON_CLOSE \| OPEN_REPARSE_POINT` flags |
-| `vmsmb_rmdir` | **Original** | Uses `DELETE_ON_CLOSE`; CIFS uses `SET_INFO FileDispositionInfo` |
-| `vmsmb_rename` | **Original** | Calls `vmsmb_smb2_rename()`, supports `RENAME_NOREPLACE` |
+| `vmsmb_fill_inode` | **Ported** from CIFS `cifs_fattr_to_inode` | SMB2 attrs to inode; simplified (no SFU/SFM, no reparse tags beyond symlink) |
+| `vmsmb_refresh_inode` | **Ported** from CIFS `cifs_fattr_to_inode` update-path | Truncates pagecache on shrink, invalidates on mtime change |
+| `vmsmb_build_path` | **Simplified** from CIFS `build_path_from_dentry` | Same dentry-walk logic, simpler (no UNC prefix) |
+| `vmsmb_lookup` | **Ported** from CIFS `cifs_lookup` | Compound CREATE+CLOSE probe; reparse handling at lookup time |
+| `vmsmb_create` / `vmsmb_mkdir` | **Ported** from CIFS `cifs_create` / `cifs_mkdir` | |
+| `vmsmb_unlink` | **Ported** from CIFS `cifs_unlink` | Uses `vmsmb_smb2_unlink()`; same `DELETE_ON_CLOSE \| OPEN_REPARSE_POINT` flags |
+| `vmsmb_rmdir` | **Ported** from CIFS `cifs_rmdir` | Uses `DELETE_ON_CLOSE`; CIFS uses `SET_INFO FileDispositionInfo` |
+| `vmsmb_rename` | **Ported** from CIFS `cifs_rename2` | Calls `vmsmb_smb2_rename()`, supports `RENAME_NOREPLACE` |
 | `vmsmb_link` | **Ported** from CIFS `cifs_hardlink()` | `d_drop()` + `inc_nlink()` under `i_lock` |
 | `vmsmb_symlink` | **Simplified** from CIFS `cifs_symlink()` | Calls `vmsmb_smb2_create_symlink()`; host denies in practice |
 | `vmsmb_get_link` | **Ported** from CIFS `cifs_get_link()` | Returns cached symlink target via `set_delayed_call` |
@@ -90,21 +91,14 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_parse_reparse` | **Ported** from CIFS `smb2_parse_native_symlink()` | Same NT prefix stripping (`\??\`, `\DosDevices\`, `\GLOBAL??\`), `GLOBALROOT` chaining, `Global\` prefix, drive-letter translation under `symlinkroot`; skips NFS/WSL/AF_UNIX tags |
 | `vmsmb_lookup` (reparse) | **Ported** from CIFS pattern | `OPEN_REPARSE_POINT` + cache symlink target at lookup time |
 | `vmsmb_readdir` (reparse) | **Ported** from CIFS pattern | `FILE_ATTRIBUTE_REPARSE_POINT` → `DT_LNK` |
-| `vmsmb_file_open` / `release` | **Original** | Open flags to SMB2 disposition mapping |
-| `vmsmb_readdir` | **Original** | Parses `FILE_DIRECTORY_INFO` chain |
+| `vmsmb_file_open` / `release` | **Ported** from CIFS `cifs_open` / `cifs_close` | Open flags to SMB2 disposition mapping |
+| `vmsmb_readdir` | **Ported** from CIFS `cifs_readdir` | Parses `FILE_DIRECTORY_INFO` chain |
 | `vmsmb_utf16_name_to_utf8` | **Ported** from kernel `utf16s_to_utf8s()` | Corresponds to CIFS `cifs_from_utf16()`, without NLS/SFU/SFM |
 | `vmsmb_issue_read` / `issue_write` | **Ported** from CIFS `smb2_async_readv` / `smb2_async_writev` | Async submit + completion callback into netfs |
 | `vmsmb_prepare_write` | **Ported** from CIFS `cifs_prepare_write` | Sets `sreq_max_len` for unbuffered write path |
-| `vmsmb_statfs` | **Original** | Calls `vmsmb_smb2_queryfs()` and converts FS_FULL_SIZE_INFORMATION to `kstatfs` |
-| `vmsmb_getattr` | **Original** | `generic_fillattr` only, no server revalidation |
+| `vmsmb_statfs` | **Ported** from CIFS `cifs_statfs` | Calls `vmsmb_smb2_queryfs()` and converts FS_FULL_SIZE_INFORMATION to `kstatfs` |
+| `vmsmb_getattr` | **Ported** from CIFS `cifs_getattr` | Re-issues CREATE+CLOSE when stale (actimeo expired); `generic_fillattr` |
 | `vmsmb_setattr` | **Ported** from CIFS `cifs_setattr()` | Pushes atime/mtime/ctime via `vmsmb_smb2_set_basic_info()` and size via `vmsmb_smb2_set_eof()` + `truncate_setsize()`; uid/gid/mode stay local |
-## Summary
-
-| Category | Approximate % | Description |
-|----------|---------------|-------------|
-| Ported from upstream | ~20% | Inode lifecycle (CIFS), recv loop (hvsock), netfs aops/fops, struct headers, async read/write (CIFS) |
-| Spec-conformant original | ~60% | SMB2 command construction, VFS ops, async transport (design inspired by libsmb2), mount logic |
-| Reverse-engineered original | ~20% | VSMB version protocol, UNC path format, host packet size limit, post-negotiate drain, DirectMap protocol |
 
 ## Protocol Discovery
 
