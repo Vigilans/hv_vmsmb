@@ -1,0 +1,9 @@
+post_install() {
+    echo "==> hv_vmsmb has been installed via DKMS."
+    echo "    The module auto-loads via VMBus modalias when a VSMB channel is present."
+    echo "    To load manually: sudo modprobe hv_vmsmb"
+}
+
+post_upgrade() {
+    post_install
+}

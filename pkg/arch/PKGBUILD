@@ -1,0 +1,43 @@
+# Maintainer: Vigilans <vigilans@foxmail.com>
+_pkgbase=hv-vmsmb
+pkgname=${_pkgbase}-dkms-git
+pkgver=0.1.0.r0.ga16a347
+pkgrel=1
+pkgdesc="Hyper-V VSMB (Virtual SMB) filesystem client kernel module"
+arch=('x86_64')
+url="https://github.com/Vigilans/hv_vmsmb"
+license=('GPL-2.0-only')
+depends=('dkms')
+makedepends=('git')
+provides=("${_pkgbase}")
+conflicts=("${_pkgbase}")
+source=("${_pkgbase}::git+${url}.git")
+sha256sums=('SKIP')
+install="${_pkgbase}.install"
+
+pkgver() {
+    cd "${_pkgbase}"
+    local _tag
+    if _tag=$(git describe --long --tags 2>/dev/null); then
+        echo "${_tag}" | sed 's/^v//;s/-/.r/;s/-/./g'
+    else
+        printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+    fi
+}
+
+package() {
+    cd "${_pkgbase}"
+
+    local _dkmsdir="${pkgdir}/usr/src/${_pkgbase}-${pkgver}"
+    install -dm755 "${_dkmsdir}"
+
+    # Module sources
+    install -Dm644 Makefile "${_dkmsdir}/Makefile"
+    install -Dm644 dkms.conf "${_dkmsdir}/dkms.conf"
+    for f in *.c *.h; do
+        install -Dm644 "${f}" "${_dkmsdir}/${f}"
+    done
+
+    # Patch dkms.conf version
+    sed -i "s/PACKAGE_VERSION=\".*\"/PACKAGE_VERSION=\"${pkgver}\"/" "${_dkmsdir}/dkms.conf"
+}
