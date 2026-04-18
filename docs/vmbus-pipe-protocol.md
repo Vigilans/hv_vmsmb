@@ -173,3 +173,46 @@ This means module reload (`rmmod` + `insmod`) requires a VM restart. During deve
 - openvmm `vm/devices/vmbus/vmbfs/src/protocol.rs` — VmbFs pipe framing (no VMBusPipeIO)
 - Linux `net/vmw_vsock/hyperv_transport.c` — hv_sock PipeHeader usage
 - MS-SMB2 §2.1 — Direct TCP transport
+
+## Guest-to-Host Packet Size Limit
+
+The host-side SMB2 engine (`vmusrv.dll`) validates incoming packets
+against a hardcoded `Smb2MaxPacketSize = 0x11000` (69632 bytes). The
+compared "received size" is the SMB2 PDU length measured from the SMB2
+header (excludes PipeHeader and DirectTCP framing). Packets exceeding
+this cause the host to silently not respond.
+
+This is **not a VMBus protocol limit** — the VMBus transport layer
+(`vmbkmclr.sys`) supports packets up to ~512KB.
+
+Empirically, the maximum safe write data is `65536 - 256 = 65280`
+bytes per SMB2 WRITE PDU. The theoretical limit from the RE analysis
+(`0x11000 - 0x70 = 69520`) has not been achieved in practice — the
+precise framing layers included in the check need dynamic validation.
+
+## VMBus Packet Types
+
+VMBus supports multiple packet types for different data transfer modes:
+
+| Type | Name | Description |
+|------|------|-------------|
+| 6 | `VM_PKT_DATA_INBAND` | All data in ring buffer (our current mode) |
+| 7 | `VM_PKT_DATA_USING_XFER_PAGES` | Ring carries descriptor; data in transfer pages |
+| 8 | `VM_PKT_DATA_USING_GPADL` | Ring carries descriptor; data via GPADL |
+| 9 | `VM_PKT_DATA_USING_GPA_DIRECT` | Ring carries descriptor; data at GPA ranges |
+
+Windows' `mrxsmb.sys` uses type 9 (GPA-direct) for large SMB
+sends/receives via `VmbPacketSendWithExternalMdl` /
+`VmbPacketSendWithExternalPfns`. The ring buffer carries only a compact
+descriptor (page range list + small inline fragment), while the bulk data
+resides in locked guest pages that the host reads/writes directly.
+
+This is why Windows can use 20KB (5-page) ring buffers while handling
+68KB+ packets — the ring is a descriptor/notification channel, not a
+data channel.
+
+Our Linux driver currently uses type 6 (`VM_PKT_DATA_INBAND` via
+`vmbus_sendpacket()`), which puts the entire payload in the ring and
+is therefore ring-size-bound. Switching to `vmbus_sendpacket_mpb_desc()`
+(Linux equivalent of GPA-direct) would decouple packet size from ring
+size.

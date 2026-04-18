@@ -94,6 +94,152 @@ VSMB uses a minimal subset of SMB2:
 
 UNC path format for TREE_CONNECT: `\\vsmb\ShareName`
 
+## DirectMap (Zero-Copy File Mapping)
+
+DirectMap is VSMB's mechanism for mapping host file pages directly into
+guest physical memory, bypassing the VMBus ring buffer entirely.
+
+### Capability Negotiation
+
+During the VSMB version exchange, the guest advertises `capabilities=1`
+(bit 0 = DirectMap support). The host stores this as a per-connection
+capability flag.
+
+### Mapping Protocol
+
+DirectMap uses a private FSCTL `0x1403cc` (not the public
+`FSCTL_QUERY_DIRECT_ACCESS_EXTENTS`):
+
+**Request** (8 bytes):
+```c
+struct {
+    uint32_t PageProtection;       // PAGE_READONLY(0x2), PAGE_EXECUTE(0x10),
+                                   // or PAGE_EXECUTE_READ(0x20)
+    uint32_t AllocationAttributes; // SEC_IMAGE(0x01000000) or SEC_COMMIT(0x08000000)
+};
+```
+
+**Response** (0x28 bytes):
+```c
+struct {
+    uint64_t OriginalImageBase;
+    uint32_t ExtentCount;       // always 1
+    uint32_t Reserved;
+    uint64_t TotalPageCount;
+    uint64_t PageIndex;
+    uint64_t PageCount;
+};
+```
+
+### Host-Side Mechanism
+
+`vmusrv.dll` handles `0x1403cc` in `CFile::QueryDirectAccessExtents`:
+1. `NtCreateSection` creates a section-backed mapping from the file
+2. Section size is rounded up to 4KB pages
+3. Quota is charged against the DirectMap budget
+4. `PageIndex` + `PageCount` are returned to the guest
+
+Budget is controlled by `vmwp.exe` via the HCS configuration key
+`/configuration/settings/topology/direct_file_mapping_mb` (even MB,
+max 65536 MB, default from `DirectFileMappingInMB` in the VM config).
+
+### Lifecycle
+
+- **Create**: On section creation (e.g., loading a DLL from VSMB share)
+- **Use**: Guest accesses file data directly via mapped pages
+- **Teardown refused**: File close / tree close / share removal are
+  blocked while DirectMap is active
+- **Destroy**: Explicit teardown via `CDirectMapping::Destroy`
+- **Save/Restore**: Validates `PageCount` and `OriginalImageBase` unchanged
+
+### Coherence
+
+There is **no explicit invalidation mechanism**. Coherence is provided by
+NT section/cache-manager semantics — section pages and file cache pages
+are the same physical pages. Host file modifications are automatically
+visible through the mapping.
+
+### Windows Guest Implementation
+
+`mrxsmb.sys` uses a per-dialect callback table (installed by
+`MRxSmbSetServerEntryDialect`) for the section-synchronization path.
+Per-file DirectMap state is stored at `fcb + 0x88` (extension) with
+nested state at `extension + 0x60` (node type `0xe400`). The downstream
+consumer (`FUN_1c00533dc`) chooses between `MmMapLockedPagesSpecifyCache`
+(map path) and `RtlCopyMdlToBuffer` (copy path).
+
+Windows guests use only 20KB (5-page) ring buffers per direction —
+DirectMap handles data transfer, and the ring carries only SMB2 control
+PDUs.
+
+### Linux Guest Status
+
+Not yet implemented. Our driver advertises `VSMB_CAP_DIRECTMAP` in the
+version exchange but does not send FSCTL `0x1403cc`.
+
+## VMBus Transport Details
+
+### Ring Buffer Sizing
+
+| Implementation | Send Ring | Recv Ring |
+|---------------|-----------|-----------|
+| Windows guest (mrxsmb.sys) | 20KB (5 pages) | 20KB (5 pages) |
+| Linux guest (hv_vmsmb) | 1MB | 1MB |
+
+Windows' small rings work because data is transferred via GPA-direct
+packet types (type 9), not in-band. Our Linux driver uses
+`VM_PKT_DATA_INBAND` (type 6), requiring larger rings.
+
+### Packet Types
+
+Windows' VMBus client library (`vmbkmclr.sys`) supports external-data
+packet types where the ring carries only a descriptor:
+
+| Type | Usage | Ring Content |
+|------|-------|-------------|
+| `VM_PKT_DATA_INBAND` (6) | Our current mode | Full payload |
+| `VM_PKT_DATA_USING_GPA_DIRECT` (9) | Windows mode | Descriptor + small inline fragment |
+
+See [VMBus Pipe Protocol](vmbus-pipe-protocol.md) for details.
+
+## Known Host-Side Limitations
+
+### Compound CREATE+SET_INFO+CLOSE crashes vmwp.exe
+
+Compound SMB2 requests with SET_INFO as the middle operation cause a
+`FAIL_FAST` (`c0000409 / subcode 7`) in `vmusrv.dll`, crashing the VM
+worker process.
+
+**Root cause** (confirmed via RE of `vmusrv.dll` build 26100):
+`SrvContinueSetInfo` (`0x18002a850`) assumes the response buffer
+descriptor is already allocated and ≥ 0x42 bytes when the provider
+callback succeeds. In compound mode, the compound dispatcher does not
+pre-allocate this buffer for the SET_INFO leg, so the continuation
+falls through to `_o_terminate()`.
+
+The IOCTL compound path (`Smb2PostExecuteIoctl`) does not have this
+bug — it checks the response buffer size and allocates a larger one if
+needed before formatting the reply.
+
+**Affected operations**: Any compound containing SET_INFO:
+- `CREATE+SET_INFO(FILE_END_OF_FILE_INFORMATION)+CLOSE` (ftruncate)
+- `CREATE+SET_INFO(FILE_BASIC_INFORMATION)+CLOSE` (chmod/touch)
+
+**Unaffected**: `CREATE+CLOSE`, `CREATE+IOCTL+CLOSE` (readlink), and
+standalone (non-compound) SET_INFO all work correctly.
+
+**Our response**: Reverted compound SET_INFO (commit `696e701`). These
+operations use three separate round-trips instead. The performance cost
+is one extra VMBus round-trip (~170μs) per metadata-only operation —
+negligible for data throughput.
+
+### Guest-to-host packet size limit
+
+`vmusrv.dll` enforces `Smb2MaxPacketSize = 0x11000` (69632 bytes) on
+incoming SMB2 PDUs. This is a host-side implementation limit, not a
+VMBus protocol constraint. See [VMBus Pipe Protocol](vmbus-pipe-protocol.md)
+for details.
+
 ## Related Resources
 
 - [hcsshim](https://github.com/microsoft/hcsshim) — `internal/gcs-sidecar/vsmb.go`, `internal/uvm/vsmb.go`

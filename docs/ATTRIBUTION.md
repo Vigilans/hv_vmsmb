@@ -93,7 +93,8 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_file_open` / `release` | **Original** | Open flags to SMB2 disposition mapping |
 | `vmsmb_readdir` | **Original** | Parses `FILE_DIRECTORY_INFO` chain |
 | `vmsmb_utf16_name_to_utf8` | **Ported** from kernel `utf16s_to_utf8s()` | Corresponds to CIFS `cifs_from_utf16()`, without NLS/SFU/SFM |
-| `vmsmb_issue_read` / `issue_write` | **Original** | netfs callbacks; CIFS versions are async |
+| `vmsmb_issue_read` / `issue_write` | **Ported** from CIFS `smb2_async_readv` / `smb2_async_writev` | Async submit + completion callback into netfs |
+| `vmsmb_prepare_write` | **Ported** from CIFS `cifs_prepare_write` | Sets `sreq_max_len` for unbuffered write path |
 | `vmsmb_statfs` | **Original** | Calls `vmsmb_smb2_queryfs()` and converts FS_FULL_SIZE_INFORMATION to `kstatfs` |
 | `vmsmb_getattr` | **Original** | `generic_fillattr` only, no server revalidation |
 | `vmsmb_setattr` | **Ported** from CIFS `cifs_setattr()` | Pushes atime/mtime/ctime via `vmsmb_smb2_set_basic_info()` and size via `vmsmb_smb2_set_eof()` + `truncate_setsize()`; uid/gid/mode stay local |
@@ -101,9 +102,9 @@ projects use GPL-2.0-compatible licenses.
 
 | Category | Approximate % | Description |
 |----------|---------------|-------------|
-| Ported from upstream | ~15% | Inode lifecycle (CIFS), recv loop (hvsock), netfs aops/fops, struct headers |
-| Spec-conformant original | ~65% | SMB2 command construction, VFS ops, async transport (design inspired by libsmb2), mount logic |
-| Reverse-engineered original | ~20% | VSMB version protocol, UNC path format, 64K pipe MTU, post-negotiate drain |
+| Ported from upstream | ~20% | Inode lifecycle (CIFS), recv loop (hvsock), netfs aops/fops, struct headers, async read/write (CIFS) |
+| Spec-conformant original | ~60% | SMB2 command construction, VFS ops, async transport (design inspired by libsmb2), mount logic |
+| Reverse-engineered original | ~20% | VSMB version protocol, UNC path format, host packet size limit, post-negotiate drain, DirectMap protocol |
 
 ## Protocol Discovery
 
@@ -113,10 +114,27 @@ public specification and were discovered through reverse engineering:
 - **VSMB version exchange**: DirectTCP-style framing with `type=1`,
   payload of `{version: u32, capabilities: u32}`
 - **UNC path format**: `\\vsmb\<ShareName>` for TREE_CONNECT
-- **VMBus pipe-mode 64K guest-to-host MTU**: Packets exceeding 64K
-  are silently dropped by the host
+- **VMBus pipe-mode guest-to-host size limit**: Not a VMBus protocol
+  limit — `vmusrv.dll` enforces `Smb2MaxPacketSize = 0x11000` (69632
+  bytes, measured from the SMB2 header). Packets exceeding this are
+  silently dropped. The VMBus transport itself supports ~512K packets.
 - **Post-negotiate drain**: Host may send asynchronous notifications
   after version negotiation that must be drained before SMB2 begins
+- **DirectMap protocol**: FSCTL `0x1403cc` triggers host-side
+  `NtCreateSection` + page mapping; returns 0x28-byte extent descriptor
+  `{OriginalImageBase, ExtentCount, TotalPageCount, PageIndex, PageCount}`.
+  Request is 8 bytes: `{PageProtection, AllocationAttributes}` where
+  PageProtection ∈ {PAGE_READONLY, PAGE_EXECUTE, PAGE_EXECUTE_READ}
+  and AllocationAttributes ∈ {SEC_IMAGE, SEC_COMMIT}.
+  No explicit invalidation — coherence via section/cache-manager semantics.
+- **DirectMap budget**: `vmwp.exe` reads `direct_file_mapping_mb` from
+  VM configuration (even MB, max 65536 MB)
+- **Windows guest ring buffer**: mrxsmb.sys uses 5 pages (20KB) per
+  direction — relies on DirectMap for data, ring only for control PDUs
+- **VMBus external-data packets**: Windows guest uses type 9
+  (`VM_PKT_DATA_USING_GPA_DIRECT`) for large sends/receives; ring
+  carries only descriptors + small inline fragment. Our driver currently
+  uses type 6 (`VM_PKT_DATA_INBAND`) which is ring-size-bound.
 
 ## License Compatibility
 
