@@ -22,7 +22,7 @@
 		  0x8e, 0xaa, 0x52, 0x70, 0xfc, 0x6a, 0xbd, 0xb7)
 
 /* Default ring buffer size (bytes per direction) */
-#define VMSMB_RING_SIZE		(256 * 1024)
+#define VMSMB_RING_SIZE		(1024 * 1024)
 
 /* Max SMB2 response buffer */
 #define VMSMB_MAX_RESPONSE	4096
@@ -31,14 +31,25 @@
 #define VMSMB_MAX_IO_RESPONSE	(1048576 + 256)
 
 /*
- * VMBus pipe-mode guest→host packets must fit within 64K.
- * Total VMBus payload = vmpipe_hdr(8) + DirectTCP(4) + SMB2 header + data.
- * READ requests are small so the limit only constrains WRITE data.
- * READ chunk controls how much data we ask the server to return per request;
- * the response travels host→guest and is not subject to this limit.
+ * Guest→host packet size limit.  The VMBus pipe payload (DirectTCP header +
+ * SMB2 PDU) must fit in 16 bits, i.e. ≤ 0xFFFF.  At 0x10000 the size
+ * overflows and the host silently drops the packet.  Binary-search testing
+ * confirms max write data = 0xFFFF - sizeof(smb2_direct_tcp_hdr) -
+ * sizeof(struct smb2_write_req) = 65535 - 4 - 112 = 65419.
+ *
+ * vmusrv.dll also has Smb2MaxPacketSize = 0x11000 at the SMB2 layer, but
+ * the pipe-level 16-bit limit is hit first.
+ *
+ * READ responses travel host→guest and are not subject to this limit;
+ * VMSMB_MAX_READ_CHUNK is our self-chosen chunk size, sized for good
+ * pipelining within the 1MB ring buffer.
  */
-#define VMSMB_MAX_WRITE_CHUNK	(65536 - 256)	/* 65280 — under 64K pipe MTU */
-#define VMSMB_MAX_READ_CHUNK	(192 * 1024)	/* limited by ring buffer size */
+#define VMSMB_PIPE_MAX_PAYLOAD	0xFFFF
+#define VMSMB_SMB2_MAX_PACKET_SIZE	0x11000
+#define VMSMB_WRITE_HDR_SIZE		0x70	/* sizeof(struct smb2_write_req) */
+#define VMSMB_DIRECT_TCP_HDR_SIZE	4
+#define VMSMB_MAX_WRITE_CHUNK	(VMSMB_PIPE_MAX_PAYLOAD - VMSMB_DIRECT_TCP_HDR_SIZE - VMSMB_WRITE_HDR_SIZE)
+#define VMSMB_MAX_READ_CHUNK	(512 * 1024)
 
 /* Timeout for synchronous send/recv (ms) */
 #define VMSMB_TIMEOUT_MS	10000

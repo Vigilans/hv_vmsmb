@@ -1140,6 +1140,7 @@ int vmsmb_smb2_write(struct vmsmb_session *sess, u32 tree_id,
 		return -ENOMEM;
 
 	/* Data follows immediately after the fixed header */
+	BUILD_BUG_ON(sizeof(struct smb2_write_req) != VMSMB_WRITE_HDR_SIZE);
 	data_offset = sizeof(struct smb2_write_req);
 	pdu_len = data_offset + length;
 	pdu_buf = kvmalloc(pdu_len, GFP_KERNEL);
