@@ -115,27 +115,6 @@ struct vsmb_version_payload {
 #define VSMB_CAP_DIRECTMAP	1
 
 /*
- * VSMB private FSCTL for DirectMap (not public FSCTL_QUERY_DIRECT_ACCESS_EXTENTS).
- * Input: 8 bytes (PageProtection + AllocationAttributes).
- * Output: 0x28 bytes (extent descriptor with GPA page_index).
- */
-#define VSMB_FSCTL_QUERY_DIRECT_ACCESS	0x001403cc
-
-struct vsmb_directmap_req {
-	__le32 page_protection;		/* PAGE_READONLY=0x02, PAGE_EXECUTE_READ=0x20 */
-	__le32 alloc_attributes;	/* SEC_COMMIT=0x08000000, SEC_IMAGE=0x01000000 */
-} __packed;
-
-struct vsmb_directmap_reply {
-	__le64 original_image_base;
-	__le32 extent_count;		/* always 1 */
-	__le32 reserved;
-	__le64 total_page_count;
-	__le64 page_index;		/* GPA base page number; phys addr = page_index << 12 */
-	__le64 page_count;
-} __packed;
-
-/*
  * SMB2 file ID (128-bit opaque handle).
  */
 struct vmsmb_fid {
@@ -261,10 +240,6 @@ struct vmsmb_inode_info {
 	char *symlink_target;		/* Cached readlink target, or NULL */
 	u64 index_number;		/* NTFS file reference (dedup key); 0 if unavailable */
 	unsigned long meta_expires;	/* jiffies after which metadata is stale */
-
-	/* DirectMap state (per-inode, set on first open if caps allow) */
-	void __iomem *dm_addr;		/* ioremap_cache'd kernel VA, or NULL */
-	u64 dm_size;			/* mapped region size in bytes */
 };
 
 static inline struct vmsmb_inode_info *VMSMB_I(struct inode *inode)
@@ -316,7 +291,6 @@ int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 int vmsmb_smb2_create_ioctl_close(struct vmsmb_session *sess, u32 tree_id,
 				  const char *path,
 				  u32 desired_access, u32 create_options,
-				  u32 share_access,
 				  u32 ctl_code,
 				  const void *in, u32 in_len,
 				  void *out, u32 out_size, u32 *out_len);
@@ -368,9 +342,6 @@ int vmsmb_smb2_set_eof(struct vmsmb_session *sess, u32 tree_id,
 		       const char *path, u64 eof);
 int vmsmb_smb2_flush(struct vmsmb_session *sess, u32 tree_id,
 		     struct vmsmb_fid *fid);
-int vmsmb_smb2_query_direct_access(struct vmsmb_session *sess, u32 tree_id,
-				   const char *path,
-				   struct vsmb_directmap_reply *reply);
 
 /* vmsmb_vfs.c */
 extern struct file_system_type vmsmb_fs_type;
