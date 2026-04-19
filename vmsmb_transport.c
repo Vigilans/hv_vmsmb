@@ -232,15 +232,56 @@ skip:
 }
 
 /*
+ * Each VMBus ring entry has an 8-byte trailer after the packet data.
+ * __hv_pkt_iter_next accounts for this when advancing the read index.
+ * The trailer is reserved space (typically contains a u64 = 0) that
+ * must be skipped.  Defined in drivers/hv/ring_buffer.c (not exported).
+ */
+#define VMBUS_PKT_TRAILER	8
+
+/*
+ * Bytes available in the inbound ring from priv_read_index onward.
+ * Equivalent to hv_pkt_iter_avail() (static in ring_buffer.c).
+ * Uses virt_load_acquire on write_index to match the host's
+ * store_release ordering.
+ */
+static inline u32 vmsmb_ring_avail(const struct hv_ring_buffer_info *rbi)
+{
+	u32 pri = rbi->priv_read_index;
+	u32 wi = virt_load_acquire(&rbi->ring_buffer->write_index);
+
+	return wi >= pri ? (wi - pri) : (rbi->ring_datasize - pri + wi);
+}
+
+/*
  * VMBus channel callback — parse and dispatch responses.
  *
- * Iterates ring buffer entries using hv_pkt_iter (hvsock pattern),
- * extracts vmpipe DATA payloads, and feeds them into the stream
- * reassembly state machine.
+ * Reads directly from the double-mapped ring buffer, bypassing the
+ * hv_pkt_iter bounce copy (channel->pkt_buffer).  The ring is vmap'd
+ * twice so virtual addresses are contiguous even at the physical wrap
+ * point — no special handling needed.
  *
- * Dispatch model inspired by libsmb2's smb2_service_fd() readable
- * path (parse header → match by MessageId → invoke completion).
- * CIFS uses a dedicated demultiplex_thread for the same purpose.
+ * This saves one full-packet memcpy per VMBus entry.  For 512K READ
+ * responses at 8K ops/s that's ~4 GB/s of memcpy eliminated.
+ *
+ * Trade-off: we bypass the TOCTOU protection that hv_pkt_iter_first
+ * provides (the bounce snapshot prevents a malicious host from mutating
+ * packet metadata after we validate it).  For VSMB the host is our own
+ * hypervisor, so this is acceptable.
+ *
+ * Kernel API compatibility:
+ *   - hv_ring_buffer_info.{priv_read_index, ring_datasize, ring_buffer},
+ *     hv_get_ring_buffer(), hv_pkt_iter_close(), struct vmpacket_descriptor
+ *     are all in <linux/hyperv.h> (stable since hv_pkt_iter introduction,
+ *     kernel 4.14+). These are also used by the foreach_vmbus_pkt path,
+ *     so no additional struct-layout risk vs the standard API.
+ *   - VMBUS_PKT_TRAILER (8) is defined in drivers/hv/ring_buffer.c, not
+ *     exported. Value unchanged since introduction. If it changes, our
+ *     priv_read_index advance will silently misalign.
+ *   - Ring double-mapping (vmap of 2N-1 pages) is an implementation
+ *     detail of hv_ringbuffer_init, not an API guarantee. Added in
+ *     commit 95096f2 (2020). If removed, reads spanning the ring wrap
+ *     point would return garbage.
  *
  * Also signals recv_done for the synchronous version negotiation path.
  */
@@ -254,16 +295,28 @@ static void vmsmb_channel_cb(void *ctx)
 	 * buffer for the synchronous receive path (version negotiation).
 	 */
 	if (!list_empty(&sess->pending_requests) || sess->current_recv) {
-		struct vmpacket_descriptor *desc;
+		struct hv_ring_buffer_info *rbi = &sess->channel->inbound;
+		u8 *ring = hv_get_ring_buffer(rbi);
+		bool processed_any = false;
 
-		foreach_vmbus_pkt(desc, sess->channel) {
+		while (vmsmb_ring_avail(rbi) >=
+		       sizeof(struct vmpacket_descriptor) + VMBUS_PKT_TRAILER) {
+			const struct vmpacket_descriptor *desc;
 			const struct vmpipe_hdr *ph;
-			u32 pkt_payload_len, ptype, dsize;
+			u32 pkt_len, pkt_payload_len, ptype, dsize;
 			const u8 *data;
 
-			pkt_payload_len = hv_pkt_datalen(desc);
+			desc = (const struct vmpacket_descriptor *)
+				(ring + rbi->priv_read_index);
+			pkt_len = READ_ONCE(desc->len8) << 3;
+
+			if (pkt_len < sizeof(*desc) ||
+			    pkt_len + VMBUS_PKT_TRAILER > vmsmb_ring_avail(rbi))
+				break;
+
+			pkt_payload_len = pkt_len - (READ_ONCE(desc->offset8) << 3);
 			if (pkt_payload_len < sizeof(struct vmpipe_hdr))
-				continue;
+				goto advance;
 
 			ph = (const struct vmpipe_hdr *)
 				((const u8 *)desc + (desc->offset8 << 3));
@@ -271,10 +324,10 @@ static void vmsmb_channel_cb(void *ctx)
 			dsize = le32_to_cpu(ph->data_size);
 
 			if (ptype == 0)
-				continue;
+				goto advance;
 
 			if (ptype != VMPIPE_TYPE_DATA || dsize == 0)
-				continue;
+				goto advance;
 
 			if (sizeof(struct vmpipe_hdr) + dsize > pkt_payload_len)
 				dsize = pkt_payload_len -
@@ -282,7 +335,16 @@ static void vmsmb_channel_cb(void *ctx)
 
 			data = (const u8 *)ph + sizeof(struct vmpipe_hdr);
 			vmsmb_process_data(sess, data, dsize);
+
+advance:
+			rbi->priv_read_index += pkt_len + VMBUS_PKT_TRAILER;
+			if (rbi->priv_read_index >= rbi->ring_datasize)
+				rbi->priv_read_index -= rbi->ring_datasize;
+			processed_any = true;
 		}
+
+		if (processed_any)
+			hv_pkt_iter_close(sess->channel);
 	}
 
 	/* Signal synchronous waiters (version negotiation, drain) */
