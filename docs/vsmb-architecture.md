@@ -172,10 +172,44 @@ Windows guests use only 20KB (5-page) ring buffers per direction —
 DirectMap handles data transfer, and the ring carries only SMB2 control
 PDUs.
 
+### Host-Side GPA Mapping (vid.sys)
+
+`vmwp.exe` installs DirectMap pages into guest physical address space via
+`vid.sys` VID APIs. RE of `vid.sys` (build 26100) reveals two distinct
+GPA mapping paths:
+
+| Path | API | EPT Memory Type | Use |
+|------|-----|-----------------|-----|
+| Normal RAM / hot-add | `WinHvAddPhysicalMemory` | WB (write-back) | Guest RAM |
+| DirectMap / VA-backed | `WinHvMapGpaPagesSpecial` | UC/WT (uncached) | File sections |
+
+The routing is controlled by an internal map-type flag table
+(`DAT_1c0036f20`): map types with bits `0x30000` set are normalized to
+`0x10000` and dispatched to the "Special" mapper. Observed special-map
+flag values: `0x10000`, `0x4010000`, `0x8010000`.
+
+There is **no cache-type selector** in the recovered API surface — the
+EPT memory type is implicitly determined by the mapper path.
+
 ### Linux Guest Status
 
-Not yet implemented. Our driver advertises `VSMB_CAP_DIRECTMAP` in the
-version exchange but does not send FSCTL `0x1403cc`.
+Implemented and reverted. The full protocol works correctly:
+FSCTL `0x1403cc` → `ioremap_cache(page_index << 12)` → `memcpy_fromio`
+read path → `iounmap` cleanup. Data integrity verified (md5sum match).
+
+However, the hypervisor assigns UC/WT EPT entries to DirectMap GPA pages
+(via `WinHvMapGpaPagesSpecial`), making `ioremap_cache` ineffective —
+the effective memory type is UC/WT regardless of guest page table
+settings (Intel SDM Vol.3C Ch.28). Measured throughput:
+
+| Method | Read Speed |
+|--------|-----------|
+| DirectMap + `ioremap` (UC) | ~15 MB/s |
+| DirectMap + `ioremap_cache` (WB requested, UC effective) | ~35 MB/s |
+| VMBus ring buffer (baseline) | 2,000+ MB/s |
+
+The DirectMap read fast path is reverted. The VMBus ring path remains
+the primary data transfer mechanism for Linux guests.
 
 ## VMBus Transport Details
 
@@ -189,6 +223,36 @@ version exchange but does not send FSCTL `0x1403cc`.
 Windows' small rings work because data is transferred via GPA-direct
 packet types (type 9), not in-band. Our Linux driver uses
 `VM_PKT_DATA_INBAND` (type 6), requiring larger rings.
+
+### Direct Ring Buffer Read
+
+The channel callback bypasses the kernel's `hv_pkt_iter_first` bounce
+copy, reading packet data directly from the double-mapped ring buffer.
+This eliminates one full-packet `memcpy` per VMBus entry (~512K for READ
+responses), improving sequential I/O by ~15-19%.
+
+Key implementation details:
+- `VMBUS_PKT_TRAILER = 8`: each ring entry has an 8-byte trailer that
+  must be accounted for when advancing `priv_read_index`
+- `vmsmb_ring_avail()` uses `priv_read_index` (not host-visible
+  `read_index`) with `virt_load_acquire` on `write_index`, matching
+  the kernel's internal `hv_pkt_iter_avail()`
+- `hv_pkt_iter_close()` is called after processing to update the
+  host-visible read index and handle flow control signaling
+
+Trade-off: bypasses TOCTOU protection (the bounce copy prevents a
+malicious host from mutating packet metadata after validation). For VSMB
+the host is our own hypervisor, so this is acceptable.
+
+### Readahead Configuration
+
+BDI readahead is set to 4 MB (`sb->s_bdi->ra_pages = 1024`) at mount
+time. The kernel default of 128 KB is too small — each async subrequest
+is 512K, and the transport can pipeline 4-8 of them concurrently.
+
+Impact on cold sequential reads (real model files, NVMe backend):
+- `ra_pages = 128KB`: ~538 MB/s
+- `ra_pages = 4MB`: ~2,500 MB/s (+365%)
 
 ### Packet Types
 
