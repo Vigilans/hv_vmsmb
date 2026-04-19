@@ -1433,7 +1433,8 @@ int vmsmb_smb2_write_async(struct vmsmb_session *sess, u32 tree_id,
  */
 int vmsmb_smb2_query_dir(struct vmsmb_session *sess, u32 tree_id,
 			 struct vmsmb_fid *fid,
-			 const char *pattern, void *buf, u32 buf_size,
+			 const char *pattern, u8 flags,
+			 void *buf, u32 buf_size,
 			 u32 *data_len)
 {
 	u8 *pdu_buf, *resp_buf;
@@ -1470,7 +1471,7 @@ int vmsmb_smb2_query_dir(struct vmsmb_session *sess, u32 tree_id,
 	vmsmb_fill_hdr(&req->hdr, SMB2_QUERY_DIRECTORY_HE, sess, tree_id);
 	req->StructureSize = cpu_to_le16(33);
 	req->FileInformationClass = 1; /* FileDirectoryInformation */
-	req->Flags = SMB2_RESTART_SCANS;
+	req->Flags = flags;
 	req->FileIndex = 0;
 	req->PersistentFileId = fid->persistent;
 	req->VolatileFileId = fid->volatile_id;

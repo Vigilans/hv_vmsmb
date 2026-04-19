@@ -314,7 +314,8 @@ int vmsmb_smb2_write_async(struct vmsmb_session *sess, u32 tree_id,
 			   void *priv);
 int vmsmb_smb2_query_dir(struct vmsmb_session *sess, u32 tree_id,
 			 struct vmsmb_fid *fid,
-			 const char *pattern, void *buf, u32 buf_size,
+			 const char *pattern, u8 flags,
+			 void *buf, u32 buf_size,
 			 u32 *data_len);
 int vmsmb_smb2_rename(struct vmsmb_session *sess, u32 tree_id,
 		       const char *old_path, const char *new_path,

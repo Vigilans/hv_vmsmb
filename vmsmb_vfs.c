@@ -1474,8 +1474,12 @@ static int vmsmb_utf16_name_to_utf8(char *dst, size_t dst_size,
  *
  * Port of CIFS cifs_readdir() (fs/smb/client/readdir.c): open the dir with
  * FILE_LIST_DIRECTORY, loop QUERY_DIRECTORY until STATUS_NO_MORE_FILES,
- * feed each FILE_DIRECTORY_INFO into dir_emit(). Simplified: no
- * resumption via FileIndex, always restart scans.
+ * feed each FILE_DIRECTORY_INFO into dir_emit().
+ *
+ * Stateless: each VFS call re-opens the directory and re-scans from the
+ * beginning, skipping entries until ctx->pos is reached.  This is simple
+ * and correct for directories of any size; the cost is proportional to
+ * directory size × number of getdents calls (typically 1-2 for most dirs).
  */
 static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 {
@@ -1485,53 +1489,52 @@ static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 	struct vmsmb_fid fid;
 	char *path;
 	void *buf;
-	u32 buf_size = 4096;  /* TODO: increase + add continuation loop for large dirs */
+	u32 buf_size = 65536;
 	u32 data_len;
+	u8 flags;
+	bool first = true;
+	loff_t pos = 0;
 	int ret;
 
 	if (!dir_emit_dots(file, ctx))
-		return 0;
-
-	/* Only scan once — if we've already emitted entries, done */
-	if (ctx->pos > 2)
 		return 0;
 
 	path = vmsmb_build_path(file->f_path.dentry);
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 
-	buf = kmalloc(buf_size, GFP_KERNEL);
+	buf = kvmalloc(buf_size, GFP_KERNEL);
 	if (!buf) {
 		kfree(path);
 		return -ENOMEM;
 	}
 
-	/* Open directory */
-
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, VMSMB_DIR_ACCESS,
 				FILE_OPEN, CREATE_NOT_FILE,
 				&fid, NULL);
 	if (ret) {
-	
 		pr_err("readdir: CREATE '%s' failed: %d\n", path, ret);
 		kfree(path);
-		kfree(buf);
+		kvfree(buf);
 		return ret;
 	}
 
-	/* Query directory entries */
-	ret = vmsmb_smb2_query_dir(sess, sbi->tree_id, &fid, "*", buf, buf_size, &data_len);
-	pr_debug("readdir: QUERY_DIRECTORY ret=%d data_len=%u\n",
-		 ret, ret == 0 ? data_len : 0);
+	for (;;) {
+		flags = first ? SMB2_RESTART_SCANS : 0;
+		first = false;
 
-	if (ret == -ENODATA) {
-		/* Empty directory */
-		ret = 0;
-		data_len = 0;
-	}
+		ret = vmsmb_smb2_query_dir(sess, sbi->tree_id, &fid, "*",
+					   flags, buf, buf_size, &data_len);
 
-	if (ret == 0 && data_len > 0) {
-		/* Parse FILE_DIRECTORY_INFO chain */
+		if (ret == -ENODATA) {
+			ret = 0;
+			break;
+		}
+		if (ret)
+			break;
+		if (data_len == 0)
+			break;
+
 		u32 offset = 0;
 
 		while (offset < data_len) {
@@ -1548,13 +1551,13 @@ static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 						      entry->FileName,
 						      name_len);
 
-			pr_debug("readdir: entry off=%u nlen=%u attrs=0x%x name='%s'\n",
-				offset, name_len, attrs, name_utf8);
-
-			/* Skip . and .. (already emitted by dir_emit_dots) */
 			if ((utf8_len == 1 && name_utf8[0] == '.') ||
 			    (utf8_len == 2 && name_utf8[0] == '.' &&
 			     name_utf8[1] == '.'))
+				goto next_entry;
+
+			pos++;
+			if (pos + 2 <= ctx->pos)
 				goto next_entry;
 
 			d_type = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) ?
@@ -1565,7 +1568,7 @@ static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 			if (!dir_emit(ctx, name_utf8, utf8_len,
 				      atomic64_inc_return(&vmsmb_ino_counter),
 				      d_type))
-				break;
+				goto out;
 
 			ctx->pos++;
 
@@ -1576,12 +1579,11 @@ next_entry:
 		}
 	}
 
-	/* Close directory */
+out:
 	vmsmb_smb2_close(sess, sbi->tree_id, &fid);
 
-
 	kfree(path);
-	kfree(buf);
+	kvfree(buf);
 	return ret;
 }
 
