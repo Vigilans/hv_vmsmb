@@ -489,13 +489,10 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 	if (IS_ERR(path))
 		return ERR_CAST(path);
 
-
 	ret = vmsmb_smb2_create_close(sess, sbi->tree_id, path,
 				      FILE_READ_ATTRIBUTES,
 				      OPEN_REPARSE_POINT,
 				      &info);
-
-
 	kfree(path);
 
 	if (ret == -ENOENT)
@@ -526,10 +523,8 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 			return ERR_PTR(-ENOMEM);
 		}
 
-	
 		ret = vmsmb_smb2_get_reparse(sess, sbi->tree_id, path, reparse_buf,
 					      VMSMB_MAX_RESPONSE, &reparse_len);
-	
 		kfree(path);
 
 		if (ret) {
@@ -617,13 +612,11 @@ static int vmsmb_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 
-
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, VMSMB_RW_ACCESS,
 				excl ? FILE_CREATE : FILE_OPEN_IF,
 				CREATE_NOT_DIR, &fid, &info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, sbi->tree_id, &fid);
-
 
 	kfree(path);
 
@@ -659,13 +652,11 @@ static struct dentry *vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	if (IS_ERR(path))
 		return ERR_CAST(path);
 
-
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, VMSMB_DIR_ACCESS,
 				FILE_CREATE, CREATE_NOT_FILE,
 				&fid, &info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, sbi->tree_id, &fid);
-
 
 	kfree(path);
 
@@ -698,10 +689,7 @@ static int vmsmb_unlink(struct inode *dir, struct dentry *dentry)
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 
-
 	ret = vmsmb_smb2_unlink(sess, sbi->tree_id, path);
-
-
 	kfree(path);
 
 	if (ret == 0)
@@ -727,7 +715,6 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 
-
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, DELETE,
 				FILE_OPEN,
 				CREATE_DELETE_ON_CLOSE |
@@ -735,7 +722,6 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 				&fid, NULL);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, sbi->tree_id, &fid);
-
 
 	kfree(path);
 
@@ -779,9 +765,7 @@ static int vmsmb_rename(struct mnt_idmap *idmap,
 
 	replace = !(flags & RENAME_NOREPLACE);
 
-
 	ret = vmsmb_smb2_rename(sess, sbi->tree_id, old_path, new_path, replace);
-
 
 	kfree(old_path);
 	kfree(new_path);
@@ -813,9 +797,7 @@ static int vmsmb_link(struct dentry *old_dentry, struct inode *dir,
 		return PTR_ERR(new_path);
 	}
 
-
 	ret = vmsmb_smb2_hardlink(sess, sbi->tree_id, old_path, new_path);
-
 
 	if ((ret == -EIO) || (ret == -EINVAL))
 		ret = -EOPNOTSUPP;
@@ -884,9 +866,7 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 
-
 	ret = vmsmb_smb2_create_symlink(sess, sbi->tree_id, path, target);
-
 
 	if (ret) {
 		kfree(path);
@@ -901,7 +881,6 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 				&fid, &info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, sbi->tree_id, &fid);
-
 
 	kfree(path);
 
@@ -1355,11 +1334,9 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 		disposition = FILE_OPEN;
 	}
 
-
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, access, disposition,
 				CREATE_NOT_DIR,
 				&ctx->fid, &info);
-
 
 	kfree(path);
 
@@ -1391,9 +1368,7 @@ static int vmsmb_file_release(struct inode *inode, struct file *file)
 		if (VMSMB_I(inode)->active_ctx == ctx)
 			VMSMB_I(inode)->active_ctx = NULL;
 
-	
 		vmsmb_smb2_close(sess, sbi->tree_id, &ctx->fid);
-	
 		kfree(ctx);
 	}
 	return 0;
@@ -1513,7 +1488,7 @@ static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 				FILE_OPEN, CREATE_NOT_FILE,
 				&fid, NULL);
 	if (ret) {
-		pr_err("readdir: CREATE '%s' failed: %d\n", path, ret);
+		pr_debug("readdir: CREATE '%s' failed: %d\n", path, ret);
 		kfree(path);
 		kvfree(buf);
 		return ret;
@@ -1917,7 +1892,6 @@ static int vmsmb_get_tree(struct fs_context *fc)
 
 	ret = vmsmb_smb2_tree_connect(sess, dev_name, &sbi->tree_id);
 
-
 	if (ret) {
 		pr_err("TREE_CONNECT '%s' failed: %d\n", dev_name, ret);
 		kfree(sbi->share_name);
@@ -1962,8 +1936,8 @@ static int vmsmb_init_fs_context(struct fs_context *fc)
 
 /*
  * Release superblock resources on unmount — free sbi's strings + the
- * sbi struct. The session / tree_id are shared across mounts of the
- * same share so they aren't torn down here.
+ * sbi struct. No TREE_DISCONNECT: the host cleans up all tree connects
+ * when the VMBus channel closes.
  *
  * Port of CIFS cifs_kill_sb() (fs/smb/client/cifsfs.c) simplified: no
  * per-sb cifs_sb_tlink_tree / tcon teardown.
@@ -1975,7 +1949,7 @@ static void vmsmb_kill_sb(struct super_block *sb)
 	kill_anon_super(sb);
 
 	if (sbi) {
-		/* TODO: TREE_DISCONNECT */
+		/* Nice to have: TREE_DISCONNECT */
 		kfree(sbi->share_name);
 		kfree(sbi->symlinkroot);
 		kfree(sbi);
