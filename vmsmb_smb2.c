@@ -883,6 +883,7 @@ out:
 int vmsmb_smb2_create_ioctl_close(struct vmsmb_session *sess, u32 tree_id,
 				  const char *path,
 				  u32 desired_access, u32 create_options,
+				  u32 share_access,
 				  u32 ctl_code,
 				  const void *in, u32 in_len,
 				  void *out, u32 out_size, u32 *out_len)
@@ -932,7 +933,7 @@ int vmsmb_smb2_create_ioctl_close(struct vmsmb_session *sess, u32 tree_id,
 	creq->ImpersonationLevel = cpu_to_le32(0x02);
 	creq->DesiredAccess = cpu_to_le32(desired_access);
 	creq->FileAttributes = cpu_to_le32(FILE_ATTRIBUTE_NORMAL);
-	creq->ShareAccess = cpu_to_le32(0x07);
+	creq->ShareAccess = cpu_to_le32(share_access);
 	creq->CreateDisposition = cpu_to_le32(FILE_OPEN);
 	creq->CreateOptions = cpu_to_le32(create_options);
 	creq->NameOffset = cpu_to_le16(sizeof(struct smb2_create_req));
@@ -1830,6 +1831,7 @@ int vmsmb_smb2_get_reparse(struct vmsmb_session *sess, u32 tree_id,
 	return vmsmb_smb2_create_ioctl_close(sess, tree_id, path,
 					     FILE_READ_ATTRIBUTES,
 					     OPEN_REPARSE_POINT,
+					     0x07,
 					     FSCTL_GET_REPARSE_POINT,
 					     NULL, 0, buf, buf_size, data_len);
 }
@@ -2237,4 +2239,39 @@ int vmsmb_smb2_flush(struct vmsmb_session *sess, u32 tree_id,
 out:
 	kfree(resp_buf);
 	return ret;
+}
+
+/*
+ * Query DirectMap extents for a file via compound CREATE+IOCTL+CLOSE.
+ *
+ * Sends VSMB private FSCTL 0x1403cc (QueryDirectAccessExtents) to obtain
+ * GPA page mapping info.  The host creates a section-backed mapping and
+ * installs the pages into guest physical address space via VID GPA-range
+ * APIs.  The returned page_index is a GPA base page number.
+ *
+ * Reference: vmusrv.dll!CFile::QueryDirectAccessExtents, vmwp.exe
+ * CreateSectionBackedGpaRange / CreateDaxFileBackedGpaRange.
+ */
+int vmsmb_smb2_query_direct_access(struct vmsmb_session *sess, u32 tree_id,
+				   const char *path,
+				   struct vsmb_directmap_reply *reply)
+{
+	struct vsmb_directmap_req req = {
+		.page_protection = cpu_to_le32(0x02),		/* PAGE_READONLY */
+		.alloc_attributes = cpu_to_le32(0x08000000),	/* SEC_COMMIT */
+	};
+	u32 out_len;
+	int ret;
+
+	ret = vmsmb_smb2_create_ioctl_close(sess, tree_id, path,
+					     FILE_READ_DATA | FILE_READ_ATTRIBUTES, 0,
+					     0x05, /* no FILE_SHARE_WRITE — vmusrv rejects DirectMap with it */
+					     VSMB_FSCTL_QUERY_DIRECT_ACCESS,
+					     &req, sizeof(req),
+					     reply, sizeof(*reply), &out_len);
+	if (ret)
+		return ret;
+	if (out_len < sizeof(*reply))
+		return -EPROTO;
+	return 0;
 }

@@ -19,6 +19,7 @@
 #include <linux/backing-dev.h>
 #include <linux/nls.h>
 #include <linux/fs_parser.h>
+#include <linux/io.h>
 #include "vmsmb.h"
 #include "smb2pdu.h"
 #include "smb1pdu.h"
@@ -1107,6 +1108,7 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
 	struct vmsmb_session *sess = sbi->sess;
 	struct vmsmb_file_ctx *ctx = rreq->netfs_priv;
+	struct vmsmb_inode_info *vi = VMSMB_I(inode);
 	struct vmsmb_fid temp_fid;
 	void *buf;
 	u32 bytes_read = 0;
@@ -1115,6 +1117,24 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 
 	pr_debug("issue_read: ctx=%p pos=%lld len=%zu\n",
 		 ctx, (long long)subreq->start, subreq->len);
+
+	/* DirectMap fast path: copy directly from GPA-mapped pages */
+	if (vi->dm_addr && subreq->start + subreq->len <= vi->dm_size) {
+		void *tmp = kvmalloc(subreq->len, GFP_KERNEL);
+
+		if (tmp) {
+			memcpy_fromio(tmp, vi->dm_addr + subreq->start, subreq->len);
+			if (copy_to_iter(tmp, subreq->len, &subreq->io_iter) == subreq->len)
+				subreq->transferred = subreq->len;
+			else
+				subreq->error = -EFAULT;
+			kvfree(tmp);
+		} else {
+			subreq->error = -ENOMEM;
+		}
+		netfs_read_subreq_terminated(subreq);
+		return;
+	}
 
 	/* Fast path: open fid + subreq fits in one chunk → async single-shot */
 	if (ctx && subreq->len <= VMSMB_MAX_READ_CHUNK) {
@@ -1360,16 +1380,52 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 				CREATE_NOT_DIR,
 				&ctx->fid, &info);
 
-
-	kfree(path);
-
 	if (ret) {
+		kfree(path);
 		kfree(ctx);
 		return ret;
 	}
 
 	/* Update inode size from server */
 	i_size_write(inode, info.size);
+
+	/* Try to establish DirectMap for reads (non-fatal on failure).
+	 * Only for read-only opens — NtCreateSection(SEC_COMMIT) on the host
+	 * fails with STATUS_SHARING_VIOLATION if the file is open for write.
+	 * Uses compound CREATE+IOCTL+CLOSE with ShareAccess=0x05 (no SHARE_WRITE)
+	 * since vmusrv.dll rejects DirectMap if CFile was opened with SHARE_WRITE.
+	 */
+	if ((sess->vsmb_caps & VSMB_CAP_DIRECTMAP) &&
+	    S_ISREG(inode->i_mode) && !VMSMB_I(inode)->dm_addr &&
+	    !(file->f_mode & FMODE_WRITE)) {
+		struct vsmb_directmap_reply dm_reply;
+		int dm_ret;
+
+		dm_ret = vmsmb_smb2_query_direct_access(sess, sbi->tree_id,
+							path, &dm_reply);
+		if (dm_ret == 0) {
+			u64 gpa = le64_to_cpu(dm_reply.page_index) << PAGE_SHIFT;
+			u64 sz = le64_to_cpu(dm_reply.page_count) << PAGE_SHIFT;
+			void *addr = ioremap_cache(gpa, sz);
+
+			if (addr) {
+				VMSMB_I(inode)->dm_addr = addr;
+				VMSMB_I(inode)->dm_size = sz;
+				pr_debug("directmap: '%s' mapped %llu pages at GPA 0x%llx\n",
+					path,
+					le64_to_cpu(dm_reply.page_count),
+					le64_to_cpu(dm_reply.page_index));
+			} else {
+				pr_debug("directmap: ioremap_cache failed for GPA 0x%llx\n",
+					 le64_to_cpu(dm_reply.page_index));
+			}
+		} else {
+			pr_debug("directmap: FSCTL failed for '%s': %d\n",
+				 path, dm_ret);
+		}
+	}
+
+	kfree(path);
 
 	file->private_data = ctx;
 	VMSMB_I(inode)->active_ctx = ctx;
@@ -1669,7 +1725,14 @@ static int vmsmb_statfs(struct dentry *dentry, struct kstatfs *buf)
  */
 static void vmsmb_evict_inode(struct inode *inode)
 {
-	kfree(VMSMB_I(inode)->symlink_target);
+	struct vmsmb_inode_info *vi = VMSMB_I(inode);
+
+	if (vi->dm_addr) {
+		iounmap(vi->dm_addr);
+		vi->dm_addr = NULL;
+		vi->dm_size = 0;
+	}
+	kfree(vi->symlink_target);
 	netfs_wait_for_outstanding_io(inode);
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
