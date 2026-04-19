@@ -532,7 +532,8 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, u32 tree_id,
 	req->ImpersonationLevel = cpu_to_le32(0x02); /* Impersonation */
 	req->DesiredAccess = cpu_to_le32(desired_access);
 	req->FileAttributes = cpu_to_le32(FILE_ATTRIBUTE_NORMAL);
-	req->ShareAccess = cpu_to_le32(0x07); /* READ|WRITE|DELETE */
+	req->ShareAccess = FILE_SHARE_READ_LE | FILE_SHARE_WRITE_LE |
+			   FILE_SHARE_DELETE_LE;
 	req->CreateDisposition = cpu_to_le32(disposition);
 	req->CreateOptions = cpu_to_le32(create_options);
 	/*
@@ -747,7 +748,8 @@ int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 	creq->ImpersonationLevel = cpu_to_le32(0x02);
 	creq->DesiredAccess = cpu_to_le32(desired_access);
 	creq->FileAttributes = cpu_to_le32(FILE_ATTRIBUTE_NORMAL);
-	creq->ShareAccess = cpu_to_le32(0x07);
+	creq->ShareAccess = FILE_SHARE_READ_LE | FILE_SHARE_WRITE_LE |
+			    FILE_SHARE_DELETE_LE;
 	creq->CreateDisposition = cpu_to_le32(FILE_OPEN);
 	creq->CreateOptions = cpu_to_le32(create_options);
 	creq->NameOffset = cpu_to_le16(sizeof(struct smb2_create_req));
@@ -932,7 +934,8 @@ int vmsmb_smb2_create_ioctl_close(struct vmsmb_session *sess, u32 tree_id,
 	creq->ImpersonationLevel = cpu_to_le32(0x02);
 	creq->DesiredAccess = cpu_to_le32(desired_access);
 	creq->FileAttributes = cpu_to_le32(FILE_ATTRIBUTE_NORMAL);
-	creq->ShareAccess = cpu_to_le32(0x07);
+	creq->ShareAccess = FILE_SHARE_READ_LE | FILE_SHARE_WRITE_LE |
+			    FILE_SHARE_DELETE_LE;
 	creq->CreateDisposition = cpu_to_le32(FILE_OPEN);
 	creq->CreateOptions = cpu_to_le32(create_options);
 	creq->NameOffset = cpu_to_le16(sizeof(struct smb2_create_req));
