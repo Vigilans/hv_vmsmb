@@ -27,7 +27,11 @@
 /* Max SMB2 response buffer */
 #define VMSMB_MAX_RESPONSE	4096
 
-/* Max I/O response buffer (header overhead + MaxReadSize) */
+/*
+ * Max I/O response buffer (MaxReadSize + framing/header overhead).
+ * Overhead: StreamHdr(4) + smb2_hdr(64) + smb2_read_rsp body(17) + padding = ~85.
+ * Rounded to 256 for alignment safety.
+ */
 #define VMSMB_MAX_IO_RESPONSE	(1048576 + 256)
 
 /*
@@ -51,8 +55,12 @@
 #define VMSMB_MAX_WRITE_CHUNK	(VMSMB_PIPE_MAX_PAYLOAD - VMSMB_DIRECT_TCP_HDR_SIZE - VMSMB_WRITE_HDR_SIZE)
 #define VMSMB_MAX_READ_CHUNK	(512 * 1024)
 
-/* Timeout for synchronous send/recv (ms) */
+/* Timeout for synchronous send/recv (ms). CIFS uses 30s; local VMBus latency
+ * is sub-millisecond, so 10s is generous even for host-side disk I/O. */
 #define VMSMB_TIMEOUT_MS	10000
+
+/* Max send retries on EAGAIN (ring buffer backpressure) */
+#define VMSMB_SEND_MAX_RETRIES	100
 
 /*
  * VMBus pipe header — required for pipe-mode channels.

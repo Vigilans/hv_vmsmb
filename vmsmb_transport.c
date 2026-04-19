@@ -387,7 +387,7 @@ static int vmsmb_send_recv_sync(struct vmsmb_session *sess,
 	{
 		int send_retries;
 
-		for (send_retries = 0; send_retries < 100; send_retries++) {
+		for (send_retries = 0; send_retries < VMSMB_SEND_MAX_RETRIES; send_retries++) {
 			ret = vmbus_sendpacket(sess->channel, pkt, pkt_len,
 					       0, VM_PKT_DATA_INBAND, 0);
 			if (ret != -EAGAIN)
@@ -541,7 +541,7 @@ static int vmsmb_submit(struct vmsmb_session *sess,
 	spin_unlock_bh(&sess->pending_lock);
 
 	mutex_lock(&sess->send_mutex);
-	for (send_retries = 0; send_retries < 100; send_retries++) {
+	for (send_retries = 0; send_retries < VMSMB_SEND_MAX_RETRIES; send_retries++) {
 		ret = vmbus_sendpacket(sess->channel, send_buf, send_pkt_len,
 				       0, VM_PKT_DATA_INBAND, 0);
 		if (ret != -EAGAIN)

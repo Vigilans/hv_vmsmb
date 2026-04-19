@@ -728,7 +728,7 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 		return PTR_ERR(path);
 
 
-	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, 0x00010000 /* DELETE */,
+	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, DELETE,
 				FILE_OPEN,
 				CREATE_DELETE_ON_CLOSE |
 				CREATE_NOT_FILE,
@@ -1113,8 +1113,8 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 	char *path;
 	int ret;
 
-	pr_info("issue_read: ctx=%p pos=%lld len=%zu\n",
-		ctx, (long long)subreq->start, subreq->len);
+	pr_debug("issue_read: ctx=%p pos=%lld len=%zu\n",
+		 ctx, (long long)subreq->start, subreq->len);
 
 	/* Fast path: open fid + subreq fits in one chunk → async single-shot */
 	if (ctx && subreq->len <= VMSMB_MAX_READ_CHUNK) {
@@ -1227,8 +1227,8 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 
 	/* Fast path: open fid + subreq fits in one chunk → async single-shot */
 	if (ctx && subreq->len <= VMSMB_MAX_WRITE_CHUNK) {
-		pr_info("issue_write: ASYNC ctx=%p pos=%lld len=%zu\n",
-			ctx, (long long)subreq->start, subreq->len);
+		pr_debug("issue_write: ASYNC ctx=%p pos=%lld len=%zu\n",
+			 ctx, (long long)subreq->start, subreq->len);
 		buf = kvmalloc(subreq->len, GFP_KERNEL);
 		if (!buf) {
 			netfs_write_subrequest_terminated(subreq, -ENOMEM);
@@ -1485,7 +1485,7 @@ static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 	struct vmsmb_fid fid;
 	char *path;
 	void *buf;
-	u32 buf_size = 4096;
+	u32 buf_size = 4096;  /* TODO: increase + add continuation loop for large dirs */
 	u32 data_len;
 	int ret;
 

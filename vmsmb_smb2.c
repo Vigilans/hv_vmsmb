@@ -46,7 +46,13 @@ static void vmsmb_fill_hdr(struct smb2_hdr *hdr, u16 command,
 	hdr->StructureSize = cpu_to_le16(64);
 	hdr->Command = cpu_to_le16(command);
 	hdr->CreditCharge = cpu_to_le16(1);
-	hdr->CreditRequest = cpu_to_le16(64); /* request plenty of credits */
+	/*
+	 * CreditRequest: CIFS uses 256 (SMB2_MAX_CREDITS_DEFAULT). 64 is
+	 * sufficient for our max async concurrency (~8 in-flight via netfs).
+	 * CreditCharge=1 is correct because all our PDUs are ≤64K after
+	 * chunking (VMSMB_MAX_WRITE_CHUNK ≈ 65K, control PDUs ≤ 4K).
+	 */
+	hdr->CreditRequest = cpu_to_le16(64);
 	hdr->MessageId = cpu_to_le64(atomic64_inc_return(&sess->message_id) - 1);
 	hdr->Id.SyncId.TreeId = cpu_to_le32(tree_id);
 	hdr->SessionId = cpu_to_le64(sess->session_id);
