@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+
+SRC_DIR = /usr/src/hv-vmsmb-0.1.0
+
+%:
+	dh $@ --buildsystem=none
+
+override_dh_auto_install:
+	install -d $(DESTDIR)$(SRC_DIR)
+	install -m 0644 Makefile dkms.conf $(DESTDIR)$(SRC_DIR)/
+	install -m 0644 *.c *.h $(DESTDIR)$(SRC_DIR)/
+
+override_dh_dkms:
+	dh_dkms -V 0.1.0

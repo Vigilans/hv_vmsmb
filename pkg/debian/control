@@ -1,0 +1,21 @@
+Source: hv-vmsmb-dkms
+Section: kernel
+Priority: optional
+Maintainer: Vigilans <vigilans@foxmail.com>
+Build-Depends: debhelper-compat (= 13), dkms
+Standards-Version: 4.6.2
+Homepage: https://github.com/Vigilans/hv_vmsmb
+
+Package: hv-vmsmb-dkms
+Architecture: all
+Depends: ${misc:Depends}, dkms
+Description: Hyper-V VSMB filesystem client kernel module (DKMS)
+ DKMS package for hv_vmsmb, a Linux kernel module that implements
+ a VSMB (Virtual SMB) filesystem client over Hyper-V VMBus.
+ .
+ VSMB is Hyper-V's native file sharing mechanism, used internally
+ by Windows Containers and Windows Sandbox. This module provides
+ shared folder access between host and Linux guest with significantly
+ better performance than Plan9 (9p) shares.
+ .
+ The module auto-loads via VMBus modalias when a VSMB channel is present.

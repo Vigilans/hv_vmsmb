@@ -26,6 +26,20 @@ sudo dkms install hv-vmsmb/0.1.0
 
 Arch Linux: an AUR package is available in `pkg/arch/`.
 
+Debian/Ubuntu: `make deb` builds a `.deb` package (requires `dpkg-dev` and `debhelper`):
+
+```bash
+make deb
+sudo dpkg -i ../hv-vmsmb-dkms_0.1.0-1_all.deb
+```
+
+Fedora/RHEL: `make rpm` builds an RPM (requires `rpm-build`):
+
+```bash
+make rpm
+sudo rpm -i rpmbuild/RPMS/noarch/hv-vmsmb-dkms-0.1.0-1.*.noarch.rpm
+```
+
 ### Mount
 
 ```bash

@@ -1,0 +1,5 @@
+hv-vmsmb-dkms (0.1.0-1) unstable; urgency=medium
+
+  * Initial DKMS packaging.
+
+ -- Vigilans <vigilans@foxmail.com>  Sun, 19 Apr 2026 19:24:17 +0800

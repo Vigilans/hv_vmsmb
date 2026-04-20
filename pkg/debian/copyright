@@ -1,0 +1,29 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: hv-vmsmb
+Upstream-Contact: Vigilans <vigilans@foxmail.com>
+Source: https://github.com/Vigilans/hv_vmsmb
+
+Files: *
+Copyright: 2025-2026 Vigilans
+License: GPL-2.0-only
+
+Files: smb2pdu.h smb2status.h fscc.h smbfsctl.h smb1pdu.h
+Copyright: Linux kernel contributors
+License: LGPL-2.1-only
+Comment: Derived from Linux kernel fs/smb/common/ headers.
+
+License: GPL-2.0-only
+ This program is free software; you can redistribute it and/or modify
+ it under the terms of the GNU General Public License version 2
+ as published by the Free Software Foundation.
+ .
+ On Debian systems, the full text of the GNU General Public License
+ version 2 can be found in /usr/share/common-licenses/GPL-2.
+
+License: LGPL-2.1-only
+ This library is free software; you can redistribute it and/or modify
+ it under the terms of the GNU Lesser General Public License version 2.1
+ as published by the Free Software Foundation.
+ .
+ On Debian systems, the full text of the GNU Lesser General Public
+ License version 2.1 can be found in /usr/share/common-licenses/LGPL-2.1.
