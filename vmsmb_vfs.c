@@ -454,8 +454,27 @@ static int vmsmb_d_revalidate(struct inode *dir, const struct qstr *name,
 	}
 
 	vi = VMSMB_I(inode);
-	if (time_after(jiffies, vi->meta_expires))
-		return 0;		/* stale — force re-lookup */
+	if (time_after(jiffies, vi->meta_expires)) {
+		struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
+		struct vmsmb_session *sess = sbi->sess;
+		struct vmsmb_file_info info;
+		char *path;
+		int ret;
+
+		path = vmsmb_build_path(dentry);
+		if (IS_ERR(path))
+			return 1;
+
+		ret = vmsmb_smb2_create_close(sess, sbi->tree_id, path,
+					      FILE_READ_ATTRIBUTES,
+					      OPEN_REPARSE_POINT, &info);
+		kfree(path);
+
+		if (ret == -ENOENT || ret == -ESTALE)
+			return 0;
+		if (ret == 0)
+			vmsmb_refresh_inode(inode, &info);
+	}
 
 	return 1;
 }
