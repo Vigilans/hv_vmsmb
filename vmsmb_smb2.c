@@ -897,19 +897,29 @@ int vmsmb_smb2_create_ioctl_close(struct vmsmb_session *sess, u32 tree_id,
 	const struct smb2_hdr *hdr1, *hdr2, *hdr3;
 	__le16 *name_utf16;
 	int name_len;
-	u32 resp_len;
+	u32 resp_len, resp_buf_size;
 	u32 create_pdu_len, ioctl_pdu_off, ioctl_pdu_len, close_pdu_off, total_len;
 	u32 pdu2_resp_off, pdu2_resp_remaining, rsp_out_off, rsp_out_len;
 	u32 next1, next2;
 	int ret;
 
-	resp_buf = kmalloc(VMSMB_MAX_IO_RESPONSE, GFP_KERNEL);
+	/*
+	 * Size response buffer to actual need: compound response is
+	 * CREATE_rsp(~88) + IOCTL_rsp(48 + out_size) + CLOSE_rsp(60) +
+	 * compound alignment slack. 1 KB overhead is generous.
+	 *
+	 * kvmalloc so callers passing larger out_size (e.g. future bulk
+	 * IOCTLs) don't hit order-N physical-contiguity failures under
+	 * memory fragmentation — vmalloc fallback uses non-contiguous pages.
+	 */
+	resp_buf_size = out_size + 1024;
+	resp_buf = kvmalloc(resp_buf_size, GFP_KERNEL);
 	if (!resp_buf)
 		return -ENOMEM;
 
 	name_utf16 = vmsmb_path_to_utf16(path, &name_len);
 	if (!name_utf16) {
-		kfree(resp_buf);
+		kvfree(resp_buf);
 		return -ENOMEM;
 	}
 
@@ -922,7 +932,7 @@ int vmsmb_smb2_create_ioctl_close(struct vmsmb_session *sess, u32 tree_id,
 	pdu_buf = kzalloc(total_len, GFP_KERNEL);
 	if (!pdu_buf) {
 		kfree(name_utf16);
-		kfree(resp_buf);
+		kvfree(resp_buf);
 		return -ENOMEM;
 	}
 
@@ -976,7 +986,7 @@ int vmsmb_smb2_create_ioctl_close(struct vmsmb_session *sess, u32 tree_id,
 		 path, ctl_code, total_len);
 
 	ret = vmsmb_smb2_transact(sess, pdu_buf, total_len,
-				  resp_buf, VMSMB_MAX_IO_RESPONSE, &resp_len);
+				  resp_buf, resp_buf_size, &resp_len);
 	kfree(pdu_buf);
 	if (ret)
 		goto out;
@@ -1044,7 +1054,7 @@ int vmsmb_smb2_create_ioctl_close(struct vmsmb_session *sess, u32 tree_id,
 			 le32_to_cpu(hdr3->Status));
 
 out:
-	kfree(resp_buf);
+	kvfree(resp_buf);
 	return ret;
 }
 
