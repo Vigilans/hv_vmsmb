@@ -1024,6 +1024,7 @@ const struct address_space_operations vmsmb_aops = {
 	.writepages	= netfs_writepages,
 	.release_folio	= netfs_release_folio,
 	.invalidate_folio = netfs_invalidate_folio,
+	.migrate_folio	= filemap_migrate_folio,
 	.direct_IO	= noop_direct_IO,
 };
 
