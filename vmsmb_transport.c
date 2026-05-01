@@ -51,9 +51,11 @@
 static void vmsmb_async_work(struct work_struct *work)
 {
 	struct vmsmb_request *req = container_of(work, struct vmsmb_request, work);
+	struct vmsmb_session *sess = req->sess;
 
 	req->async_cb(req);
 	/* async_cb owns req from here — it must kfree. */
+	up(&sess->async_slots);
 }
 
 /*
@@ -374,6 +376,7 @@ int vmsmb_open_channel(struct vmsmb_session *sess)
 
 	sess->channel = ch;
 	mutex_init(&sess->send_mutex);
+	sema_init(&sess->async_slots, VMSMB_MAX_ASYNC_INFLIGHT);
 	spin_lock_init(&sess->pending_lock);
 	INIT_LIST_HEAD(&sess->pending_requests);
 	sess->current_recv = NULL;
@@ -608,7 +611,16 @@ static int vmsmb_submit(struct vmsmb_session *sess,
 				       0, VM_PKT_DATA_INBAND, 0);
 		if (ret != -EAGAIN)
 			break;
+		/*
+		 * Ring buffer is full. Release the mutex while we sleep so
+		 * other senders (especially small READ PDUs) can interleave —
+		 * holding the mutex across all retries serializes the entire
+		 * send path on the slowest writer. The host drains outbound
+		 * asynchronously, so progress can happen while we wait.
+		 */
+		mutex_unlock(&sess->send_mutex);
 		usleep_range(100, 500);
+		mutex_lock(&sess->send_mutex);
 	}
 	mutex_unlock(&sess->send_mutex);
 	kfree(send_buf);
@@ -657,11 +669,19 @@ int vmsmb_smb2_submit_async(struct vmsmb_session *sess,
 	INIT_LIST_HEAD(&req->list);
 	init_completion(&req->done);
 	req->status = -EINPROGRESS;
+	req->sess = sess;
 	req->async_cb = async_cb;
 	req->async_priv = async_priv;
 
+	if (down_interruptible(&sess->async_slots)) {
+		kvfree(req->response_buf);
+		kfree(req);
+		return -EINTR;
+	}
+
 	ret = vmsmb_submit(sess, smb2_req, req_len, req);
 	if (ret) {
+		up(&sess->async_slots);
 		kvfree(req->response_buf);
 		kfree(req);
 		return ret;

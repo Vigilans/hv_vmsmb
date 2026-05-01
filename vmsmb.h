@@ -10,6 +10,7 @@
 #include <linux/hyperv.h>
 #include <linux/completion.h>
 #include <linux/mutex.h>
+#include <linux/semaphore.h>
 #include <linux/atomic.h>
 #include <linux/types.h>
 #include <linux/fs.h>
@@ -61,6 +62,22 @@
 
 /* Max send retries on EAGAIN (ring buffer backpressure) */
 #define VMSMB_SEND_MAX_RETRIES	100
+
+/*
+ * Max concurrent async requests.
+ *
+ * Sized to outbound ring capacity for worst-case (write-heavy) load:
+ *   1 MB outbound ring / 65 KB per WRITE PDU = ~16 in-flight WRITEs.
+ *
+ * Without this cap, multi-threaded writers (e.g. huggingface_hub's xet
+ * backend with 25+ workers) overflow the ring → vmbus_sendpacket returns
+ * EAGAIN → SEND_MAX_RETRIES exhausts → transact errors and channel wedge.
+ *
+ * Reads cost ~50 bytes outbound each so this same limit is generous for
+ * read-heavy load. Inbound ring (response side) is naturally bounded by
+ * how fast we drain in channel_cb, so no separate cap needed there.
+ */
+#define VMSMB_MAX_ASYNC_INFLIGHT	16
 
 /*
  * VMBus pipe header — required for pipe-mode channels.
@@ -153,6 +170,7 @@ struct vmsmb_file_info {
 struct vmsmb_request {
 	struct list_head list;		/* in sess->pending_requests */
 	u64 message_id;			/* SMB2 MessageId for matching */
+	struct vmsmb_session *sess;	/* back-pointer for async slot release */
 
 	/* Response buffer (caller-owned for sync, req-owned for async) */
 	void *response_buf;
@@ -192,6 +210,9 @@ struct vmsmb_session {
 
 	/* Send serialization (ring buffer write is not concurrent-safe) */
 	struct mutex send_mutex;
+
+	/* Async in-flight limiter (prevents host overload) */
+	struct semaphore async_slots;
 
 	/* Pending request tracking */
 	spinlock_t pending_lock;
