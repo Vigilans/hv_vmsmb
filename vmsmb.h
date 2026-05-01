@@ -10,7 +10,8 @@
 #include <linux/hyperv.h>
 #include <linux/completion.h>
 #include <linux/mutex.h>
-#include <linux/semaphore.h>
+#include <linux/spinlock.h>
+#include <linux/wait.h>
 #include <linux/atomic.h>
 #include <linux/types.h>
 #include <linux/fs.h>
@@ -64,20 +65,19 @@
 #define VMSMB_SEND_MAX_RETRIES	100
 
 /*
- * Max concurrent async requests.
+ * Initial SMB2 credit pool — minimum to send NEGOTIATE.
  *
- * Sized to outbound ring capacity for worst-case (write-heavy) load:
- *   1 MB outbound ring / 65 KB per WRITE PDU = ~16 in-flight WRITEs.
+ * Per MS-SMB2 §3.2.4.1.2, the client starts with one implicit credit so it
+ * can send the initial NEGOTIATE; the server's NEGOTIATE response grants
+ * the real pool via the CreditRequest field. Subsequent responses
+ * replenish; sends decrement by CreditCharge.
  *
- * Without this cap, multi-threaded writers (e.g. huggingface_hub's xet
- * backend with 25+ workers) overflow the ring → vmbus_sendpacket returns
- * EAGAIN → SEND_MAX_RETRIES exhausts → transact errors and channel wedge.
- *
- * Reads cost ~50 bytes outbound each so this same limit is generous for
- * read-heavy load. Inbound ring (response side) is naturally bounded by
- * how fast we drain in channel_cb, so no separate cap needed there.
+ * This supersedes the earlier VMSMB_MAX_ASYNC_INFLIGHT semaphore: credit
+ * gating is the protocol-correct way to bound in-flight requests, since
+ * the server's MID window — not the ring buffer or guest concurrency — is
+ * what wedges the channel under burst.
  */
-#define VMSMB_MAX_ASYNC_INFLIGHT	16
+#define VMSMB_INITIAL_CREDITS	1
 
 /*
  * VMBus pipe header — required for pipe-mode channels.
@@ -211,8 +211,23 @@ struct vmsmb_session {
 	/* Send serialization (ring buffer write is not concurrent-safe) */
 	struct mutex send_mutex;
 
-	/* Async in-flight limiter (prevents host overload) */
-	struct semaphore async_slots;
+	/*
+	 * SMB2 credit pool — gates send rate to the server's MID window.
+	 *
+	 * Sender path: walks the (possibly compound) request, sums CreditCharge
+	 * across PDUs, waits until pool >= total, then decrements.  Receiver
+	 * path: walks the response, sums CreditRequest fields, adds to pool,
+	 * wakes waiters.  Without this, bursty sends (e.g. 18 READs in 3 ms
+	 * during process restart) outrun the server's CommandSequenceWindow,
+	 * which then rejects MIDs with STATUS_INVALID_PARAMETER and never
+	 * recovers — the wedge symptom we observed via ETW.
+	 *
+	 * Models CIFS server->credits / wait_for_free_credits()
+	 * (fs/smb/client/transport.c).
+	 */
+	spinlock_t credit_lock;
+	int credits_available;
+	wait_queue_head_t credit_wait;
 
 	/* Pending request tracking */
 	spinlock_t pending_lock;

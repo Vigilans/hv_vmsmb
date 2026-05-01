@@ -51,17 +51,140 @@
 static void vmsmb_async_work(struct work_struct *work)
 {
 	struct vmsmb_request *req = container_of(work, struct vmsmb_request, work);
-	struct vmsmb_session *sess = req->sess;
 
 	req->async_cb(req);
 	/* async_cb owns req from here — it must kfree. */
-	up(&sess->async_slots);
+}
+
+/*
+ * SMB2 credit accounting — walks the (possibly compound) PDU chain in @buf
+ * and sums CreditCharge (request side) or CreditRequest (response side).
+ *
+ * SMB 2.1 dialect always uses CreditCharge=1 per PDU, so the walk reduces
+ * to "PDU count" for charges; we read the field anyway for correctness if
+ * a future caller bumps it (e.g. SMB3.x large MTU credit charging).
+ *
+ * Bound by @len so a malformed chain or truncated response cannot run off
+ * the end of the buffer.
+ *
+ * Models CIFS smb2_check_message() credit accounting
+ * (fs/smb/client/smb2misc.c).
+ */
+static u16 vmsmb_walk_pdu_charges(const void *buf, u32 len)
+{
+	u32 off = 0;
+	u16 total = 0;
+
+	while (off + sizeof(struct smb2_hdr) <= len) {
+		const struct smb2_hdr *h = (const struct smb2_hdr *)((const u8 *)buf + off);
+		u16 c = le16_to_cpu(h->CreditCharge);
+		u32 next = le32_to_cpu(h->NextCommand);
+
+		total += c ? c : 1;	/* MS-SMB2: 0 ≡ 1 for SMB 2.0.2/2.1 */
+		if (!next || next < sizeof(struct smb2_hdr))
+			break;
+		if (off + next > len)
+			break;
+		off += next;
+	}
+	return total;
+}
+
+static u16 vmsmb_walk_pdu_grants(const void *buf, u32 len)
+{
+	u32 off = 0;
+	u16 total = 0;
+
+	while (off + sizeof(struct smb2_hdr) <= len) {
+		const struct smb2_hdr *h = (const struct smb2_hdr *)((const u8 *)buf + off);
+		u32 next = le32_to_cpu(h->NextCommand);
+
+		total += le16_to_cpu(h->CreditRequest);
+		if (!next || next < sizeof(struct smb2_hdr))
+			break;
+		if (off + next > len)
+			break;
+		off += next;
+	}
+	return total;
+}
+
+/*
+ * Wait until @charge credits are available, atomically reserving them.
+ *
+ * Sender path only — runs in process context.  Uses spin_lock_bh because
+ * the granter (vmsmb_grant_credits) runs in softirq.  Returns -EINTR if
+ * a fatal signal arrives during the wait.
+ *
+ * Models CIFS wait_for_free_credits() (fs/smb/client/transport.c).
+ */
+static int vmsmb_acquire_credits(struct vmsmb_session *sess, u16 charge)
+{
+	DEFINE_WAIT(wait);
+	int ret = 0;
+
+	spin_lock_bh(&sess->credit_lock);
+	for (;;) {
+		if (sess->credits_available >= (int)charge) {
+			sess->credits_available -= (int)charge;
+			break;
+		}
+		prepare_to_wait(&sess->credit_wait, &wait, TASK_INTERRUPTIBLE);
+		spin_unlock_bh(&sess->credit_lock);
+
+		if (signal_pending(current)) {
+			ret = -EINTR;
+			finish_wait(&sess->credit_wait, &wait);
+			return ret;
+		}
+		schedule();
+		finish_wait(&sess->credit_wait, &wait);
+		spin_lock_bh(&sess->credit_lock);
+	}
+	spin_unlock_bh(&sess->credit_lock);
+	return ret;
+}
+
+/*
+ * Add @grant credits back to the pool and wake one waiter.
+ *
+ * Receiver path: called from the channel callback (softirq) once a
+ * response has been fully assembled.  Plain spin_lock is sufficient
+ * because senders use spin_lock_bh.
+ */
+static void vmsmb_grant_credits(struct vmsmb_session *sess, u16 grant)
+{
+	if (grant == 0)
+		return;
+	spin_lock(&sess->credit_lock);
+	sess->credits_available += (int)grant;
+	spin_unlock(&sess->credit_lock);
+	wake_up(&sess->credit_wait);
+}
+
+/*
+ * Return @charge credits to the pool — used when send fails before the
+ * request reaches the wire (vmbus_sendpacket error / OOM after
+ * acquire).  Process context, must use spin_lock_bh.
+ */
+static void vmsmb_refund_credits(struct vmsmb_session *sess, u16 charge)
+{
+	if (charge == 0)
+		return;
+	spin_lock_bh(&sess->credit_lock);
+	sess->credits_available += (int)charge;
+	spin_unlock_bh(&sess->credit_lock);
+	wake_up(&sess->credit_wait);
 }
 
 /*
  * Called from channel_cb (softirq) when a response for @req is complete.
  * Routes to either the sync completion (wakes wait_for_completion_timeout)
  * or the async workqueue (runs async_cb in process context).
+ *
+ * Before signaling, walks the response PDU chain and adds the granted
+ * credits back to the session pool, waking any blocked senders.  This is
+ * the protocol-correct mirror of vmsmb_acquire_credits() on send.
  *
  * Simplified from CIFS handle_mid() dispatch (fs/smb/client/connect.c):
  * CIFS invokes a uniform mid->callback(mid) — sync mids register
@@ -71,8 +194,19 @@ static void vmsmb_async_work(struct work_struct *work)
  */
 static inline void vmsmb_complete_req(struct vmsmb_request *req)
 {
+	const u32 stream_hdr_size = sizeof(struct smb2_stream_hdr);
+
 	req->response_len = req->recv_offset;
 	req->status = 0;
+
+	if (req->response_len > stream_hdr_size) {
+		const void *smb2 = (const u8 *)req->response_buf + stream_hdr_size;
+		u32 smb2_len = req->response_len - stream_hdr_size;
+
+		vmsmb_grant_credits(req->sess,
+				    vmsmb_walk_pdu_grants(smb2, smb2_len));
+	}
+
 	if (req->async_cb) {
 		INIT_WORK(&req->work, vmsmb_async_work);
 		schedule_work(&req->work);
@@ -376,7 +510,9 @@ int vmsmb_open_channel(struct vmsmb_session *sess)
 
 	sess->channel = ch;
 	mutex_init(&sess->send_mutex);
-	sema_init(&sess->async_slots, VMSMB_MAX_ASYNC_INFLIGHT);
+	spin_lock_init(&sess->credit_lock);
+	init_waitqueue_head(&sess->credit_wait);
+	sess->credits_available = VMSMB_INITIAL_CREDITS;
 	spin_lock_init(&sess->pending_lock);
 	INIT_LIST_HEAD(&sess->pending_requests);
 	sess->current_recv = NULL;
@@ -578,17 +714,35 @@ static int vmsmb_submit(struct vmsmb_session *sess,
 	const struct smb2_hdr *smb2h;
 	u8 *send_buf;
 	u32 send_pkt_len;
+	u16 charge;
 	int ret, send_retries;
 
 	if (req_len < sizeof(struct smb2_hdr))
 		return -EINVAL;
 	smb2h = (const struct smb2_hdr *)smb2_req;
 	req->message_id = le64_to_cpu(smb2h->MessageId);
+	req->sess = sess;
+
+	/* Sum CreditCharge across the (possibly compound) request */
+	charge = vmsmb_walk_pdu_charges(smb2_req, req_len);
+	if (charge == 0)
+		charge = 1;
+
+	/*
+	 * Gate on credits *before* allocating send_buf so we can return
+	 * -EINTR cleanly without leaking memory.  Server's MID window
+	 * dictates how many requests it will accept; we mirror it.
+	 */
+	ret = vmsmb_acquire_credits(sess, charge);
+	if (ret)
+		return ret;
 
 	send_pkt_len = sizeof(struct vmpipe_hdr) + stream_hdr_size + req_len;
 	send_buf = kmalloc(send_pkt_len, GFP_KERNEL);
-	if (!send_buf)
+	if (!send_buf) {
+		vmsmb_refund_credits(sess, charge);
 		return -ENOMEM;
+	}
 
 	pipe = (struct vmpipe_hdr *)send_buf;
 	pipe->pkt_type = cpu_to_le32(VMPIPE_TYPE_DATA);
@@ -630,6 +784,7 @@ static int vmsmb_submit(struct vmsmb_session *sess,
 		spin_lock_bh(&sess->pending_lock);
 		list_del_init(&req->list);
 		spin_unlock_bh(&sess->pending_lock);
+		vmsmb_refund_credits(sess, charge);
 	}
 	return ret;
 }
@@ -673,15 +828,8 @@ int vmsmb_smb2_submit_async(struct vmsmb_session *sess,
 	req->async_cb = async_cb;
 	req->async_priv = async_priv;
 
-	if (down_interruptible(&sess->async_slots)) {
-		kvfree(req->response_buf);
-		kfree(req);
-		return -EINTR;
-	}
-
 	ret = vmsmb_submit(sess, smb2_req, req_len, req);
 	if (ret) {
-		up(&sess->async_slots);
 		kvfree(req->response_buf);
 		kfree(req);
 		return ret;
