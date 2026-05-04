@@ -108,6 +108,20 @@
 #define VMSMB_MAX_CREDITS		8192
 
 /*
+ * Initial adaptive target_window (mrxsmb's `target_window` init value).
+ *
+ * Mirrors `+0x90 target_window` initialization in
+ * SmbCeAllocateCreditTransport @0x1c00156eb (init 2).  Floor for the
+ * EWMA-driven shrink path; bucket 16-17 (>4.25s avg latency) divides by
+ * 2 each response, so without a floor it would collapse to 0 and stall.
+ *
+ * 2 is enough to keep the channel breathing during catastrophic latency
+ * (one CREATE+CLOSE compound = charge 2 fits exactly), so timed-out
+ * sends still drain and senders eventually wake.
+ */
+#define VMSMB_INITIAL_TARGET_WINDOW	2
+
+/*
  * Reserve-side wait timeout (ms).
  *
  * If the send admission gate (live_window / outstanding) keeps a sender
@@ -209,6 +223,7 @@ struct vmsmb_request {
 	u64 message_id;			/* SMB2 MessageId, assigned by reserve_credits */
 	u16 credit_charge;		/* CC at reserve time, freed back on release */
 	struct vmsmb_session *sess;	/* back-pointer for async slot release */
+	ktime_t send_tick;		/* set in reserve_credits; used by EWMA */
 
 	/* Response buffer (caller-owned for sync, req-owned for async) */
 	void *response_buf;
@@ -284,6 +299,39 @@ struct vmsmb_session {
 	atomic_t ct_pending_grant;	/* lockless receive-side accumulator */
 	u32    ct_max_credits;		/* mid_table capacity, init 128, doubles to 8192 */
 	struct vmsmb_request **ct_mid_table; /* size = ct_max_credits */
+
+	/*
+	 * EWMA latency feedback for adaptive target_window (mrxsmb-derived).
+	 *
+	 * On every release the response latency is folded into ct_avg_lat_us
+	 * via mrxsmb's EWMA formula (SmbCeDemuxResponseAndAccumulateCredits
+	 * @0x1c000217c..0x1c00021bc):
+	 *
+	 *   avg = (elapsed_us + max(outstanding, 8) * old_avg)
+	 *         / (max(outstanding, 8) + credit_charge)
+	 *
+	 * The 18-entry bucket table at DAT_1c0072270 then maps avg latency
+	 * into a multiplicative or additive op on ct_target_window:
+	 *
+	 *   bucket = clamp((2 * avg_us) / 500000, 0, 17)
+	 *
+	 * Buckets 0-7 grow target (x4..x5/4); 8-10 add (+4..+1); 11-12
+	 * subtract (-1, -2); 13-17 shrink (x7/8..x1/2).  ct_target_window
+	 * is clamped to [VMSMB_INITIAL_TARGET_WINDOW=2, ct_max_credits].
+	 *
+	 * The send admission gate uses target_window (not max_credits) as
+	 * the upper bound that competes with outstanding:
+	 *
+	 *   bound = max(min(live_window, target_window), outstanding)
+	 *
+	 * When server enters sustained CR=0 flow control (vmusrv path #3
+	 * zero-grant), per-request latency rises -> bucket index rises ->
+	 * target_window shrinks -> outstanding cap shrinks -> in-flight
+	 * count auto-throttles below ring saturation, avoiding Mode A
+	 * over-send.
+	 */
+	u64    ct_avg_lat_us;		/* EWMA average response latency, microseconds */
+	u32    ct_target_window;	/* adaptive target, init 2, clamped to max_credits */
 
 	/* Stream reassembly state (channel_cb context, single-threaded) */
 	struct vmsmb_request *current_recv;

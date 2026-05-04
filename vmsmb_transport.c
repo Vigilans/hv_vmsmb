@@ -146,6 +146,8 @@ void vmsmb_credit_reset(struct vmsmb_session *sess)
 	sess->ct_outstanding = 0;
 	sess->ct_live_window = VMSMB_INITIAL_CREDITS;
 	atomic_set(&sess->ct_pending_grant, 0);
+	sess->ct_avg_lat_us  = 0;
+	sess->ct_target_window = VMSMB_INITIAL_TARGET_WINDOW;
 	if (sess->ct_mid_table)
 		memset(sess->ct_mid_table, 0,
 		       sess->ct_max_credits * sizeof(*sess->ct_mid_table));
@@ -181,11 +183,132 @@ static void vmsmb_fold_pending_locked(struct vmsmb_session *sess)
 /*
  * Effective-avail predicate.  Caller must hold ct_lock.
  */
+/*
+ * mrxsmb 18-bucket EWMA target_window adaptation table
+ * (DAT_1c0072270 in mrxsmb.sys Win11 26100).
+ *
+ * Each entry is {op, a, b}:
+ *   op=0  -> target = (target * a) / b      (multiplicative)
+ *   op=1  -> target = target + a - b        (additive, b is subtracted)
+ *
+ * Bucket index is computed in vmsmb_ewma_update_locked from the EWMA
+ * average response latency (microseconds):
+ *
+ *   bucket = clamp((2 * avg_us) / 500000, 0, 17)
+ *
+ * 250000us per bucket step; bucket 0 covers [0..250ms], bucket 17 is
+ * the >4.25s saturation slot.  See mrxsmb.md (re-analyst memory) for
+ * the recovered table from disasm of
+ * SmbCeDemuxResponseAndAccumulateCredits @0x1c00022a0..0x1c00032c7.
+ *
+ * Net effect:
+ *   buckets 0-7 grow target_window aggressively (x4..x5/4)
+ *   buckets 8-10 add small constants (+4, +2, +1)
+ *   buckets 11-12 subtract (-1, -2)
+ *   buckets 13-17 shrink multiplicatively (x7/8..x1/2)
+ *
+ * After op, target_window is clamped to
+ * [VMSMB_INITIAL_TARGET_WINDOW, ct_max_credits].
+ */
+static const struct {
+	u8 op;
+	u8 a;
+	u8 b;
+} vmsmb_target_buckets[18] = {
+	{ 0, 4, 1 },	/*  0: x4   */
+	{ 0, 4, 1 },	/*  1: x4   */
+	{ 0, 3, 1 },	/*  2: x3   */
+	{ 0, 2, 1 },	/*  3: x2   */
+	{ 0, 2, 1 },	/*  4: x2   */
+	{ 0, 7, 4 },	/*  5: x7/4 */
+	{ 0, 3, 2 },	/*  6: x3/2 */
+	{ 0, 5, 4 },	/*  7: x5/4 */
+	{ 1, 4, 0 },	/*  8: +4   */
+	{ 1, 2, 0 },	/*  9: +2   */
+	{ 1, 1, 0 },	/* 10: +1   */
+	{ 1, 0, 1 },	/* 11: -1   */
+	{ 1, 0, 2 },	/* 12: -2   */
+	{ 0, 7, 8 },	/* 13: x7/8 */
+	{ 0, 7, 8 },	/* 14: x7/8 */
+	{ 0, 3, 4 },	/* 15: x3/4 */
+	{ 0, 1, 2 },	/* 16: x1/2 */
+	{ 0, 1, 2 },	/* 17: x1/2 */
+};
+
+/*
+ * Update EWMA average latency, derive bucket, apply target_window op.
+ * Caller must hold ct_lock; @elapsed_us is the just-completed request's
+ * response latency in microseconds, @charge is its credit_charge.
+ *
+ * EWMA formula (mrxsmb SmbCeDemuxResponseAndAccumulateCredits
+ *   @0x1c000217c..0x1c00021bc):
+ *
+ *     avg_new = (elapsed_us + max(outstanding, 8) * avg_old)
+ *               / (max(outstanding, 8) + charge)
+ *
+ * max(outstanding, 8) dampens EWMA changes at low queue depth to avoid
+ * single-sample spikes dominating the moving average.
+ */
+static void vmsmb_ewma_update_locked(struct vmsmb_session *sess,
+				     u64 elapsed_us, u16 charge)
+{
+	u64 weight = max_t(u32, sess->ct_outstanding, 8U);
+	u64 numer = elapsed_us + weight * sess->ct_avg_lat_us;
+	u64 denom = weight + (u64)charge;
+	u32 bucket;
+	u32 target;
+
+	if (denom)
+		sess->ct_avg_lat_us = numer / denom;
+
+	/* bucket = (2 * avg_us) / 500000, clamped to [0, 17] */
+	bucket = (u32)((2 * sess->ct_avg_lat_us) / 500000ULL);
+	if (bucket > 17)
+		bucket = 17;
+
+	target = sess->ct_target_window;
+	if (vmsmb_target_buckets[bucket].op == 0) {
+		/* multiplicative: target = (target * a) / b */
+		u8 a = vmsmb_target_buckets[bucket].a;
+		u8 b = vmsmb_target_buckets[bucket].b;
+
+		if (b)
+			target = (u32)(((u64)target * a) / b);
+	} else {
+		/* additive: target = target + a - b */
+		u8 a = vmsmb_target_buckets[bucket].a;
+		u8 b = vmsmb_target_buckets[bucket].b;
+
+		if (target + a >= b)
+			target = target + a - b;
+		else
+			target = 0;
+	}
+
+	if (target < VMSMB_INITIAL_TARGET_WINDOW)
+		target = VMSMB_INITIAL_TARGET_WINDOW;
+	if (target > sess->ct_max_credits)
+		target = sess->ct_max_credits;
+
+	sess->ct_target_window = target;
+}
+
+/*
+ * Effective-avail predicate.  Caller must hold ct_lock.
+ *
+ * bound = max(min(live_window, target_window), outstanding)
+ *
+ * target_window is the EWMA-adapted upper bound (init 2, grows to
+ * max_credits under low latency, shrinks toward 2 under high latency).
+ * It dominates over max_credits in the gate, so when the server enters
+ * sustained CR=0 flow control and per-request latency rises, the
+ * outstanding cap auto-shrinks below ring saturation.
+ */
 static bool vmsmb_can_reserve_locked(struct vmsmb_session *sess, u16 charge)
 {
 	u32 bound;
 
-	bound = min(sess->ct_live_window, sess->ct_max_credits);
+	bound = min(sess->ct_live_window, sess->ct_target_window);
 	if (bound < sess->ct_outstanding)
 		bound = sess->ct_outstanding;
 	if (bound < (u32)charge)
@@ -358,6 +481,7 @@ retry:
 	}
 
 	req->credit_charge = total_charge;
+	req->send_tick = ktime_get();
 	sess->ct_outstanding += total_charge;
 	spin_unlock_bh(&sess->ct_lock);
 	return 0;
@@ -426,6 +550,22 @@ static void vmsmb_release_mid(struct vmsmb_session *sess,
 			sess->ct_outstanding -= freed;
 		else
 			sess->ct_outstanding = 0;
+	}
+
+	/*
+	 * EWMA latency feedback -> target_window adaptation.
+	 *
+	 * mrxsmb runs this on every demux response, before the credit
+	 * release.  Computing it here (post-clear, pre-fold) keeps the
+	 * formula's `outstanding` matching the post-release value used in
+	 * the original (mrxsmb subtracts before EWMA at +0x1c000217c).
+	 */
+	{
+		s64 elapsed_ns = ktime_to_ns(ktime_sub(ktime_get(),
+						       req->send_tick));
+		u64 elapsed_us = elapsed_ns > 0 ? (u64)elapsed_ns / 1000 : 0;
+
+		vmsmb_ewma_update_locked(sess, elapsed_us, req->credit_charge);
 	}
 
 	vmsmb_fold_pending_locked(sess);
@@ -833,6 +973,8 @@ int vmsmb_open_channel(struct vmsmb_session *sess)
 	sess->ct_outstanding = 0;
 	sess->ct_live_window = VMSMB_INITIAL_CREDITS;
 	atomic_set(&sess->ct_pending_grant, 0);
+	sess->ct_avg_lat_us  = 0;
+	sess->ct_target_window = VMSMB_INITIAL_TARGET_WINDOW;
 	sess->ct_max_credits = VMSMB_INITIAL_MAX_CREDITS;
 	sess->ct_mid_table = kvzalloc(
 		sess->ct_max_credits * sizeof(*sess->ct_mid_table),
