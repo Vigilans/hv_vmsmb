@@ -1203,7 +1203,7 @@ static int vmsmb_submit(struct vmsmb_session *sess,
 	req->sess = sess;
 
 	send_pkt_len = sizeof(struct vmpipe_hdr) + stream_hdr_size + req_len;
-	send_buf = kmalloc(send_pkt_len, GFP_KERNEL);
+	send_buf = kvmalloc(send_pkt_len, GFP_KERNEL);
 	if (!send_buf)
 		return -ENOMEM;
 
@@ -1227,7 +1227,7 @@ static int vmsmb_submit(struct vmsmb_session *sess,
 	 */
 	ret = vmsmb_reserve_credits(sess, chain, req_len, req);
 	if (ret) {
-		kfree(send_buf);
+		kvfree(send_buf);
 		return ret;
 	}
 
@@ -1249,7 +1249,7 @@ static int vmsmb_submit(struct vmsmb_session *sess,
 		mutex_lock(&sess->send_mutex);
 	}
 	mutex_unlock(&sess->send_mutex);
-	kfree(send_buf);
+	kvfree(send_buf);
 
 	if (ret) {
 		pr_err("vmbus_sendpacket failed: %d\n", ret);
