@@ -53,7 +53,12 @@ static void vmsmb_fill_hdr(struct smb2_hdr *hdr, u16 command,
 	 * chunking (VMSMB_MAX_WRITE_CHUNK ≈ 65K, control PDUs ≤ 4K).
 	 */
 	hdr->CreditRequest = cpu_to_le16(64);
-	hdr->MessageId = cpu_to_le64(atomic64_inc_return(&sess->message_id) - 1);
+	/*
+	 * MessageId is left zero here; vmsmb_reserve_credits walks the chain
+	 * in transport context and assigns the actual MID under ct_lock,
+	 * keeping MID allocation atomic with outstanding/mid_table updates
+	 * (mrxsmb.sys-style).
+	 */
 	hdr->Id.SyncId.TreeId = cpu_to_le32(tree_id);
 	hdr->SessionId = cpu_to_le64(sess->session_id);
 }

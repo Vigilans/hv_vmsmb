@@ -80,6 +80,44 @@
 #define VMSMB_INITIAL_CREDITS	1
 
 /*
+ * MID table sizing.
+ *
+ * The MID table is sess->ct_mid_table[mid % ct_max_credits], an O(1)
+ * response-demux index sized to bound the in-flight MID span.  It is a
+ * separate ring from the server's Slots[] but anchored to the same wire
+ * MIDs — the client's mid_table[mid % ct_max_credits] and the server's
+ * Slots[mid % AllocatedWindows] map the same MID through different
+ * modular indices.
+ *
+ * VMSMB_INITIAL_MAX_CREDITS: starting capacity.  Mirrors mrxsmb.sys's
+ * 0x80; doubles via vmsmb_grow_mid_table when outstanding pressure
+ * approaches max_credits.
+ *
+ * VMSMB_MAX_CREDITS: hard ceiling, matching server's VSmbMaxCredits
+ * (vmusrv reads HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\
+ * Virtualization\Containers\VSmbMaxCredits, default 0x2000=8192).  The
+ * server enforces EndMid - StartMid <= MaxWindowSize <= VSmbMaxCredits;
+ * sending past this returns STATUS_INVALID_PARAMETER (0xc00000d0)
+ * silently — recorded in ETW Event 403 but no response on the wire.
+ * Once outstanding hits this cap, vmsmb_grow_mid_table refuses to grow
+ * further and reserve_credits queues senders.
+ *
+ * Memory: 8192 slots × sizeof(void *) = 64 KB per session, kvzalloc'd.
+ */
+#define VMSMB_INITIAL_MAX_CREDITS	128
+#define VMSMB_MAX_CREDITS		8192
+
+/*
+ * Reserve-side wait timeout (ms).
+ *
+ * If the send admission gate (live_window / outstanding) keeps a sender
+ * blocked beyond this, return -EBUSY.  Surfaces stalls as user-visible
+ * errors instead of silent wedges.  Set to match VMSMB_TIMEOUT_MS so a
+ * stuck reserve fails before its caller's transact timeout.
+ */
+#define VMSMB_SEND_TIMEOUT_MS	VMSMB_TIMEOUT_MS
+
+/*
  * VMBus pipe header — required for pipe-mode channels.
  */
 struct vmpipe_hdr {
@@ -168,8 +206,8 @@ struct vmsmb_file_info {
  *     the request lifetime — it must kfree(req) and kvfree(response_buf).
  */
 struct vmsmb_request {
-	struct list_head list;		/* in sess->pending_requests */
-	u64 message_id;			/* SMB2 MessageId for matching */
+	u64 message_id;			/* SMB2 MessageId, assigned by reserve_credits */
+	u16 credit_charge;		/* CC at reserve time, freed back on release */
 	struct vmsmb_session *sess;	/* back-pointer for async slot release */
 
 	/* Response buffer (caller-owned for sync, req-owned for async) */
@@ -203,7 +241,6 @@ struct vmsmb_session {
 
 	/* SMB2 session state */
 	u64 session_id;
-	atomic64_t message_id;
 	u32 max_read_size;
 	u32 max_write_size;
 	u32 max_transact_size;
@@ -212,26 +249,41 @@ struct vmsmb_session {
 	struct mutex send_mutex;
 
 	/*
-	 * SMB2 credit pool — gates send rate to the server's MID window.
+	 * Credit transport state — mrxsmb.sys-derived rate-agnostic gate.
 	 *
-	 * Sender path: walks the (possibly compound) request, sums CreditCharge
-	 * across PDUs, waits until pool >= total, then decrements.  Receiver
-	 * path: walks the response, sums CreditRequest fields, adds to pool,
-	 * wakes waiters.  Without this, bursty sends (e.g. 18 READs in 3 ms
-	 * during process restart) outrun the server's CommandSequenceWindow,
-	 * which then rejects MIDs with STATUS_INVALID_PARAMETER and never
-	 * recovers — the wedge symptom we observed via ETW.
+	 * The send admission predicate is
 	 *
-	 * Models CIFS server->credits / wait_for_free_credits()
-	 * (fs/smb/client/transport.c).
+	 *   bound = max(min(live_window, max_credits), outstanding)
+	 *   effective_avail = bound - outstanding
+	 *
+	 * which throttles purely on outstanding (in-flight CC sum), not on
+	 * accumulated CR.  When the server emits CR=0 (server-side flow
+	 * control via vmusrv path #3 zero-grant) live_window stops growing,
+	 * outstanding stays high, effective_avail collapses to 0, and senders
+	 * queue on ct_send_wait.  In-flight responses still drain via
+	 * release_mid, which re-opens the gate from below.  Net effect: any
+	 * server zero-rate is tolerated without drifting next_mid past the
+	 * server's actual EndMid.
+	 *
+	 * Models mrxsmb.sys SmbCe* credit transport
+	 * (SmbCeReserveCreditsForBufferContexts, SmbCeApplyCreditGrantAndRelease,
+	 * SmbCeDemuxResponseAndAccumulateCredits, SmbCeGrowCreditMidTable).
+	 *
+	 * ct_lock protects all ct_* fields except ct_pending_grant which is
+	 * lockless atomic_add (drained via xchg under ct_lock).  Process
+	 * context uses spin_lock_bh; channel_cb softirq context uses plain
+	 * spin_lock — receivers do not race with each other because ring
+	 * processing is single-threaded.
 	 */
-	spinlock_t credit_lock;
-	int credits_available;
-	wait_queue_head_t credit_wait;
-
-	/* Pending request tracking */
-	spinlock_t pending_lock;
-	struct list_head pending_requests;
+	spinlock_t  ct_lock;
+	wait_queue_head_t ct_send_wait;
+	u64    ct_oldest_mid;		/* lower bound of in-flight MID span */
+	u64    ct_next_mid;		/* next MID to assign in reserve */
+	u32    ct_outstanding;		/* sum of in-flight CreditCharge */
+	u32    ct_live_window;		/* folded grant accumulator (verbatim CR sum) */
+	atomic_t ct_pending_grant;	/* lockless receive-side accumulator */
+	u32    ct_max_credits;		/* mid_table capacity, init 128, doubles to 8192 */
+	struct vmsmb_request **ct_mid_table; /* size = ct_max_credits */
 
 	/* Stream reassembly state (channel_cb context, single-threaded) */
 	struct vmsmb_request *current_recv;
@@ -297,6 +349,7 @@ extern const struct address_space_operations vmsmb_aops;
 /* vmsmb_transport.c */
 int vmsmb_open_channel(struct vmsmb_session *sess);
 void vmsmb_close_channel(struct vmsmb_session *sess);
+void vmsmb_credit_reset(struct vmsmb_session *sess);
 int vmsmb_negotiate_version(struct vmsmb_session *sess);
 int vmsmb_smb2_transact(struct vmsmb_session *sess,
 			const void *smb2_req, u32 req_len,

@@ -70,7 +70,7 @@ static int vmsmb_probe(struct hv_device *dev,
 			msleep(500 * retries);
 		}
 
-		atomic64_set(&sess->message_id, 0);
+		vmsmb_credit_reset(sess);
 		ret = vmsmb_smb2_negotiate(sess);
 		if (ret)
 			continue;
