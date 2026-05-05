@@ -13,6 +13,7 @@
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 #include <linux/atomic.h>
+#include <linux/refcount.h>
 #include <linux/types.h>
 #include <linux/fs.h>
 #include <linux/netfs.h>
@@ -361,9 +362,23 @@ struct vmsmb_sb_info {
 
 /*
  * Per-open-file private data.
+ *
+ * Refcounted so that pending netfs I/O requests hold the ctx alive past
+ * user-space close().  CLOSE PDU is sent only when the last reference
+ * drops, ensuring no in-flight WRITE PDUs race the file teardown — which
+ * would otherwise let the host-side NTFS IoManager auto-cancel them as
+ * part of NtClose handle cleanup, producing the silent-drop wedge.
+ *
+ * Mirrors CIFS struct cifsFileInfo (count + file_info_lock); each
+ * cifs_init_request takes a ref via cifsFileInfo_get, cifs_free_request
+ * drops it via cifsFileInfo_put, and _cifsFileInfo_put only sends the
+ * SMB2 CLOSE when its decrement reaches zero.
  */
 struct vmsmb_file_ctx {
 	struct vmsmb_fid fid;
+	refcount_t ref;
+	struct vmsmb_session *sess;
+	u32 tree_id;
 };
 
 /*

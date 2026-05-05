@@ -1053,6 +1053,30 @@ static char *vmsmb_inode_path(struct inode *inode)
 }
 
 /*
+ * Drop a reference on a file ctx.  When the last reference goes away,
+ * send the deferred SMB2 CLOSE and free the ctx.
+ *
+ * Refs are held by:
+ *   - file_open: the user-space-fd reference (released by file_release)
+ *   - init_request: each in-flight netfs_io_request (released by free_request)
+ *
+ * Port of CIFS _cifsFileInfo_put (fs/smb/client/file.c): server->ops->close
+ * fires only when the refcount drops to zero, so an in-flight async WRITE
+ * always extends the ctx lifetime past the user's close().  Without this,
+ * the SMB2 CLOSE PDU could race a pending WRITE PDU on the same fid,
+ * letting the host IoManager's NtClose cleanup auto-cancel the still-queued
+ * WRITE IRP and surface STATUS_CANCELLED — which vmusrv silently drops +
+ * replay-queues, wedging the connection.
+ */
+static void vmsmb_file_ctx_put(struct vmsmb_file_ctx *ctx)
+{
+	if (refcount_dec_and_test(&ctx->ref)) {
+		vmsmb_smb2_close(ctx->sess, ctx->tree_id, &ctx->fid);
+		kfree(ctx);
+	}
+}
+
+/*
  * netfs init_request hook — stash the open file context so issue_read /
  * issue_write can use the existing fid without reopening.
  *
@@ -1063,10 +1087,29 @@ static char *vmsmb_inode_path(struct inode *inode)
  */
 static int vmsmb_init_request(struct netfs_io_request *rreq, struct file *file)
 {
-	if (file)
-		rreq->netfs_priv = file->private_data; /* vmsmb_file_ctx */
+	if (file) {
+		struct vmsmb_file_ctx *ctx = file->private_data;
+
+		rreq->netfs_priv = ctx; /* vmsmb_file_ctx */
+		if (ctx)
+			refcount_inc(&ctx->ref);
+	}
 	rreq->io_streams[0].sreq_max_len = VMSMB_MAX_READ_CHUNK;
 	return 0;
+}
+
+/*
+ * netfs free_request hook — drop the ref taken in init_request.
+ *
+ * Port of CIFS cifs_free_request() (fs/smb/client/file.c).  Last ref
+ * drop sends the deferred SMB2 CLOSE and frees the ctx.
+ */
+static void vmsmb_free_request(struct netfs_io_request *rreq)
+{
+	struct vmsmb_file_ctx *ctx = rreq->netfs_priv;
+
+	if (ctx)
+		vmsmb_file_ctx_put(ctx);
 }
 
 /*
@@ -1074,11 +1117,15 @@ static int vmsmb_init_request(struct netfs_io_request *rreq, struct file *file)
  * vmsmb_read_async_complete. Safe to copy_to_iter() / sleep here.
  *
  * Port of CIFS smb2_readv_callback() → cifs_readahead_to_fscache finish path.
+ *
+ * Drops the per-READ-PDU ref taken in vmsmb_issue_read fast path (mirror of
+ * the WRITE-PDU pattern; preserves the wire-level ctx liveness invariant).
  */
 static void vmsmb_issue_read_complete(void *priv, int status,
 				      const void *data, u32 len)
 {
 	struct netfs_io_subrequest *subreq = priv;
+	struct vmsmb_file_ctx *ctx = subreq->rreq->netfs_priv;
 
 	if (status) {
 		subreq->error = status;
@@ -1088,6 +1135,9 @@ static void vmsmb_issue_read_complete(void *priv, int status,
 		subreq->transferred = len;
 	}
 	netfs_read_subreq_terminated(subreq);
+
+	if (ctx)
+		vmsmb_file_ctx_put(ctx);
 }
 
 /*
@@ -1117,11 +1167,14 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 
 	/* Fast path: open fid + subreq fits in one chunk → async single-shot */
 	if (ctx && subreq->len <= VMSMB_MAX_READ_CHUNK) {
+		/* Per-READ-PDU ref: same rationale as WRITE path. */
+		refcount_inc(&ctx->ref);
 		ret = vmsmb_smb2_read_async(sess, sbi->tree_id, &ctx->fid,
 					    subreq->start, subreq->len,
 					    vmsmb_issue_read_complete, subreq);
 		if (ret == 0)
 			return;
+		vmsmb_file_ctx_put(ctx);	/* rollback per-PDU ref */
 		/* Submit failed — fall through to sync path for graceful error */
 		subreq->error = ret;
 		netfs_read_subreq_terminated(subreq);
@@ -1168,36 +1221,50 @@ out:
 }
 
 /*
- * netfs begin_writeback hook — stash the active fid and advertise the
- * per-subrequest max chunk size.
+ * netfs begin_writeback hook — advertise the per-subrequest max chunk size.
  *
- * Port of CIFS cifs_begin_writeback() (fs/smb/client/file.c): set up
- * io_streams[0] with avail=true and sreq_max_len = max_write_chunk.
+ * Port of CIFS cifs_begin_writeback() (fs/smb/client/file.c).
+ *
+ * NOTE: the buffered writeback path is unused in our config
+ * (.write_iter = netfs_unbuffered_write_iter, no page cache → no dirty
+ * pages → no writeback wreq).  We do NOT stash vi->active_ctx into
+ * wreq->netfs_priv here because that would create a refcount imbalance:
+ * init_request only takes a ref when file != NULL, but writeback wreqs
+ * arrive with file == NULL, so free_request would drop a ref that was
+ * never taken.  CIFS handles this via cifs_get_writable_file() under
+ * cinode->open_file_lock — port that pattern before re-enabling buffered
+ * mode here.  In the meantime, if writeback ever fires (it shouldn't),
+ * vmsmb_issue_write will see ctx == NULL and fall to the CREATE+WRITE+CLOSE
+ * slow path, which is correct (just slower).
  */
 static void vmsmb_begin_writeback(struct netfs_io_request *wreq)
 {
-	struct inode *inode = wreq->inode;
-	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
-	struct vmsmb_inode_info *vi = VMSMB_I(inode);
-
-	/* Pass the active file handle to the write path */
-	if (vi->active_ctx)
-		wreq->netfs_priv = vi->active_ctx;
-
 	wreq->io_streams[0].avail = true;
 	wreq->io_streams[0].sreq_max_len = VMSMB_MAX_WRITE_CHUNK;
 }
 
 /*
  * Async completion for issue_write. Port of CIFS smb2_writev_callback().
+ *
+ * Drops the per-WRITE-PDU ref taken in vmsmb_issue_write fast path.  This
+ * fires when the wire response for the WRITE arrives via vmsmb_complete_req
+ * → async_cb chain, so the ref is released exactly once per acknowledged
+ * PDU.  Pending PDUs that never receive a response (silently cancelled by
+ * the server) leak their ref permanently — which keeps the ctx alive and
+ * blocks CLOSE PDU emission, preserving the wire-level invariant "do not
+ * send CLOSE while WRITE PDUs may still be acted on by the server".
  */
 static void vmsmb_issue_write_complete(void *priv, int status,
 				       u32 bytes_written)
 {
 	struct netfs_io_subrequest *subreq = priv;
+	struct vmsmb_file_ctx *ctx = subreq->rreq->netfs_priv;
 
 	netfs_write_subrequest_terminated(subreq,
 					  status ? status : (ssize_t)bytes_written);
+
+	if (ctx)
+		vmsmb_file_ctx_put(ctx);
 }
 
 /*
@@ -1239,12 +1306,18 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 			netfs_write_subrequest_terminated(subreq, -EFAULT);
 			return;
 		}
+		/* Per-WRITE-PDU ref: held until response is dispatched in
+		 * vmsmb_issue_write_complete.  Strict mirror of wire state —
+		 * needed because wreq-level ref (init_request) is dropped by
+		 * netfs cleanup which can outpace wire-ack on cancel paths. */
+		refcount_inc(&ctx->ref);
 		ret = vmsmb_smb2_write_async(sess, sbi->tree_id, &ctx->fid,
 					     subreq->start, buf, copied,
 					     vmsmb_issue_write_complete, subreq);
 		kvfree(buf);
 		if (ret == 0)
 			return;
+		vmsmb_file_ctx_put(ctx);	/* rollback per-PDU ref */
 		netfs_write_subrequest_terminated(subreq, ret);
 		return;
 	}
@@ -1300,6 +1373,7 @@ static void vmsmb_prepare_write(struct netfs_io_subrequest *subreq)
 
 const struct netfs_request_ops vmsmb_netfs_ops = {
 	.init_request	= vmsmb_init_request,
+	.free_request	= vmsmb_free_request,
 	.issue_read	= vmsmb_issue_read,
 	.begin_writeback = vmsmb_begin_writeback,
 	.prepare_write	= vmsmb_prepare_write,
@@ -1368,28 +1442,38 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 	/* Update inode size from server */
 	i_size_write(inode, info.size);
 
+	refcount_set(&ctx->ref, 1);
+	ctx->sess = sess;
+	ctx->tree_id = sbi->tree_id;
+
 	file->private_data = ctx;
 	VMSMB_I(inode)->active_ctx = ctx;
 	return 0;
 }
 
 /*
- * Close a file — SMB2 CLOSE + free per-file context.
+ * Close a file — drop the user-space-fd reference on the per-file ctx.
  *
- * Port of CIFS cifs_close() (fs/smb/client/file.c).
+ * The actual SMB2 CLOSE PDU is sent by vmsmb_file_ctx_put() once the
+ * last reference drops; pending netfs_io_request refs (taken in
+ * init_request, dropped in free_request) extend the ctx lifetime past
+ * this point.  This serializes CLOSE behind in-flight async WRITEs on
+ * the same fid, preventing the host-side IoManager NtClose IRP-cancel
+ * race that produces silent server response drops.
+ *
+ * Port of CIFS cifs_close() (fs/smb/client/file.c) which calls
+ * _cifsFileInfo_put — the SMB2 CLOSE there fires only inside the
+ * (--count == 0) branch.
  */
 static int vmsmb_file_release(struct inode *inode, struct file *file)
 {
-	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
-	struct vmsmb_session *sess = sbi->sess;
 	struct vmsmb_file_ctx *ctx = file->private_data;
 
 	if (ctx) {
 		if (VMSMB_I(inode)->active_ctx == ctx)
 			VMSMB_I(inode)->active_ctx = NULL;
 
-		vmsmb_smb2_close(sess, sbi->tree_id, &ctx->fid);
-		kfree(ctx);
+		vmsmb_file_ctx_put(ctx);
 	}
 	return 0;
 }
