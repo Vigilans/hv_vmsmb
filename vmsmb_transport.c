@@ -940,6 +940,21 @@ advance:
 
 	/* Signal synchronous waiters (version negotiation, drain) */
 	complete(&sess->recv_done);
+
+	/*
+	 * Outbound drain wake.  Same callback fires for both inbound packet
+	 * arrival and outbound-ring drain (host signals when out_full_flag
+	 * was set and freed bytes >= pending_send_sz).  Mirrors hvsock's
+	 * hvs_channel_cb at net/vmw_vsock/hyperv_transport.c:247-260.
+	 *
+	 * wake_up_all is safe in tasklet context (uses the wait_queue's
+	 * IRQ-safe spinlock).  Senders blocked in vmsmb_submit's drain
+	 * wait re-take send_mutex and retry vmbus_sendpacket; thundering
+	 * herd is bounded by mutex contention + wait_queue FIFO.
+	 */
+	if (sess->channel &&
+	    hv_get_bytes_to_write(&sess->channel->outbound) > 0)
+		wake_up_all(&sess->send_drain_wait);
 }
 
 /*
@@ -965,6 +980,7 @@ int vmsmb_open_channel(struct vmsmb_session *sess)
 
 	sess->channel = ch;
 	mutex_init(&sess->send_mutex);
+	init_waitqueue_head(&sess->send_drain_wait);
 
 	spin_lock_init(&sess->ct_lock);
 	init_waitqueue_head(&sess->ct_send_wait);
@@ -1007,13 +1023,37 @@ int vmsmb_open_channel(struct vmsmb_session *sess)
 		return ret;
 	}
 
-	pr_info("channel opened (ring=%d)\n", VMSMB_RING_SIZE);
+	/*
+	 * Arm the outbound-ring drain watermark.  Once set, the host signals
+	 * us via the same channel interrupt whenever out_full_flag was true
+	 * and free bytes >= VMSMB_DRAIN_WATERMARK.  vmsmb_channel_cb wakes
+	 * send_drain_wait on every interrupt where outbound has space —
+	 * the watermark just makes the host actually fire the interrupt
+	 * after EAGAIN backpressure (otherwise drain progress is silent).
+	 *
+	 * virt_mb() ensures the host sees the watermark before any
+	 * subsequent send (mirrors hvs_set_channel_pending_send_size at
+	 * net/vmw_vsock/hyperv_transport.c:177-182).
+	 */
+	set_channel_pending_send_size(ch, VMSMB_DRAIN_WATERMARK);
+	virt_mb();
+
+	pr_info("channel opened (ring=%d, drain_wm=%lu)\n",
+		VMSMB_RING_SIZE, (unsigned long)VMSMB_DRAIN_WATERMARK);
 	return 0;
 }
 
 void vmsmb_close_channel(struct vmsmb_session *sess)
 {
 	if (sess->channel) {
+		/*
+		 * Wake any senders blocked on the drain wait so they can
+		 * observe the channel teardown and exit (their next
+		 * vmbus_sendpacket will see -ENODEV / similar).
+		 */
+		wake_up_all(&sess->send_drain_wait);
+		wake_up_all(&sess->ct_send_wait);
+
 		vmbus_close(sess->channel);
 		sess->channel = NULL;
 		pr_info("channel closed\n");
@@ -1059,17 +1099,28 @@ static int vmsmb_send_recv_sync(struct vmsmb_session *sess,
 
 	reinit_completion(&sess->recv_done);
 
-	/* Send with EAGAIN retry */
-	{
-		int send_retries;
-
-		for (send_retries = 0; send_retries < VMSMB_SEND_MAX_RETRIES; send_retries++) {
-			ret = vmbus_sendpacket(sess->channel, pkt, pkt_len,
-					       0, VM_PKT_DATA_INBAND, 0);
-			if (ret != -EAGAIN)
-				break;
-			usleep_range(100, 500);
-		}
+	/*
+	 * Pre-SMB2 single-shot send.  Same drain-wait pattern as vmsmb_submit
+	 * (no MID involved here, so no Mode A risk, but we use the same
+	 * machinery for consistency and to avoid the legacy 100x usleep
+	 * busy-retry).
+	 */
+	for (;;) {
+		ret = vmbus_sendpacket(sess->channel, pkt, pkt_len,
+				       0, VM_PKT_DATA_INBAND, 0);
+		if (ret != -EAGAIN)
+			break;
+		set_channel_pending_send_size(sess->channel,
+					      VMSMB_DRAIN_WATERMARK);
+		virt_mb();
+		ret = wait_event_interruptible_timeout(
+			sess->send_drain_wait,
+			hv_get_bytes_to_write(&sess->channel->outbound) >=
+				pkt_len,
+			msecs_to_jiffies(VMSMB_DRAIN_WAIT_MS));
+		if (ret == -ERESTARTSYS)
+			break;
+		ret = -EAGAIN; /* loop and try again */
 	}
 	kfree(pkt);
 
@@ -1173,14 +1224,27 @@ static int vmsmb_send_recv_sync(struct vmsmb_session *sess,
  * @send_buf, then calls vmsmb_reserve_credits to atomically allocate
  * MID(s) + register @req in mid_table + bump outstanding under ct_lock,
  * patching MIDs into the SMB2 chain in-place.  Then transmits via
- * vmbus_sendpacket (serialized by send_mutex; mutex released across
- * EAGAIN sleeps so other senders can progress).
+ * vmbus_sendpacket (serialized by send_mutex).
  *
- * On send failure, vmsmb_unreserve rolls back mid_table + outstanding.
+ * Backpressure model — admission gate B2 (post-MID, on send_drain_wait):
  *
- * Analogous to CIFS smb_send_rqst() + cifs_setup_async_request()
- * (fs/smb/client/transport.c), restructured around mrxsmb's reserve-
- * then-walk pattern (SmbCseSubmitBufferContext path).
+ *   try send -> EAGAIN -> sleep on send_drain_wait -> wake on host drain
+ *               signal -> retry -> ...
+ *
+ * Replaces the legacy 100x usleep retry that, on exhaustion, called
+ * vmsmb_unreserve to release the MID locally — that abandonment was the
+ * Mode A wedge trigger (server's MID window stays pinned at the abandoned
+ * MID, client.next_mid drifts to StartMid + MaxWindows, server begins
+ * c00000d0 cascade).  Now we keep waiting until the host drains the ring;
+ * the MID is never released without a wire commit.
+ *
+ * Sleep is interruptible (caller may signal-out) and bounded by
+ * VMSMB_DRAIN_WAIT_MS per cycle.  Fatal vmbus_sendpacket failures
+ * (non-EAGAIN errors, channel rescind) still call vmsmb_unreserve —
+ * that path is treated as channel-fatal at the upper layers.
+ *
+ * Analogous to hvsock's check-then-send + drain-callback wake
+ * (net/vmw_vsock/hyperv_transport.c hvs_channel_cb).
  *
  * Lifetime: @req must remain valid until the completion fires.  For sync
  * callers it's on the stack; async callers allocate it and hand
@@ -1196,7 +1260,7 @@ static int vmsmb_submit(struct vmsmb_session *sess,
 	void *chain;
 	u8 *send_buf;
 	u32 send_pkt_len;
-	int ret, send_retries;
+	int ret;
 
 	if (req_len < sizeof(struct smb2_hdr))
 		return -EINVAL;
@@ -1220,10 +1284,10 @@ static int vmsmb_submit(struct vmsmb_session *sess,
 
 	/*
 	 * Reserve credits + assign MIDs into the chain (in-place).  Returns
-	 * -EBUSY on send-timeout, -EINTR on signal, 0 on success.  Server's
-	 * MID window dictates how many requests it will accept; the
-	 * outstanding-based gate mirrors that without trusting cumulative
-	 * grants.
+	 * -EBUSY on credit-side timeout, -EINTR on signal, 0 on success.
+	 * Server's MID window dictates how many requests it will accept;
+	 * the outstanding-based gate mirrors that without trusting
+	 * cumulative grants.
 	 */
 	ret = vmsmb_reserve_credits(sess, chain, req_len, req);
 	if (ret) {
@@ -1231,24 +1295,69 @@ static int vmsmb_submit(struct vmsmb_session *sess,
 		return ret;
 	}
 
-	mutex_lock(&sess->send_mutex);
-	for (send_retries = 0; send_retries < VMSMB_SEND_MAX_RETRIES; send_retries++) {
+	/*
+	 * Send loop with event-driven drain wake (no usleep busy-retry).
+	 *
+	 * vmbus_sendpacket may return -EAGAIN if the outbound ring is full.
+	 * In that case the host has set out_full_flag (we armed the
+	 * pending_send_size watermark in vmsmb_open_channel), so when the
+	 * host drains the ring it will signal our channel callback, which
+	 * wakes send_drain_wait.
+	 *
+	 * We use TASK_INTERRUPTIBLE so SIGKILL etc can break the wait, but
+	 * once we're committed (MID assigned) we MUST eventually get the PDU
+	 * onto the wire — abandoning leaks server-side MID-window state.
+	 * On signal we still attempt one final non-blocking send, and if
+	 * even that fails we fall through to the hard-error unreserve path
+	 * (rare; same liability as today's hard-error path).
+	 */
+	for (;;) {
+		mutex_lock(&sess->send_mutex);
 		ret = vmbus_sendpacket(sess->channel, send_buf, send_pkt_len,
 				       0, VM_PKT_DATA_INBAND, 0);
+		mutex_unlock(&sess->send_mutex);
 		if (ret != -EAGAIN)
 			break;
+
 		/*
-		 * Ring buffer is full. Release the mutex while we sleep so
-		 * other senders (especially small READ PDUs) can interleave —
-		 * holding the mutex across all retries serializes the entire
-		 * send path on the slowest writer. The host drains outbound
-		 * asynchronously, so progress can happen while we wait.
+		 * Ring saturated.  Re-arm the watermark defensively (host
+		 * may have cleared out_full_flag spuriously) and sleep until
+		 * the host signals drain progress, the wait times out, or
+		 * a signal arrives.  Each wake re-checks the gate by
+		 * looping back to vmbus_sendpacket.
 		 */
-		mutex_unlock(&sess->send_mutex);
-		usleep_range(100, 500);
-		mutex_lock(&sess->send_mutex);
+		set_channel_pending_send_size(sess->channel,
+					      VMSMB_DRAIN_WATERMARK);
+		virt_mb();
+
+		ret = wait_event_interruptible_timeout(
+			sess->send_drain_wait,
+			hv_get_bytes_to_write(&sess->channel->outbound) >=
+				send_pkt_len,
+			msecs_to_jiffies(VMSMB_DRAIN_WAIT_MS));
+
+		if (ret == -ERESTARTSYS) {
+			/*
+			 * Caller signaled.  Try one final non-blocking send
+			 * to honor the MID-lifetime invariant; if it still
+			 * fails we'll fall through to vmsmb_unreserve below.
+			 */
+			pr_warn_ratelimited("submit: drain wait interrupted by signal, last-ditch send\n");
+			mutex_lock(&sess->send_mutex);
+			ret = vmbus_sendpacket(sess->channel, send_buf,
+					       send_pkt_len,
+					       0, VM_PKT_DATA_INBAND, 0);
+			mutex_unlock(&sess->send_mutex);
+			break;
+		}
+		/*
+		 * ret == 0 (timeout, no progress) -> retry; the ring may
+		 * have drained between our last vmbus_sendpacket and now.
+		 * ret > 0 (woken up + condition true) -> retry, should
+		 * succeed.
+		 */
 	}
-	mutex_unlock(&sess->send_mutex);
+
 	kvfree(send_buf);
 
 	if (ret) {

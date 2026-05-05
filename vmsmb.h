@@ -62,8 +62,30 @@
  * is sub-millisecond, so 10s is generous even for host-side disk I/O. */
 #define VMSMB_TIMEOUT_MS	10000
 
-/* Max send retries on EAGAIN (ring buffer backpressure) */
-#define VMSMB_SEND_MAX_RETRIES	100
+/*
+ * Outbound-ring drain watermark.
+ *
+ * Set via set_channel_pending_send_size(channel, watermark) at open time.
+ * The host re-signals the guest's channel callback when the outbound ring
+ * has at least this many free bytes.  Sized to one max-payload PDU + the
+ * VMBus framing overhead so the wake fires precisely when one full WRITE
+ * could fit, mirroring hvsock's `HVS_PKT_LEN(HVS_SEND_BUF_SIZE)` choice
+ * (net/vmw_vsock/hyperv_transport.c:177-182).
+ */
+#define VMSMB_DRAIN_WATERMARK \
+	(VMSMB_PIPE_MAX_PAYLOAD + sizeof(struct vmpipe_hdr) + \
+	 sizeof(struct vmpacket_descriptor))
+
+/*
+ * Maximum sleep on send_drain_wait per vmbus_sendpacket -EAGAIN.
+ * Bounds the worst-case wait; if drain wake never arrives within this
+ * window the caller wakes spontaneously and retries (drain wake should
+ * have set out_full_flag false on the host side, so we may catch up).
+ * Larger than the legacy 100*usleep(100,500)=50ms budget on purpose:
+ * we now want to ride out genuine ring saturation without falling back
+ * to the EAGAIN-side abandonment that produced the Mode A wedge.
+ */
+#define VMSMB_DRAIN_WAIT_MS	2000
 
 /*
  * Initial SMB2 credit pool — minimum to send NEGOTIATE.
@@ -263,6 +285,24 @@ struct vmsmb_session {
 
 	/* Send serialization (ring buffer write is not concurrent-safe) */
 	struct mutex send_mutex;
+
+	/*
+	 * Outbound-ring drain wait.
+	 *
+	 * Senders blocked on vmbus_sendpacket -EAGAIN (outbound ring saturated)
+	 * sleep here.  The channel callback wakes this queue when the host
+	 * fires the pending_send_size watermark interrupt.  Kept SEPARATE from
+	 * ct_send_wait — credit gating and ring capacity are orthogonal
+	 * conditions; conflating them would cause spurious-wake livelock when
+	 * a credit grant arrives while the ring is still saturated.
+	 *
+	 * No corresponding queue list_head: scheme A — each sender sleeps
+	 * with its own kvmalloc'd send_buf on the stack, retries on wake.
+	 * No worker thread; channel_cb just wakes everyone (FIFO via wait_queue
+	 * head), each sender competes for the next available ring slot via
+	 * send_mutex on retry.
+	 */
+	wait_queue_head_t send_drain_wait;
 
 	/*
 	 * Credit transport state — mrxsmb.sys-derived rate-agnostic gate.
