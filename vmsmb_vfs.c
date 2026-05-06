@@ -685,7 +685,6 @@ static struct dentry *vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	inode = vmsmb_iget(dir->i_sb, &info);
 	if (IS_ERR(inode))
 		return ERR_CAST(inode);
-	inc_nlink(dir);
 
 	d_instantiate(dentry, inode);
 	return NULL;
@@ -721,6 +720,16 @@ static int vmsmb_unlink(struct inode *dir, struct dentry *dentry)
  *
  * Port of CIFS cifs_rmdir() (fs/smb/client/inode.c): same DELETE_ON_CLOSE
  * path as unlink; server enforces "directory must be empty".
+ *
+ * On success clear_nlink() the removed directory's own inode (matches
+ * CIFS cifs_rmdir which does the same — the inode is dead, nlink=0
+ * marks it as such for any lingering references).  The parent's nlink
+ * is intentionally NOT touched: CIFS does not maintain a precise dir
+ * nlink client-side either, because vmsmb_fill_inode initialises every
+ * directory inode with set_nlink(2) regardless of how many subdirs the
+ * server already has.  An accurate inc/drop scheme is impossible with
+ * an under-counted starting point, and underflow into nlink=0 trips an
+ * inc_nlink() WARN on the next mkdir under that parent.
  */
 static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 {
@@ -744,10 +753,8 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 
 	kfree(path);
 
-	if (ret == 0) {
-		drop_nlink(d_inode(dentry));
-		drop_nlink(dir);
-	}
+	if (ret == 0)
+		clear_nlink(d_inode(dentry));
 	return ret;
 }
 
