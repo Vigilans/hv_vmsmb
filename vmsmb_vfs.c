@@ -68,6 +68,28 @@ static inline struct vmsmb_sb_info *VMSMB_SB(struct super_block *sb)
 }
 
 /*
+ * Force the next access to re-fetch this directory's metadata from the
+ * server.  Used after operations that change the parent dir's mtime/
+ * ctime (create/mkdir/unlink/rmdir/rename/symlink/link), so subsequent
+ * stat / readdir / negative-dentry probes don't serve stale attrs from
+ * the actimeo cache.
+ *
+ * Port of CIFS cifs_unlink / cifs_rmdir / cifs_mkdir / cifs_create
+ * pattern of clearing cifsInode->time on the parent inode after a
+ * mutation (fs/smb/client/inode.c).  CIFS uses time=0 (absolute);
+ * we use jiffies-1 so vmsmb_d_revalidate's time_after(jiffies,
+ * meta_expires) check is true even when the next access lands on the
+ * same jiffy as the invalidate (HZ=1000 → 1 ms granularity, fast
+ * mutations like mkdir/unlink can complete and be re-stat'd within
+ * one jiffy and would otherwise still see cached attrs).
+ */
+static inline void vmsmb_invalidate_dir(struct inode *dir)
+{
+	if (dir)
+		VMSMB_I(dir)->meta_expires = jiffies - 1;
+}
+
+/*
  * Fill an inode with SMB2 file attributes.
  *
  * Port of CIFS cifs_fattr_to_inode() (fs/smb/client/inode.c) initial-fill
@@ -646,6 +668,7 @@ static int vmsmb_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
 
+	vmsmb_invalidate_dir(dir);
 	d_instantiate(dentry, inode);
 	return 0;
 }
@@ -686,6 +709,7 @@ static struct dentry *vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	if (IS_ERR(inode))
 		return ERR_CAST(inode);
 
+	vmsmb_invalidate_dir(dir);
 	d_instantiate(dentry, inode);
 	return NULL;
 }
@@ -710,8 +734,10 @@ static int vmsmb_unlink(struct inode *dir, struct dentry *dentry)
 	ret = vmsmb_smb2_unlink(sess, sbi->tree_id, path);
 	kfree(path);
 
-	if (ret == 0)
+	if (ret == 0) {
 		drop_nlink(d_inode(dentry));
+		vmsmb_invalidate_dir(dir);
+	}
 	return ret;
 }
 
@@ -753,8 +779,10 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 
 	kfree(path);
 
-	if (ret == 0)
+	if (ret == 0) {
 		clear_nlink(d_inode(dentry));
+		vmsmb_invalidate_dir(dir);
+	}
 	return ret;
 }
 
@@ -795,6 +823,12 @@ static int vmsmb_rename(struct mnt_idmap *idmap,
 
 	kfree(old_path);
 	kfree(new_path);
+
+	if (ret == 0) {
+		vmsmb_invalidate_dir(old_dir);
+		if (new_dir != old_dir)
+			vmsmb_invalidate_dir(new_dir);
+	}
 	return ret;
 }
 
@@ -837,6 +871,7 @@ static int vmsmb_link(struct dentry *old_dentry, struct inode *dir,
 		spin_lock(&inode->i_lock);
 		inc_nlink(inode);
 		spin_unlock(&inode->i_lock);
+		vmsmb_invalidate_dir(dir);
 	}
 
 	kfree(old_path);
@@ -918,6 +953,7 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		return PTR_ERR(inode);
 	VMSMB_I(inode)->symlink_target = kstrdup(target, GFP_KERNEL);
 
+	vmsmb_invalidate_dir(dir);
 	d_instantiate(dentry, inode);
 	return 0;
 }
