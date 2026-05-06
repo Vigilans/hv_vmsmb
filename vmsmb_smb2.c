@@ -1732,6 +1732,10 @@ hclose:
  * Port of CIFS smb2_unlink() (fs/smb/client/smb2inode.c:1108-1110):
  * DELETE_ON_CLOSE + OPEN_REPARSE_POINT ensures reparse points are
  * deleted rather than followed.
+ *
+ * The actual deletion is committed at CLOSE time, so CLOSE errors
+ * (e.g. server-side delete-veto) must be surfaced — unlike the probe
+ * paths in vmsmb_smb2_create_close where CLOSE is just fid release.
  */
 int vmsmb_smb2_unlink(struct vmsmb_session *sess, u32 tree_id,
 		      const char *path)
@@ -1743,9 +1747,9 @@ int vmsmb_smb2_unlink(struct vmsmb_session *sess, u32 tree_id,
 				FILE_OPEN,
 				CREATE_DELETE_ON_CLOSE | OPEN_REPARSE_POINT,
 				&fid, NULL);
-	if (ret == 0)
-		vmsmb_smb2_close(sess, tree_id, &fid);
-	return ret;
+	if (ret)
+		return ret;
+	return vmsmb_smb2_close(sess, tree_id, &fid);
 }
 
 /*

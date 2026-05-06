@@ -740,7 +740,7 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 				CREATE_NOT_FILE,
 				&fid, NULL);
 	if (ret == 0)
-		vmsmb_smb2_close(sess, sbi->tree_id, &fid);
+		ret = vmsmb_smb2_close(sess, sbi->tree_id, &fid);
 
 	kfree(path);
 
