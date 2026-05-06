@@ -28,6 +28,19 @@
 #include "smb2pdu.h"
 
 /*
+ * VMBus ring buffer size, KB per direction.  See VMSMB_RING_SIZE_KB_*
+ * bounds in vmsmb.h.  Value is captured into the channel at vmbus_open
+ * time (vmsmb_open_channel); changing the param after module load has
+ * no effect — `rmmod hv_vmsmb && modprobe hv_vmsmb ring_size_kb=N` to
+ * apply.
+ */
+static unsigned int ring_size_kb = VMSMB_RING_SIZE_KB_DEFAULT;
+module_param(ring_size_kb, uint, 0444);
+MODULE_PARM_DESC(ring_size_kb,
+	"VMBus ring buffer size in KB per direction (256..2048, default 1024). "
+	"Must be a multiple of 4 (PAGE_SIZE).  Reload module to apply.");
+
+/*
  * Adaptive spinning window (microseconds).
  *
  * Before sleeping on wait_for_completion, busy-poll for this long.
@@ -970,6 +983,7 @@ advance:
 int vmsmb_open_channel(struct vmsmb_session *sess)
 {
 	struct vmbus_channel *ch = sess->dev->channel;
+	u32 actual_kb = ring_size_kb;
 	int ret;
 
 	if (ch->state != CHANNEL_OPEN_STATE) {
@@ -1016,7 +1030,29 @@ int vmsmb_open_channel(struct vmsmb_session *sess)
 			   sizeof(struct vmpipe_hdr) +
 			   sizeof(struct vmpacket_descriptor);
 
-	ret = vmbus_open(ch, VMSMB_RING_SIZE, VMSMB_RING_SIZE,
+	if (actual_kb < VMSMB_RING_SIZE_KB_MIN) {
+		pr_warn("ring_size_kb=%u below minimum, clamping to %u\n",
+			ring_size_kb, VMSMB_RING_SIZE_KB_MIN);
+		actual_kb = VMSMB_RING_SIZE_KB_MIN;
+	} else if (actual_kb > VMSMB_RING_SIZE_KB_MAX) {
+		pr_warn("ring_size_kb=%u above maximum, clamping to %u\n",
+			ring_size_kb, VMSMB_RING_SIZE_KB_MAX);
+		actual_kb = VMSMB_RING_SIZE_KB_MAX;
+	}
+
+	/*
+	 * VMBus requires the ring size be a multiple of PAGE_SIZE (4 KB);
+	 * otherwise vmbus_open returns -EINVAL.  Round down to the nearest
+	 * 4 KB multiple — round-up could push us back over MAX.
+	 */
+	if (actual_kb & 3) {
+		u32 rounded = actual_kb & ~3U;
+		pr_warn("ring_size_kb=%u not 4 KB aligned, rounding down to %u\n",
+			actual_kb, rounded);
+		actual_kb = rounded;
+	}
+
+	ret = vmbus_open(ch, actual_kb * 1024, actual_kb * 1024,
 			 NULL, 0, vmsmb_channel_cb, sess);
 	if (ret) {
 		pr_err("vmbus_open failed: %d\n", ret);
@@ -1038,8 +1074,8 @@ int vmsmb_open_channel(struct vmsmb_session *sess)
 	set_channel_pending_send_size(ch, VMSMB_DRAIN_WATERMARK);
 	virt_mb();
 
-	pr_info("channel opened (ring=%d, drain_wm=%lu)\n",
-		VMSMB_RING_SIZE, (unsigned long)VMSMB_DRAIN_WATERMARK);
+	pr_info("channel opened (ring=%u KB, drain_wm=%lu)\n",
+		actual_kb, (unsigned long)VMSMB_DRAIN_WATERMARK);
 	return 0;
 }
 

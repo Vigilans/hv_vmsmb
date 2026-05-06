@@ -24,8 +24,25 @@
 	GUID_INIT(0x4d12e519, 0x17a0, 0x4ae4, \
 		  0x8e, 0xaa, 0x52, 0x70, 0xfc, 0x6a, 0xbd, 0xb7)
 
-/* Default ring buffer size (bytes per direction) */
-#define VMSMB_RING_SIZE		(1024 * 1024)
+/*
+ * Ring buffer size bounds, in KB per direction.  Runtime value comes from
+ * the `ring_size_kb` module parameter (default below).
+ *
+ * Min 256 KB — admission gate's drain-wake watermark equals one max-PDU
+ *   (VMSMB_DRAIN_WATERMARK).  The data area (ring_size - 4 KB header)
+ *   must comfortably hold ≥ 2 max-PDUs so drain wake fires on every PDU
+ *   drain under concurrent senders.
+ *
+ * Max 2048 KB — VMBus host-side ring allocator caps each direction at
+ *   exactly 2 MiB; vmbus_open returns -ENOMEM above this.  ring_size
+ *   must also be a multiple of 4 KB (PAGE_SIZE) or vmbus_open returns
+ *   -EINVAL; non-aligned values are rounded down at module load.
+ *
+ * Default 1024 KB (1 MB) — production-validated by overnight B2 4/4 wins.
+ */
+#define VMSMB_RING_SIZE_KB_DEFAULT	1024
+#define VMSMB_RING_SIZE_KB_MIN		256
+#define VMSMB_RING_SIZE_KB_MAX		2048
 
 /* Max SMB2 response buffer */
 #define VMSMB_MAX_RESPONSE	4096
