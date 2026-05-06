@@ -1,7 +1,7 @@
 # Maintainer: Vigilans <vigilans@foxmail.com>
 _pkgbase=hv-vmsmb
 pkgname=${_pkgbase}-dkms-git
-pkgver=0.1.0.r0.ga16a347
+pkgver=0.1.0
 pkgrel=1
 pkgdesc="Hyper-V VSMB (Virtual SMB) filesystem client kernel module"
 arch=('x86_64')
