@@ -1103,8 +1103,10 @@ static int vmsmb_send_recv_sync(struct vmsmb_session *sess,
 	 * Pre-SMB2 single-shot send.  Same drain-wait pattern as vmsmb_submit
 	 * (no MID involved here, so no Mode A risk, but we use the same
 	 * machinery for consistency and to avoid the legacy 100x usleep
-	 * busy-retry).  TASK_KILLABLE matches vmsmb_submit so non-fatal
-	 * signals don't churn the negotiation path.
+	 * busy-retry).  Pre-SMB2 keeps TASK_KILLABLE since no MID has been
+	 * allocated yet; SIGKILL during NEGOTIATE / SESSION_SETUP can abort
+	 * cleanly.  vmsmb_submit goes TASK_UNINTERRUPTIBLE because its wait
+	 * happens after MID allocation.
 	 */
 	for (;;) {
 		ret = vmbus_sendpacket(sess->channel, pkt, pkt_len,
@@ -1305,13 +1307,14 @@ static int vmsmb_submit(struct vmsmb_session *sess,
 	 * host drains the ring it will signal our channel callback, which
 	 * wakes send_drain_wait.
 	 *
-	 * We use TASK_KILLABLE so non-fatal signals (SIGURG / SIGUSR /
-	 * SIGTERM / etc.) do NOT break the wait — once we're committed (MID
-	 * assigned) we MUST eventually get the PDU onto the wire, since
-	 * abandoning leaks server-side MID-window state and triggers Mode A.
-	 * Only SIGKILL can break the wait; in that case the process is being
-	 * killed unconditionally, so the residual Mode A risk on a SIGKILL'd
-	 * caller is academic.
+	 * The wait is TASK_UNINTERRUPTIBLE: once a MID has been allocated
+	 * the PDU MUST eventually reach the wire — abandoning the MID leaks
+	 * server-side StartMid and triggers Mode A drift.  No signal,
+	 * including SIGKILL, can break the wait.  Each iteration is bounded
+	 * by VMSMB_DRAIN_WAIT_MS, after which the loop retries
+	 * vmbus_sendpacket; if the host genuinely cannot drain the ring the
+	 * caller will block in D-state until hung_task fires, same fate as
+	 * any write to a dead backend.
 	 */
 	for (;;) {
 		mutex_lock(&sess->send_mutex);
@@ -1324,40 +1327,19 @@ static int vmsmb_submit(struct vmsmb_session *sess,
 		/*
 		 * Ring saturated.  Re-arm the watermark defensively (host
 		 * may have cleared out_full_flag spuriously) and sleep until
-		 * the host signals drain progress, the wait times out, or
-		 * SIGKILL arrives.  Each wake re-checks the gate by looping
-		 * back to vmbus_sendpacket.
+		 * the host signals drain progress or the wait times out.
+		 * Each wake re-checks the gate by looping back to
+		 * vmbus_sendpacket.
 		 */
 		set_channel_pending_send_size(sess->channel,
 					      VMSMB_DRAIN_WATERMARK);
 		virt_mb();
 
-		ret = wait_event_killable_timeout(
+		wait_event_timeout(
 			sess->send_drain_wait,
 			hv_get_bytes_to_write(&sess->channel->outbound) >=
 				send_pkt_len,
 			msecs_to_jiffies(VMSMB_DRAIN_WAIT_MS));
-
-		if (ret == -ERESTARTSYS) {
-			/*
-			 * SIGKILL only (TASK_KILLABLE filters everything else).
-			 * Process is being killed; abort cleanly.  No last-ditch
-			 * send — at 256K ring under signal storm that path was
-			 * itself a Mode A trigger (EAGAIN cascades into
-			 * vmsmb_unreserve).  Falling through to unreserve here
-			 * leaves residual Mode A risk only when the caller is
-			 * being SIGKILL'd, which is acceptable.
-			 */
-			pr_warn_ratelimited("submit: drain wait killed (SIGKILL), aborting\n");
-			ret = -EINTR;
-			break;
-		}
-		/*
-		 * ret == 0 (timeout, no progress) -> retry; the ring may
-		 * have drained between our last vmbus_sendpacket and now.
-		 * ret > 0 (woken up + condition true) -> retry, should
-		 * succeed.
-		 */
 	}
 
 	kvfree(send_buf);
