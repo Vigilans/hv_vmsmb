@@ -130,7 +130,7 @@
  * modular indices.
  *
  * VMSMB_INITIAL_MAX_CREDITS: starting capacity.  Mirrors mrxsmb.sys's
- * 0x80; doubles via vmsmb_grow_mid_table when outstanding pressure
+ * 0x80; doubles via vmsmb_grow_mid_table when mid_range_size pressure
  * approaches max_credits.
  *
  * VMSMB_MAX_CREDITS: hard ceiling, matching server's VSmbMaxCredits
@@ -139,7 +139,7 @@
  * server enforces EndMid - StartMid <= MaxWindowSize <= VSmbMaxCredits;
  * sending past this returns STATUS_INVALID_PARAMETER (0xc00000d0)
  * silently — recorded in ETW Event 403 but no response on the wire.
- * Once outstanding hits this cap, vmsmb_grow_mid_table refuses to grow
+ * Once mid_range_size hits this cap, vmsmb_grow_mid_table refuses to grow
  * further and reserve_credits queues senders.
  *
  * Memory: 8192 slots × sizeof(void *) = 64 KB per session, kvzalloc'd.
@@ -164,7 +164,7 @@
 /*
  * Reserve-side wait timeout (ms).
  *
- * If the send admission gate (live_window / outstanding) keeps a sender
+ * If the send admission gate (live_window / mid_range_size) keeps a sender
  * blocked beyond this, return -EBUSY.  Surfaces stalls as user-visible
  * errors instead of silent wedges.  Set to match VMSMB_TIMEOUT_MS so a
  * stuck reserve fails before its caller's transact timeout.
@@ -326,17 +326,19 @@ struct vmsmb_session {
 	 *
 	 * The send admission predicate is
 	 *
-	 *   bound = max(min(live_window, max_credits), outstanding)
-	 *   effective_avail = bound - outstanding
+	 *   bound = max(min(live_window, max_credits), mid_range_size)
+	 *   effective_avail = bound - mid_range_size
 	 *
-	 * which throttles purely on outstanding (in-flight CC sum), not on
-	 * accumulated CR.  When the server emits CR=0 (server-side flow
+	 * which throttles purely on mid_range_size (= ct_next_mid - ct_oldest_mid;
+	 * sum of CreditCharge for un-released MIDs since the leading hole),
+	 * not on accumulated CR.  When the server emits CR=0 (server-side flow
 	 * control via vmusrv path #3 zero-grant) live_window stops growing,
-	 * outstanding stays high, effective_avail collapses to 0, and senders
+	 * mid_range_size stays high, effective_avail collapses to 0, and senders
 	 * queue on ct_send_wait.  In-flight responses still drain via
-	 * release_mid, which re-opens the gate from below.  Net effect: any
-	 * server zero-rate is tolerated without drifting next_mid past the
-	 * server's actual EndMid.
+	 * release_mid (which sweeps oldest forward and decrements
+	 * mid_range_size when leading slots become NULL), re-opening the gate
+	 * from below.  Net effect: any server zero-rate is tolerated without
+	 * drifting next_mid past the server's actual EndMid.
 	 *
 	 * Models mrxsmb.sys SmbCe* credit transport
 	 * (SmbCeReserveCreditsForBufferContexts, SmbCeApplyCreditGrantAndRelease,
@@ -352,7 +354,7 @@ struct vmsmb_session {
 	wait_queue_head_t ct_send_wait;
 	u64    ct_oldest_mid;		/* lower bound of in-flight MID span */
 	u64    ct_next_mid;		/* next MID to assign in reserve */
-	u32    ct_outstanding;		/* sum of in-flight CreditCharge */
+	u32    ct_mid_range_size;	/* ct_next_mid - ct_oldest_mid (MID range with leading hole; admission gate's actual gated quantity) */
 	u32    ct_live_window;		/* folded grant accumulator (verbatim CR sum) */
 	atomic_t ct_pending_grant;	/* lockless receive-side accumulator */
 	u32    ct_max_credits;		/* mid_table capacity, init 128, doubles to 8192 */
@@ -365,8 +367,8 @@ struct vmsmb_session {
 	 * via mrxsmb's EWMA formula (SmbCeDemuxResponseAndAccumulateCredits
 	 * @0x1c000217c..0x1c00021bc):
 	 *
-	 *   avg = (elapsed_us + max(outstanding, 8) * old_avg)
-	 *         / (max(outstanding, 8) + credit_charge)
+	 *   avg = (elapsed_us + max(mid_range_size, 8) * old_avg)
+	 *         / (max(mid_range_size, 8) + credit_charge)
 	 *
 	 * The 18-entry bucket table at DAT_1c0072270 then maps avg latency
 	 * into a multiplicative or additive op on ct_target_window:
@@ -378,13 +380,13 @@ struct vmsmb_session {
 	 * is clamped to [VMSMB_INITIAL_TARGET_WINDOW=2, ct_max_credits].
 	 *
 	 * The send admission gate uses target_window (not max_credits) as
-	 * the upper bound that competes with outstanding:
+	 * the upper bound that competes with mid_range_size:
 	 *
-	 *   bound = max(min(live_window, target_window), outstanding)
+	 *   bound = max(min(live_window, target_window), mid_range_size)
 	 *
 	 * When server enters sustained CR=0 flow control (vmusrv path #3
 	 * zero-grant), per-request latency rises -> bucket index rises ->
-	 * target_window shrinks -> outstanding cap shrinks -> in-flight
+	 * target_window shrinks -> mid_range_size cap shrinks -> in-flight
 	 * count auto-throttles below ring saturation, avoiding Mode A
 	 * over-send.
 	 */

@@ -127,14 +127,14 @@ static u16 vmsmb_walk_pdu_grants(const void *buf, u32 len)
  *
  * Send admission gate (`vmsmb_reserve_credits`):
  *
- *   bound = max(min(live_window, max_credits), outstanding)
- *   effective_avail = bound - outstanding
+ *   bound = max(min(live_window, max_credits), mid_range_size)
+ *   effective_avail = bound - mid_range_size
  *
- * Throttles purely on outstanding (in-flight CC sum), not on accumulated
+ * Throttles purely on mid_range_size (in-flight CC sum), not on accumulated
  * CR.  Server CR=0 (vmusrv path #3 zero-grant flow control) stops
  * live_window from growing; effective_avail naturally collapses to 0;
  * senders queue on ct_send_wait.  Drains via vmsmb_release_mid which
- * decrements outstanding when the oldest in-flight MID completes.  Net:
+ * decrements mid_range_size when the oldest in-flight MID completes.  Net:
  * any server zero-rate is tolerated without drifting next_mid past the
  * server's actual EndMid.
  *
@@ -156,7 +156,7 @@ void vmsmb_credit_reset(struct vmsmb_session *sess)
 	spin_lock_bh(&sess->ct_lock);
 	sess->ct_oldest_mid  = 0;
 	sess->ct_next_mid    = 0;
-	sess->ct_outstanding = 0;
+	sess->ct_mid_range_size = 0;
 	sess->ct_live_window = VMSMB_INITIAL_CREDITS;
 	atomic_set(&sess->ct_pending_grant, 0);
 	sess->ct_avg_lat_us  = 0;
@@ -170,7 +170,7 @@ void vmsmb_credit_reset(struct vmsmb_session *sess)
 
 /*
  * Drain ct_pending_grant atomically into ct_live_window, clamp to
- * [outstanding, max_credits], spill any overflow back to pending_grant.
+ * [mid_range_size, max_credits], spill any overflow back to pending_grant.
  * Caller must hold ct_lock.
  *
  * Mirrors mrxsmb.sys SmbCeFoldPendingCreditsIntoWindow @0x1c00260d0.
@@ -183,8 +183,8 @@ static void vmsmb_fold_pending_locked(struct vmsmb_session *sess)
 		return;
 
 	sess->ct_live_window += pending;
-	if (sess->ct_live_window < sess->ct_outstanding)
-		sess->ct_live_window = sess->ct_outstanding;
+	if (sess->ct_live_window < sess->ct_mid_range_size)
+		sess->ct_live_window = sess->ct_mid_range_size;
 	if (sess->ct_live_window > sess->ct_max_credits) {
 		u32 overflow = sess->ct_live_window - sess->ct_max_credits;
 
@@ -256,16 +256,16 @@ static const struct {
  * EWMA formula (mrxsmb SmbCeDemuxResponseAndAccumulateCredits
  *   @0x1c000217c..0x1c00021bc):
  *
- *     avg_new = (elapsed_us + max(outstanding, 8) * avg_old)
- *               / (max(outstanding, 8) + charge)
+ *     avg_new = (elapsed_us + max(mid_range_size, 8) * avg_old)
+ *               / (max(mid_range_size, 8) + charge)
  *
- * max(outstanding, 8) dampens EWMA changes at low queue depth to avoid
+ * max(mid_range_size, 8) dampens EWMA changes at low queue depth to avoid
  * single-sample spikes dominating the moving average.
  */
 static void vmsmb_ewma_update_locked(struct vmsmb_session *sess,
 				     u64 elapsed_us, u16 charge)
 {
-	u64 weight = max_t(u32, sess->ct_outstanding, 8U);
+	u64 weight = max_t(u32, sess->ct_mid_range_size, 8U);
 	u64 numer = elapsed_us + weight * sess->ct_avg_lat_us;
 	u64 denom = weight + (u64)charge;
 	u32 bucket;
@@ -309,24 +309,24 @@ static void vmsmb_ewma_update_locked(struct vmsmb_session *sess,
 /*
  * Effective-avail predicate.  Caller must hold ct_lock.
  *
- * bound = max(min(live_window, target_window), outstanding)
+ * bound = max(min(live_window, target_window), mid_range_size)
  *
  * target_window is the EWMA-adapted upper bound (init 2, grows to
  * max_credits under low latency, shrinks toward 2 under high latency).
  * It dominates over max_credits in the gate, so when the server enters
  * sustained CR=0 flow control and per-request latency rises, the
- * outstanding cap auto-shrinks below ring saturation.
+ * mid_range_size cap auto-shrinks below ring saturation.
  */
 static bool vmsmb_can_reserve_locked(struct vmsmb_session *sess, u16 charge)
 {
 	u32 bound;
 
 	bound = min(sess->ct_live_window, sess->ct_target_window);
-	if (bound < sess->ct_outstanding)
-		bound = sess->ct_outstanding;
+	if (bound < sess->ct_mid_range_size)
+		bound = sess->ct_mid_range_size;
 	if (bound < (u32)charge)
 		return false;
-	return (bound - sess->ct_outstanding) >= (u32)charge;
+	return (bound - sess->ct_mid_range_size) >= (u32)charge;
 }
 
 /*
@@ -386,8 +386,8 @@ static int vmsmb_grow_mid_table(struct vmsmb_session *sess)
  *
  * Walks @buf in-place, writes MessageId into each PDU header, places the
  * request pointer into mid_table[mid % max_credits], advances ct_next_mid
- * by per-PDU CC, increments ct_outstanding by total chain charge.  All
- * three updates happen under ct_lock so MID/outstanding/mid_table are
+ * by per-PDU CC, increments ct_mid_range_size by total chain charge.  All
+ * three updates happen under ct_lock so MID/mid_range_size/mid_table are
  * always consistent.
  *
  * If the gate denies (effective_avail < total_charge), the call queues
@@ -421,7 +421,7 @@ retry:
 
 		spin_lock_bh(&sess->ct_lock);
 		if (sess->ct_max_credits <
-		    sess->ct_outstanding + 8 + total_charge)
+		    sess->ct_mid_range_size + 8 + total_charge)
 			need_grow = (sess->ct_max_credits < VMSMB_MAX_CREDITS);
 		spin_unlock_bh(&sess->ct_lock);
 
@@ -430,7 +430,7 @@ retry:
 			if (ret == -ENOMEM)
 				return ret;
 			/* -ENOBUFS at cap is OK — fall through to wait if
-			 * the gate denies; outstanding will drain via
+			 * the gate denies; mid_range_size will drain via
 			 * release_mid. */
 		}
 	}
@@ -454,9 +454,9 @@ retry:
 		finish_wait(&sess->ct_send_wait, &wait);
 
 		if (remaining == 0) {
-			pr_warn("reserve timeout: charge=%u outstanding=%u live=%u\n",
+			pr_warn("reserve timeout: charge=%u mid_range_size=%u live=%u\n",
 				total_charge,
-				sess->ct_outstanding,
+				sess->ct_mid_range_size,
 				sess->ct_live_window);
 			return -EBUSY;
 		}
@@ -466,7 +466,7 @@ retry:
 	/*
 	 * Walk the chain: per-PDU patch in MID, register in mid_table,
 	 * advance ct_next_mid by CC.  All inside ct_lock — atomic with
-	 * outstanding update below.
+	 * mid_range_size update below.
 	 */
 	off = 0;
 	while (off + sizeof(struct smb2_hdr) <= len) {
@@ -495,7 +495,7 @@ retry:
 
 	req->credit_charge = total_charge;
 	req->send_tick = ktime_get();
-	sess->ct_outstanding += total_charge;
+	sess->ct_mid_range_size += total_charge;
 	spin_unlock_bh(&sess->ct_lock);
 	return 0;
 }
@@ -521,7 +521,7 @@ static void vmsmb_accumulate_grant(struct vmsmb_session *sess, u16 grant)
  * Release a completed request: clear ALL mid_table slots written at
  * reserve time (one per PDU; chain wrote charge slots covering MIDs
  * [first..first+charge-1]), then if our first MID is at oldest_mid,
- * sweep oldest forward over consecutive NULLs and decrement outstanding.
+ * sweep oldest forward over consecutive NULLs and decrement mid_range_size.
  *
  * NOTE: clearing ALL slots (not just the first) is critical — for
  * compound chains (CC=1 per PDU but charge=N for an N-PDU chain) the
@@ -559,10 +559,10 @@ static void vmsmb_release_mid(struct vmsmb_session *sess,
 			freed++;
 		}
 		sess->ct_oldest_mid = mid;
-		if (sess->ct_outstanding >= freed)
-			sess->ct_outstanding -= freed;
+		if (sess->ct_mid_range_size >= freed)
+			sess->ct_mid_range_size -= freed;
 		else
-			sess->ct_outstanding = 0;
+			sess->ct_mid_range_size = 0;
 	}
 
 	/*
@@ -570,7 +570,7 @@ static void vmsmb_release_mid(struct vmsmb_session *sess,
 	 *
 	 * mrxsmb runs this on every demux response, before the credit
 	 * release.  Computing it here (post-clear, pre-fold) keeps the
-	 * formula's `outstanding` matching the post-release value used in
+	 * formula's `mid_range_size` matching the post-release value used in
 	 * the original (mrxsmb subtracts before EWMA at +0x1c000217c).
 	 */
 	{
@@ -592,7 +592,7 @@ static void vmsmb_release_mid(struct vmsmb_session *sess,
  * post-reserve OOM) and sync-transact timeout.  Atomically claims
  * ownership of @req via the same -EINPROGRESS → sentinel transition
  * that channel_cb uses, then clears all chain slots and decrements
- * outstanding.  If channel_cb already claimed the request (status was
+ * mid_range_size.  If channel_cb already claimed the request (status was
  * something other than -EINPROGRESS at lock entry), we exit without
  * touching anything — channel_cb's complete_req path will run
  * release_mid normally.
@@ -624,10 +624,10 @@ static bool vmsmb_unreserve(struct vmsmb_session *sess,
 			sess->ct_mid_table[mid % sess->ct_max_credits] = NULL;
 	}
 
-	if (sess->ct_outstanding >= req->credit_charge)
-		sess->ct_outstanding -= req->credit_charge;
+	if (sess->ct_mid_range_size >= req->credit_charge)
+		sess->ct_mid_range_size -= req->credit_charge;
 	else
-		sess->ct_outstanding = 0;
+		sess->ct_mid_range_size = 0;
 
 	/* Advance oldest_mid past now-empty leading slots. */
 	while (sess->ct_oldest_mid < sess->ct_next_mid &&
@@ -671,7 +671,7 @@ static inline void vmsmb_complete_req(struct vmsmb_request *req)
 	}
 
 	/* Release mid_table slot + sweep oldest_mid forward + decrement
-	 * outstanding.  Must run before completing the waiter so a sender
+	 * mid_range_size.  Must run before completing the waiter so a sender
 	 * woken by ct_send_wait sees the updated state. */
 	vmsmb_release_mid(req->sess, req);
 
@@ -751,7 +751,7 @@ static void vmsmb_process_data(struct vmsmb_session *sess,
 			 * sender path sees the claim taken and exits without
 			 * touching @req.  Without this, transact timeout's
 			 * unreserve would clear the slot + decrement
-			 * outstanding while channel_cb still holds @req,
+			 * mid_range_size while channel_cb still holds @req,
 			 * dereferencing freed stack memory after the sender
 			 * returns -ETIMEDOUT (use-after-free, panic in
 			 * subsequent grow_mid_table rehash). */
@@ -898,7 +898,7 @@ static void vmsmb_channel_cb(void *ctx)
 	 * dispatch responses. Otherwise, leave packets in the ring
 	 * buffer for the synchronous receive path (version negotiation).
 	 */
-	if (READ_ONCE(sess->ct_outstanding) || sess->current_recv) {
+	if (READ_ONCE(sess->ct_mid_range_size) || sess->current_recv) {
 		struct hv_ring_buffer_info *rbi = &sess->channel->inbound;
 		u8 *ring = hv_get_ring_buffer(rbi);
 		bool processed_any = false;
@@ -1000,7 +1000,7 @@ int vmsmb_open_channel(struct vmsmb_session *sess)
 	init_waitqueue_head(&sess->ct_send_wait);
 	sess->ct_oldest_mid  = 0;
 	sess->ct_next_mid    = 0;
-	sess->ct_outstanding = 0;
+	sess->ct_mid_range_size = 0;
 	sess->ct_live_window = VMSMB_INITIAL_CREDITS;
 	atomic_set(&sess->ct_pending_grant, 0);
 	sess->ct_avg_lat_us  = 0;
@@ -1261,7 +1261,7 @@ static int vmsmb_send_recv_sync(struct vmsmb_session *sess,
  *
  * Builds the on-wire frame [VMpipeHdr][StreamHdr][SMB2 PDU(s)] in
  * @send_buf, then calls vmsmb_reserve_credits to atomically allocate
- * MID(s) + register @req in mid_table + bump outstanding under ct_lock,
+ * MID(s) + register @req in mid_table + bump mid_range_size under ct_lock,
  * patching MIDs into the SMB2 chain in-place.  Then transmits via
  * vmbus_sendpacket (serialized by send_mutex).
  *
@@ -1325,7 +1325,7 @@ static int vmsmb_submit(struct vmsmb_session *sess,
 	 * Reserve credits + assign MIDs into the chain (in-place).  Returns
 	 * -EBUSY on credit-side timeout, -EINTR on signal, 0 on success.
 	 * Server's MID window dictates how many requests it will accept;
-	 * the outstanding-based gate mirrors that without trusting
+	 * the mid_range_size-based gate mirrors that without trusting
 	 * cumulative grants.
 	 */
 	ret = vmsmb_reserve_credits(sess, chain, req_len, req);
@@ -1517,7 +1517,7 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 		 * if channel_cb already took ownership (status != -EINPROGRESS
 		 * at lock entry), unreserve returns false and we fall through
 		 * to wait again briefly for the in-flight completion.  If we
-		 * win the claim, slots are cleared + outstanding decremented
+		 * win the claim, slots are cleared + mid_range_size decremented
 		 * inside ct_lock.
 		 *
 		 * We do NOT refund grants — server may still respond later,

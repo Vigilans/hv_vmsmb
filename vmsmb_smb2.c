@@ -56,7 +56,7 @@ static void vmsmb_fill_hdr(struct smb2_hdr *hdr, u16 command,
 	/*
 	 * MessageId is left zero here; vmsmb_reserve_credits walks the chain
 	 * in transport context and assigns the actual MID under ct_lock,
-	 * keeping MID allocation atomic with outstanding/mid_table updates
+	 * keeping MID allocation atomic with mid_range_size/mid_table updates
 	 * (mrxsmb.sys-style).
 	 */
 	hdr->Id.SyncId.TreeId = cpu_to_le32(tree_id);
