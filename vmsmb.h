@@ -497,7 +497,7 @@ int vmsmb_smb2_close(struct vmsmb_session *sess, u32 tree_id,
 		     struct vmsmb_fid *fid);
 int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 			    const char *path,
-			    u32 desired_access, u32 create_options,
+			    u32 desired_access, u32 disposition, u32 create_options,
 			    struct vmsmb_file_info *info);
 int vmsmb_smb2_create_ioctl_close(struct vmsmb_session *sess, u32 tree_id,
 				  const char *path,

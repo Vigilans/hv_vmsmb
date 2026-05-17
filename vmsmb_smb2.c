@@ -691,21 +691,22 @@ out:
 }
 
 /*
- * SMB2 CREATE+CLOSE compound — halves round-trips for metadata probe paths
- * (lookup, getattr cache-miss).
+ * SMB2 CREATE+CLOSE compound — halves round-trips for metadata operations
+ * (lookup, getattr probe; also mkdir / unlink / rmdir via DELETE_ON_CLOSE).
  *
  * Ported from CIFS smb2_compound_op() (fs/smb/client/smb2inode.c): two PDUs
  * chained via hdr1->NextCommand (8-byte aligned offset to PDU2); PDU2 sets
  * SMB2_FLAGS_RELATED_OPERATIONS and inherits the CREATE'd fid by passing
  * COMPOUND_FID. MS-SMB2 §3.2.4.1.4 "Sending Compounded Requests".
  *
- * Simplified: fixed disposition=FILE_OPEN (probe only, no create/overwrite);
- * no middle op (CIFS supports CREATE+{set_eof,set_basic_info,...}+CLOSE);
- * CLOSE failure is non-fatal (host-side fid, no leak risk).
+ * Disposition is caller-controlled (FILE_OPEN for probe; FILE_CREATE for
+ * mkdir; FILE_OPEN with CREATE_DELETE_ON_CLOSE for unlink/rmdir).  CLOSE
+ * status is surfaced when CREATE succeeded — unlink/rmdir rely on CLOSE
+ * to commit DELETE_ON_CLOSE, so a server-side delete-veto must propagate.
  */
 int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 			    const char *path,
-			    u32 desired_access, u32 create_options,
+			    u32 desired_access, u32 disposition, u32 create_options,
 			    struct vmsmb_file_info *info)
 {
 	u8 *pdu_buf, *resp_buf;
@@ -755,7 +756,7 @@ int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 	creq->FileAttributes = cpu_to_le32(FILE_ATTRIBUTE_NORMAL);
 	creq->ShareAccess = FILE_SHARE_READ_LE | FILE_SHARE_WRITE_LE |
 			    FILE_SHARE_DELETE_LE;
-	creq->CreateDisposition = cpu_to_le32(FILE_OPEN);
+	creq->CreateDisposition = cpu_to_le32(disposition);
 	creq->CreateOptions = cpu_to_le32(create_options);
 	creq->NameOffset = cpu_to_le16(sizeof(struct smb2_create_req));
 	creq->NameLength = cpu_to_le16(name_len);
@@ -855,7 +856,12 @@ int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 		}
 	}
 
-	/* Validate CLOSE response (non-fatal — fid is host-side). */
+	/* Validate CLOSE response.  When CREATE succeeded, surface the CLOSE
+	 * status: unlink/rmdir use CREATE_DELETE_ON_CLOSE, so the actual
+	 * delete commits at CLOSE and any error there must propagate.  Probe
+	 * paths (lookup/getattr) only call us when they would otherwise have
+	 * issued a separate CLOSE anyway, so seeing CLOSE errors there is
+	 * still correct. */
 	next_off = le32_to_cpu(hdr1->NextCommand);
 	if (next_off == 0 || next_off >= resp_len ||
 	    resp_len - next_off < sizeof(struct smb2_hdr)) {
@@ -868,9 +874,7 @@ int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 		pr_debug("compound: CLOSE response bad magic\n");
 		goto out;
 	}
-	if (hdr2->Status != STATUS_SUCCESS)
-		pr_debug("compound CLOSE NTSTATUS 0x%08x\n",
-			 le32_to_cpu(hdr2->Status));
+	ret = vmsmb_check_status(hdr2, "CLOSE");
 
 out:
 	kfree(resp_buf);
@@ -1729,27 +1733,20 @@ hclose:
 /*
  * SMB2 unlink — delete a file or reparse point.
  *
- * Port of CIFS smb2_unlink() (fs/smb/client/smb2inode.c:1108-1110):
- * DELETE_ON_CLOSE + OPEN_REPARSE_POINT ensures reparse points are
- * deleted rather than followed.
- *
- * The actual deletion is committed at CLOSE time, so CLOSE errors
- * (e.g. server-side delete-veto) must be surfaced — unlike the probe
- * paths in vmsmb_smb2_create_close where CLOSE is just fid release.
+ * Port of CIFS smb2_unlink() (fs/smb/client/smb2inode.c:1071): a
+ * hand-rolled compound CREATE(FILE_OPEN, DELETE_ON_CLOSE)+CLOSE.  The
+ * actual deletion commits at CLOSE; vmsmb_smb2_create_close surfaces
+ * CLOSE status when CREATE succeeds, so a server-side delete-veto
+ * propagates.  OPEN_REPARSE_POINT ensures reparse points are deleted
+ * rather than followed.
  */
 int vmsmb_smb2_unlink(struct vmsmb_session *sess, u32 tree_id,
 		      const char *path)
 {
-	struct vmsmb_fid fid;
-	int ret;
-
-	ret = vmsmb_smb2_create(sess, tree_id, path, DELETE,
-				FILE_OPEN,
-				CREATE_DELETE_ON_CLOSE | OPEN_REPARSE_POINT,
-				&fid, NULL);
-	if (ret)
-		return ret;
-	return vmsmb_smb2_close(sess, tree_id, &fid);
+	return vmsmb_smb2_create_close(sess, tree_id, path, DELETE,
+				       FILE_OPEN,
+				       CREATE_DELETE_ON_CLOSE | OPEN_REPARSE_POINT,
+				       NULL);
 }
 
 /*
