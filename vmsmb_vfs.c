@@ -674,6 +674,115 @@ static int vmsmb_create(struct mnt_idmap *idmap, struct inode *dir,
 }
 
 /*
+ * Atomic open: fold lookup + create + open into a single SMB2 CREATE.
+ *
+ * Port of CIFS cifs_atomic_open() (fs/smb/client/dir.c).  Without this,
+ * O_CREAT opens take 4 round-trips (lookup CREATE+CLOSE → vmsmb_create
+ * CREATE+CLOSE → vmsmb_file_open CREATE).  With it, a single CREATE
+ * suffices: the response carries the file_info needed to populate the
+ * inode, and the returned fid is stashed in file->private_data for
+ * subsequent read/write.
+ *
+ * Non-O_CREAT opens fall back to the lookup + .open path — matches CIFS
+ * (dir.c:540-549), since the client can't tell from the dentry alone
+ * whether the target is a regular file or a directory, and a CREATE
+ * round-trip to discover that is wasteful.
+ */
+static int vmsmb_atomic_open(struct inode *dir, struct dentry *dentry,
+			     struct file *file, unsigned int open_flag,
+			     umode_t mode)
+{
+	struct vmsmb_sb_info *sbi = VMSMB_SB(dir->i_sb);
+	struct vmsmb_session *sess = sbi->sess;
+	struct vmsmb_file_ctx *ctx;
+	struct vmsmb_file_info info;
+	struct inode *inode;
+	struct dentry *alias;
+	char *path;
+	u32 access = 0;
+	u32 disposition;
+	int ret;
+
+	if (!(open_flag & O_CREAT)) {
+		if (!d_in_lookup(dentry))
+			return -ENOENT;
+		return finish_no_open(file, vmsmb_lookup(dir, dentry, 0));
+	}
+
+	/* CIFS __cifs_do_create() dir.c:311-323 */
+	if (open_flag & O_EXCL)
+		disposition = FILE_CREATE;
+	else if (open_flag & O_TRUNC)
+		disposition = FILE_OVERWRITE_IF;
+	else
+		disposition = FILE_OPEN_IF;
+
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+
+	path = vmsmb_build_path(dentry);
+	if (IS_ERR(path)) {
+		kfree(ctx);
+		return PTR_ERR(path);
+	}
+
+	if (file->f_mode & FMODE_READ)
+		access |= VMSMB_READ_ACCESS;
+	if (file->f_mode & FMODE_WRITE)
+		access |= VMSMB_WRITE_ACCESS;
+
+	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, access, disposition,
+				CREATE_NOT_DIR, &ctx->fid, &info);
+	kfree(path);
+	if (ret) {
+		kfree(ctx);
+		return ret;
+	}
+
+	inode = vmsmb_iget(dir->i_sb, &info);
+	if (IS_ERR(inode)) {
+		vmsmb_smb2_close(sess, sbi->tree_id, &ctx->fid);
+		kfree(ctx);
+		return PTR_ERR(inode);
+	}
+
+	/* CIFS dir.c:582-588 */
+	if (d_in_lookup(dentry)) {
+		alias = d_splice_alias(inode, dentry);
+		if (IS_ERR(alias)) {
+			vmsmb_smb2_close(sess, sbi->tree_id, &ctx->fid);
+			kfree(ctx);
+			return PTR_ERR(alias);
+		}
+		if (alias)
+			dentry = alias;
+	} else {
+		d_instantiate(dentry, inode);
+	}
+
+	refcount_set(&ctx->ref, 1);
+	ctx->sess = sess;
+	ctx->tree_id = sbi->tree_id;
+	file->private_data = ctx;
+	VMSMB_I(inode)->active_ctx = ctx;
+	i_size_write(inode, info.size);
+
+	/* CIFS dir.c:590-591 — only when we know the file was just created */
+	if ((open_flag & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL))
+		file->f_mode |= FMODE_CREATED;
+
+	ret = finish_open(file, dentry, generic_file_open);
+	if (ret) {
+		vmsmb_smb2_close(sess, sbi->tree_id, &ctx->fid);
+		VMSMB_I(inode)->active_ctx = NULL;
+		file->private_data = NULL;
+		kfree(ctx);
+	}
+	return ret;
+}
+
+/*
  * Create a directory.
  *
  * Port of CIFS cifs_mkdir() (fs/smb/client/inode.c): CREATE with
@@ -1045,6 +1154,7 @@ const struct inode_operations vmsmb_dir_inode_ops = {
 	.getattr	= vmsmb_getattr,
 	.setattr	= vmsmb_setattr,
 	.create		= vmsmb_create,
+	.atomic_open	= vmsmb_atomic_open,
 	.mkdir		= vmsmb_mkdir,
 	.unlink		= vmsmb_unlink,
 	.rmdir		= vmsmb_rmdir,
