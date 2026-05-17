@@ -1458,18 +1458,10 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 	if (file->f_mode & FMODE_WRITE)
 		access |= VMSMB_WRITE_ACCESS;
 
-	if (file->f_flags & O_CREAT) {
-		if (file->f_flags & O_EXCL)
-			disposition = FILE_CREATE;
-		else if (file->f_flags & O_TRUNC)
-			disposition = FILE_OVERWRITE_IF;
-		else
-			disposition = FILE_OPEN_IF;
-	} else if (file->f_flags & O_TRUNC) {
+	if (file->f_flags & O_TRUNC)
 		disposition = FILE_OVERWRITE_IF;
-	} else {
+	else
 		disposition = FILE_OPEN;
-	}
 
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, access, disposition,
 				CREATE_NOT_DIR,
