@@ -85,6 +85,37 @@ See [docs/performance.md](docs/performance.md) for the full optimization journey
 
 [pjdfstest](https://github.com/pjd/pjdfstest): 8,787 / 8,789 pass. The 2 failures are `utimensat` timestamp precision (Windows FILETIME granularity vs POSIX nanoseconds).
 
+## Hardlinks and symlinks
+
+By default, `link(2)` and `symlink(2)` on a VSMB share fail with `Permission denied`. Both link types are blocked at the host (vmusrv) by default and need explicit unlocking on the host.
+
+### Hardlink
+
+`link(2)` is denied at NTFS-level ACL check if the per-VM token (`NT VIRTUAL MACHINE\<vmid>`) lacks `SeBackupPrivilege`. Set `UseShareRootIdentity` and `TakeBackupPrivilege` in the share's `VirtualSmbShareOptions` when creating the share:
+
+```jsonc
+{
+  "Name": "Shared",
+  "Path": "C:\\Path\\To\\Shared",
+  "Options": {
+    "UseShareRootIdentity": true,
+    "TakeBackupPrivilege": true
+  }
+}
+```
+
+The links created over the share are owned by `NT AUTHORITY\SYSTEM` on the host.
+
+### Symlink
+
+`symlink(2)` is denied by an orphan `IsAdmin` boolean gate which is not exposed by any HCS API or share option. As a workaround, a script [`scripts/vsmb_enable_symlink.py`](scripts/vsmb_enable_symlink.py) is provided to directly attach to the per-VM `vmwp.exe` and flip the byte:
+
+```powershell
+sudo python vsmb_enable_symlink.py <vm-name>
+```
+
+The script should be run on the host as Administrator, after the VM has booted and a share is mounted, and lasts until the next cold restart of the VM.
+
 ## Maintenance Status
 
 This project is primarily for personal use. I will maintain it for my own needs but do not plan to provide support beyond that scope.
