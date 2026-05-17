@@ -2066,8 +2066,9 @@ close:
  * SMB2 SET_INFO (FileBasicInformation) — push timestamps + file attributes.
  *
  * Ported from CIFS smb2_set_file_info_compound() / set_basic_info path
- * (fs/smb/client/smb2inode.c). Issues compound CREATE+SET_INFO+CLOSE via
- * vmsmb_smb2_create_setinfo_close().
+ * (fs/smb/client/smb2inode.c).  CIFS uses compound CREATE+SET_INFO+CLOSE;
+ * we do three separate requests.  Compound was reverted (696e701) because
+ * vmusrv misparses compound SET_INFO PDUs.
  *
  * Per MS-FSCC 2.4.7: timestamp value 0 means "do not change", -1 means
  * "maintain current". FileAttributes = 0 also means "do not change".
@@ -2142,8 +2143,10 @@ close:
 /*
  * SMB2 SET_INFO (FileEndOfFileInformation) — truncate/extend a file.
  *
- * Ported from CIFS smb2_set_file_size() (fs/smb/client/smb2ops.c). Issues
- * compound CREATE+SET_INFO+CLOSE via vmsmb_smb2_create_setinfo_close().
+ * Ported from CIFS smb2_set_file_size() (fs/smb/client/smb2ops.c).
+ * CIFS uses compound CREATE+SET_INFO+CLOSE; we do three separate
+ * requests.  Compound was reverted (696e701) because vmusrv misparses
+ * compound SET_INFO PDUs.
  *
  * Payload is an 8-byte LE __le64 EndOfFile value (MS-FSCC 2.4.13).
  */
