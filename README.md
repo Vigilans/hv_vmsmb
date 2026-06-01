@@ -91,7 +91,7 @@ By default, `link(2)` and `symlink(2)` on a VSMB share fail with `Permission den
 
 ### Hardlink
 
-`link(2)` is denied at NTFS-level ACL check if the per-VM token (`NT VIRTUAL MACHINE\<vmid>`) lacks `SeBackupPrivilege`. Set `UseShareRootIdentity` and `TakeBackupPrivilege` in the share's `VirtualSmbShareOptions` when creating the share:
+`link(2)` is denied at NTFS-level ACL check if the per-VM token (`NT VIRTUAL MACHINE\<vmid>`) lacks `SeBackupPrivilege`. Set `UseShareRootIdentity` and `TakeBackupPrivilege` in the share's `VirtualSmbShareOptions`:
 
 ```jsonc
 {
@@ -104,6 +104,8 @@ By default, `link(2)` and `symlink(2)` on a VSMB share fail with `Permission den
 }
 ```
 
+Note: When adding shares through HCS, shares using `UseShareRootIdentity` must be added with `HcsModifyComputeSystem` after Start instead of being embedded in the Create document. The Create path fails with `0x80070006` when `UseShareRootIdentity` is set.
+
 The links created over the share are owned by `NT AUTHORITY\SYSTEM` on the host.
 
 ### Symlink
@@ -115,6 +117,19 @@ sudo python vsmb_enable_symlink.py <vm-name>
 ```
 
 The script should be run on the host as Administrator, after the VM has booted and a share is mounted, and lasts until the next cold restart of the VM.
+
+For startup automation, use `--wait [seconds]` to wait for the VM and VSMB session before flipping the byte:
+
+```powershell
+sudo python scripts\vsmb_enable_symlink.py <vm-name> --wait 300
+```
+
+For example, if the VM is managed by NSSM, a `Start/Post` hook can run the script after the VM process starts (increase NSSM's default 60s hook deadline separately if it is shorter than the wait timeout):
+
+```powershell
+sudo nssm set <service-name> AppEvents Start/Post `
+  '"C:\Path\To\python.exe" "C:\Path\To\hv_vmsmb\scripts\vsmb_enable_symlink.py" <vm-name> --wait 300'
+```
 
 ## Maintenance Status
 

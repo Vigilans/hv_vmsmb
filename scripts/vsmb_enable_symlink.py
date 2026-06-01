@@ -7,6 +7,11 @@ Run as Administrator after the guest VM has booted and mounted at least
 one VSMB share:
 
     sudo python vsmb_enable_symlink.py <vm-name>
+
+To wait for VM boot and session establishment (e.g. for autostart):
+
+    sudo python vsmb_enable_symlink.py <vm-name> --wait
+    sudo python vsmb_enable_symlink.py <vm-name> --wait 600
 """
 from __future__ import annotations
 
@@ -109,11 +114,12 @@ def _enable_se_debug() -> bool:
         k32.CloseHandle(htok)
 
 
-def _find_vmwp_pid(vm: str | None) -> tuple[int, str] | None:
+def _find_vmwp_pid(vm: str | None, quiet: bool = False) -> tuple[int, str] | None:
     try:
         out = subprocess.run(['hcsdiag', 'list'], capture_output=True, text=True, check=True).stdout
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f'hcsdiag list failed: {e}', file=sys.stderr)
+        if not quiet:
+            print(f'hcsdiag list failed: {e}', file=sys.stderr)
         return None
 
     vms: list[tuple[str, str, str]] = []  # (id, state, name)
@@ -133,17 +139,19 @@ def _find_vmwp_pid(vm: str | None) -> tuple[int, str] | None:
         ql = vm.lower()
         matched = [v for v in running if v[0].lower() == ql or v[2].lower() == ql]
         if not matched:
-            print(f'no running VM matched "{vm}". running:', file=sys.stderr)
-            for v in running:
-                print(f'  {v[0]}  {v[2]}', file=sys.stderr)
+            if not quiet:
+                print(f'no running VM matched "{vm}". running:', file=sys.stderr)
+                for v in running:
+                    print(f'  {v[0]}  {v[2]}', file=sys.stderr)
             return None
         target = matched[0]
     elif len(running) == 1:
         target = running[0]
     else:
-        print('multiple running VMs, specify by name or id:', file=sys.stderr)
-        for v in running:
-            print(f'  {v[0]}  {v[2]}', file=sys.stderr)
+        if not quiet:
+            print('multiple running VMs, specify by name or id:', file=sys.stderr)
+            for v in running:
+                print(f'  {v[0]}  {v[2]}', file=sys.stderr)
         return None
 
     out2 = subprocess.run(
@@ -156,7 +164,8 @@ def _find_vmwp_pid(vm: str | None) -> tuple[int, str] | None:
             pid_str, cmdline = line.split('|', 1)
             if target[0].lower() in cmdline.lower():
                 return int(pid_str), target[0]
-    print(f'no vmwp.exe matched VM {target[0]}', file=sys.stderr)
+    if not quiet:
+        print(f'no vmwp.exe matched VM {target[0]}', file=sys.stderr)
     return None
 
 
@@ -242,24 +251,59 @@ def _flip(hp: int, sess: _Session) -> bool:
     return _rpm(hp, sess.address + SESSION_ISADMIN_OFFSET, 1) == b'\x01'
 
 
+def _wait_for_session(vm: str | None, timeout: int) -> tuple[int, str] | None:
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    print(f'waiting up to {timeout}s for VM + VSMB session...', flush=True)
+    pid = None
+    vm_id = None
+    while _time.monotonic() < deadline:
+        r = _find_vmwp_pid(vm, quiet=True)
+        if r is not None:
+            pid, vm_id = r
+            hp = k32.OpenProcess(
+                PROCESS_VM_READ | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
+                False, pid)
+            if hp:
+                base = _find_vmusrv_base(hp)
+                if base:
+                    sessions = _walk_sessions(hp, base)
+                    if sessions:
+                        k32.CloseHandle(hp)
+                        return pid, vm_id
+                k32.CloseHandle(hp)
+        _time.sleep(3)
+    what = 'VSMB session' if pid else 'VM'
+    print(f'timeout: no {what} after {timeout}s', file=sys.stderr)
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('vm', nargs='?', help='VM name or UUID (auto-discovers vmwp.exe)')
     ap.add_argument('--pid', type=int, help='Explicit vmwp.exe PID')
     ap.add_argument('--list', action='store_true', help='List sessions and exit, do not write')
+    ap.add_argument('--wait', nargs='?', type=int, const=300, default=None,
+                    metavar='SECONDS',
+                    help='Wait for VM and VSMB session to appear (default: 300s)')
     args = ap.parse_args()
+
+    if not _enable_se_debug():
+        return 1
 
     if args.pid:
         pid, vm = args.pid, '(explicit pid)'
+    elif args.wait is not None:
+        r = _wait_for_session(args.vm, args.wait)
+        if r is None:
+            return 1
+        pid, vm = r
     else:
         r = _find_vmwp_pid(args.vm)
         if r is None:
             return 1
         pid, vm = r
     print(f'target: vmwp.exe pid={pid} (VM={vm})')
-
-    if not _enable_se_debug():
-        return 1
 
     hp = k32.OpenProcess(
         PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION,
