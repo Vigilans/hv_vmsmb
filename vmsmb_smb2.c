@@ -2060,12 +2060,171 @@ close:
 }
 
 /*
+ * SMB2 CREATE + SET_INFO 2-PDU compound — vmusrv requires SET_INFO to be
+ * the terminal PDU in a compound chain.  SrvContinueSetInfo aliases the
+ * response descriptor onto the request descriptor and truncates the
+ * shared size to 0x42, so any subsequent PDU in the chain never gets
+ * continued (no wire response).  Caller must follow up with a separate
+ * vmsmb_smb2_close() on the returned FID.
+ *
+ * Layout: [CREATE | pad | SET_INFO(final)], NextCommand on CREATE only,
+ * SET_INFO uses SMB2_FLAGS_RELATED_OPERATIONS + COMPOUND_FID.
+ *
+ * Cleanup contract — out_fid is zeroed on entry, then:
+ * - If CREATE fails: out_fid stays zero; caller must NOT close.
+ * - If CREATE succeeds: out_fid is set immediately, before SET_INFO is
+ *   inspected; caller must close regardless of whether SET_INFO parsing
+ *   returned 0 or an error.
+ */
+static int vmsmb_smb2_create_setinfo(struct vmsmb_session *sess, u32 tree_id,
+				     const char *path, u32 desired_access,
+				     u8 info_type, u8 file_info_class,
+				     const void *payload, u32 payload_len,
+				     struct vmsmb_fid *out_fid)
+{
+	u8 *pdu_buf, *resp_buf;
+	struct smb2_create_req *creq;
+	struct smb2_set_info_req *sreq;
+	const struct smb2_create_rsp *crsp;
+	const struct smb2_hdr *hdr1, *hdr2;
+	__le16 *name_utf16;
+	int name_len;
+	u32 resp_len;
+	u32 name_end, ctx_offset, create_pdu_len, set_pdu_off, total_len;
+	u32 next1;
+	struct create_context *qfid_ctx;
+	int ret;
+
+	memset(out_fid, 0, sizeof(*out_fid));
+
+	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
+	if (!resp_buf)
+		return -ENOMEM;
+
+	name_utf16 = vmsmb_path_to_utf16(path, &name_len);
+	if (!name_utf16) {
+		kfree(resp_buf);
+		return -ENOMEM;
+	}
+
+	name_end = sizeof(struct smb2_create_req) + max_t(int, name_len, 1);
+	ctx_offset = ALIGN(name_end, 8);
+	create_pdu_len = ctx_offset + 24;		/* QFid ctx = 24 bytes */
+	set_pdu_off = ALIGN(create_pdu_len, 8);
+	total_len = set_pdu_off + sizeof(struct smb2_set_info_req) + payload_len;
+
+	pdu_buf = kzalloc(total_len, GFP_KERNEL);
+	if (!pdu_buf) {
+		kfree(name_utf16);
+		kfree(resp_buf);
+		return -ENOMEM;
+	}
+
+	/* PDU #1: CREATE with NextCommand = set_pdu_off */
+	creq = (struct smb2_create_req *)pdu_buf;
+	vmsmb_fill_hdr(&creq->hdr, SMB2_CREATE_HE, sess, tree_id);
+	creq->hdr.NextCommand = cpu_to_le32(set_pdu_off);
+	creq->StructureSize = cpu_to_le16(57);
+	creq->ImpersonationLevel = cpu_to_le32(0x02);
+	creq->DesiredAccess = cpu_to_le32(desired_access);
+	creq->FileAttributes = cpu_to_le32(FILE_ATTRIBUTE_NORMAL);
+	creq->ShareAccess = FILE_SHARE_READ_LE | FILE_SHARE_WRITE_LE |
+			    FILE_SHARE_DELETE_LE;
+	creq->CreateDisposition = cpu_to_le32(FILE_OPEN);
+	creq->CreateOptions = 0;
+	creq->NameOffset = cpu_to_le16(sizeof(struct smb2_create_req));
+	creq->NameLength = cpu_to_le16(name_len);
+	if (name_len > 0)
+		memcpy(pdu_buf + sizeof(struct smb2_create_req), name_utf16, name_len);
+	kfree(name_utf16);
+
+	qfid_ctx = (struct create_context *)(pdu_buf + ctx_offset);
+	qfid_ctx->hdr.Next = 0;
+	qfid_ctx->hdr.NameOffset = cpu_to_le16(16);
+	qfid_ctx->hdr.NameLength = cpu_to_le16(4);
+	qfid_ctx->hdr.DataOffset = 0;
+	qfid_ctx->hdr.DataLength = 0;
+	memcpy(qfid_ctx->Buffer, SMB2_CREATE_QUERY_ON_DISK_ID, 4);
+	creq->CreateContextsOffset = cpu_to_le32(ctx_offset);
+	creq->CreateContextsLength = cpu_to_le32(24);
+
+	/* PDU #2: SET_INFO(final), RELATED, using COMPOUND_FID */
+	sreq = (struct smb2_set_info_req *)(pdu_buf + set_pdu_off);
+	vmsmb_fill_hdr(&sreq->hdr, SMB2_SET_INFO_HE, sess, tree_id);
+	sreq->hdr.Flags |= SMB2_FLAGS_RELATED_OPERATIONS;
+	sreq->StructureSize = cpu_to_le16(33);
+	sreq->InfoType = info_type;
+	sreq->FileInfoClass = file_info_class;
+	sreq->BufferLength = cpu_to_le32(payload_len);
+	sreq->BufferOffset = cpu_to_le16(sizeof(struct smb2_set_info_req));
+	sreq->AdditionalInformation = 0;
+	sreq->PersistentFileId = COMPOUND_FID;
+	sreq->VolatileFileId = COMPOUND_FID;
+	memcpy(sreq->Buffer, payload, payload_len);
+
+	pr_debug("CREATE+SET_INFO compound: path='%s' class=%u total=%u\n",
+		 path, file_info_class, total_len);
+
+	ret = vmsmb_smb2_transact(sess, pdu_buf, total_len,
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	kfree(pdu_buf);
+	if (ret)
+		goto out;
+
+	/* CREATE response */
+	hdr1 = vmsmb_check_resp(resp_buf, resp_len);
+	if (!hdr1) {
+		ret = -EPROTO;
+		goto out;
+	}
+	ret = vmsmb_check_status(hdr1, "CREATE");
+	if (ret)
+		goto out;
+
+	if (resp_len < sizeof(struct smb2_create_rsp)) {
+		ret = -EPROTO;
+		goto out;
+	}
+
+	/*
+	 * Surface FID to caller as soon as CREATE is known to have succeeded,
+	 * BEFORE inspecting SET_INFO.  SET_INFO parse failure must not leak
+	 * the host-side handle.
+	 */
+	crsp = (const struct smb2_create_rsp *)resp_buf;
+	out_fid->persistent = crsp->PersistentFileId;
+	out_fid->volatile_id = crsp->VolatileFileId;
+
+	/* SET_INFO response at hdr1->NextCommand */
+	next1 = le32_to_cpu(hdr1->NextCommand);
+	if (!next1 || next1 >= resp_len ||
+	    resp_len - next1 < sizeof(struct smb2_hdr)) {
+		pr_warn_ratelimited("hv_vmsmb: compound: missing SET_INFO resp (next=%u resp=%u)\n",
+				    next1, resp_len);
+		ret = -EPROTO;
+		goto out;
+	}
+	hdr2 = (const struct smb2_hdr *)(resp_buf + next1);
+	if (hdr2->ProtocolId != SMB2_PROTO_NUMBER) {
+		ret = -EPROTO;
+		goto out;
+	}
+	ret = vmsmb_check_status(hdr2, "SET_INFO");
+
+out:
+	kfree(resp_buf);
+	return ret;
+}
+
+/*
  * SMB2 SET_INFO (FileBasicInformation) — push timestamps + file attributes.
  *
  * Ported from CIFS smb2_set_file_info_compound() / set_basic_info path
- * (fs/smb/client/smb2inode.c).  CIFS uses compound CREATE+SET_INFO+CLOSE;
- * we do three separate requests.  Compound was reverted (696e701) because
- * vmusrv misparses compound SET_INFO PDUs.
+ * (fs/smb/client/smb2inode.c).  CIFS uses a 3-PDU CREATE+SET_INFO+CLOSE
+ * compound; vmusrv requires SET_INFO to be the terminal PDU in a chain
+ * (SrvContinueSetInfo truncates the shared compound descriptor to 0x42),
+ * so we issue a 2-PDU CREATE+SET_INFO compound plus a standalone CLOSE
+ * on the real FID — 2 RT instead of CIFS's 1 RT or the prior 3 RT.
  *
  * Per MS-FSCC 2.4.7: timestamp value 0 means "do not change", -1 means
  * "maintain current". FileAttributes = 0 also means "do not change".
@@ -2078,72 +2237,23 @@ int vmsmb_smb2_set_basic_info(struct vmsmb_session *sess, u32 tree_id,
 			      const FILE_BASIC_INFO *binfo)
 {
 	struct vmsmb_fid fid;
-	u8 *pdu_buf, *resp_buf;
-	struct smb2_set_info_req *req;
-	const struct smb2_hdr *hdr;
-	u32 buf_len, pdu_len, resp_len;
 	int ret;
 
-	ret = vmsmb_smb2_create(sess, tree_id, path, FILE_WRITE_ATTRIBUTES,
-				FILE_OPEN, 0, &fid, NULL);
-	if (ret)
-		return ret;
-
-	buf_len = sizeof(struct smb2_set_info_req) + sizeof(*binfo);
-	pdu_buf = kzalloc(buf_len, GFP_KERNEL);
-	if (!pdu_buf) {
-		ret = -ENOMEM;
-		goto close;
-	}
-
-	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
-	if (!resp_buf) {
-		kfree(pdu_buf);
-		ret = -ENOMEM;
-		goto close;
-	}
-
-	req = (struct smb2_set_info_req *)pdu_buf;
-	vmsmb_fill_hdr(&req->hdr, SMB2_SET_INFO_HE, sess, tree_id);
-	req->StructureSize = cpu_to_le16(33);
-	req->InfoType = SMB2_O_INFO_FILE;
-	req->FileInfoClass = FILE_BASIC_INFORMATION;
-	req->BufferLength = cpu_to_le32(sizeof(*binfo));
-	req->BufferOffset = cpu_to_le16(sizeof(struct smb2_set_info_req));
-	req->AdditionalInformation = 0;
-	req->PersistentFileId = fid.persistent;
-	req->VolatileFileId = fid.volatile_id;
-	memcpy(req->Buffer, binfo, sizeof(*binfo));
-
-	pdu_len = sizeof(struct smb2_set_info_req) + sizeof(*binfo);
-
-	ret = vmsmb_smb2_transact(sess, pdu_buf, pdu_len,
-				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
-	kfree(pdu_buf);
-	if (ret)
-		goto free_resp;
-
-	hdr = vmsmb_check_resp(resp_buf, resp_len);
-	if (!hdr) {
-		ret = -EPROTO;
-		goto free_resp;
-	}
-
-	ret = vmsmb_check_status(hdr, "SET_INFO(basic)");
-
-free_resp:
-	kfree(resp_buf);
-close:
-	vmsmb_smb2_close(sess, tree_id, &fid);
+	ret = vmsmb_smb2_create_setinfo(sess, tree_id, path,
+					FILE_WRITE_ATTRIBUTES,
+					SMB2_O_INFO_FILE,
+					FILE_BASIC_INFORMATION,
+					binfo, sizeof(*binfo), &fid);
+	if (fid.persistent || fid.volatile_id)
+		vmsmb_smb2_close(sess, tree_id, &fid);
 	return ret;
 }
 /*
  * SMB2 SET_INFO (FileEndOfFileInformation) — truncate/extend a file.
  *
  * Ported from CIFS smb2_set_file_size() (fs/smb/client/smb2ops.c).
- * CIFS uses compound CREATE+SET_INFO+CLOSE; we do three separate
- * requests.  Compound was reverted (696e701) because vmusrv misparses
- * compound SET_INFO PDUs.
+ * Same 2-PDU + standalone CLOSE shape as vmsmb_smb2_set_basic_info()
+ * because vmusrv requires SET_INFO to be the terminal PDU in a chain.
  *
  * Payload is an 8-byte LE __le64 EndOfFile value (MS-FSCC 2.4.13).
  */
@@ -2151,64 +2261,16 @@ int vmsmb_smb2_set_eof(struct vmsmb_session *sess, u32 tree_id,
 		       const char *path, u64 eof)
 {
 	struct vmsmb_fid fid;
-	u8 *pdu_buf, *resp_buf;
-	struct smb2_set_info_req *req;
-	const struct smb2_hdr *hdr;
 	__le64 eof_le = cpu_to_le64(eof);
-	u32 buf_len, pdu_len, resp_len;
 	int ret;
 
-	ret = vmsmb_smb2_create(sess, tree_id, path, FILE_WRITE_DATA,
-				FILE_OPEN, 0, &fid, NULL);
-	if (ret)
-		return ret;
-
-	buf_len = sizeof(struct smb2_set_info_req) + sizeof(eof_le);
-	pdu_buf = kzalloc(buf_len, GFP_KERNEL);
-	if (!pdu_buf) {
-		ret = -ENOMEM;
-		goto close;
-	}
-
-	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
-	if (!resp_buf) {
-		kfree(pdu_buf);
-		ret = -ENOMEM;
-		goto close;
-	}
-
-	req = (struct smb2_set_info_req *)pdu_buf;
-	vmsmb_fill_hdr(&req->hdr, SMB2_SET_INFO_HE, sess, tree_id);
-	req->StructureSize = cpu_to_le16(33);
-	req->InfoType = SMB2_O_INFO_FILE;
-	req->FileInfoClass = FILE_END_OF_FILE_INFORMATION;
-	req->BufferLength = cpu_to_le32(sizeof(eof_le));
-	req->BufferOffset = cpu_to_le16(sizeof(struct smb2_set_info_req));
-	req->AdditionalInformation = 0;
-	req->PersistentFileId = fid.persistent;
-	req->VolatileFileId = fid.volatile_id;
-	memcpy(req->Buffer, &eof_le, sizeof(eof_le));
-
-	pdu_len = sizeof(struct smb2_set_info_req) + sizeof(eof_le);
-
-	ret = vmsmb_smb2_transact(sess, pdu_buf, pdu_len,
-				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
-	kfree(pdu_buf);
-	if (ret)
-		goto free_resp;
-
-	hdr = vmsmb_check_resp(resp_buf, resp_len);
-	if (!hdr) {
-		ret = -EPROTO;
-		goto free_resp;
-	}
-
-	ret = vmsmb_check_status(hdr, "SET_INFO(eof)");
-
-free_resp:
-	kfree(resp_buf);
-close:
-	vmsmb_smb2_close(sess, tree_id, &fid);
+	ret = vmsmb_smb2_create_setinfo(sess, tree_id, path,
+					FILE_WRITE_DATA,
+					SMB2_O_INFO_FILE,
+					FILE_END_OF_FILE_INFORMATION,
+					&eof_le, sizeof(eof_le), &fid);
+	if (fid.persistent || fid.volatile_id)
+		vmsmb_smb2_close(sess, tree_id, &fid);
 	return ret;
 }
 
