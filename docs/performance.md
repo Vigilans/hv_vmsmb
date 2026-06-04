@@ -288,16 +288,65 @@ Measured on `ls -laR` of a directory with 5,084 entries:
 Used by `get_reparse` for reading symlink targets. Saves 2 of 3
 round-trips.
 
-### CREATE+SET_INFO+CLOSE — host bug, not usable
+### CREATE+SET_INFO+CLOSE — SET_INFO must be terminal
 
-`vmusrv.dll` crashes with `FAIL_FAST` when SET_INFO is the middle
-operation of a compound. RE confirmed the bug is in
-`SrvContinueSetInfo` — it assumes a response buffer that the compound
-dispatcher doesn't allocate. IOCTL compounds work because
-`Smb2PostExecuteIoctl` has defensive buffer allocation.
+The CIFS-style 3-PDU `CREATE+SET_INFO+CLOSE` compound is not usable
+against `vmusrv.dll`. `SrvContinueSetInfo` corrupts the compound chain
+state after a successful SET_INFO, so the host cannot advance to the
+following CLOSE and no response is sent.
 
-These operations (truncate, chmod) use 3 separate round-trips instead.
-The cost is one extra ~170 us round-trip per metadata-only operation.
+The implemented form is `CREATE+SET_INFO(final)` plus a standalone
+`CLOSE`. SET_INFO is the last PDU in the compound, which avoids the
+broken continuation path. This changes `set_basic_info` / `set_eof`
+from 3 round-trips to 2 round-trips.
+
+Paths that need another operation after SET_INFO, such as hardlink and
+rename setattr handling, still use separate requests.
+
+Wall-time impact on `tar xf` is in the [Small-File / Metadata
+Workload](#small-file--metadata-workload) section.
+
+## Small-File / Metadata Workload
+
+The fio-cdm stages above measure bulk I/O. Archive extraction stresses
+a different path: many small creates, closes, stats, and timestamp
+updates.
+
+Benchmark: `tar xf linux-6.12.tar.xz` into a VSMB share. The archive
+contains 86,605 regular files plus directories and symlinks, and
+extracts to about 1.6 GB.
+
+| Stage | Wall | Δ | Main change |
+|---|---|---|---|
+| Pre-atomic_open | 4m19s | baseline | O_CREAT path used separate lookup, create, and open requests |
+| + atomic_open | 2m46s | -1m33s | O_CREAT path becomes one CREATE that instantiates the dentry |
+| + generalized CREATE+CLOSE compound | not isolated | small | metadata probes and simple create/unlink paths drop one round-trip |
+| Stable baseline rerun | **2m59s** | — | current atomic_open + CREATE+CLOSE baseline under host variance |
+| + 2-PDU SET_INFO compound | **2m55-56s** | -3-4s | timestamp SET_INFO path drops from 3 round-trips to 2 |
+| `tar -m` | **1m48s** | -1m11s | tar skips mtime restore, so the utimensat path is not executed |
+| Local ext4 on btrfs | 2.7s | — | local-filesystem reference |
+
+`atomic_open` is the dominant improvement. Before it, creating a file
+walked through lookup/probe, create, and open as separate SMB2 request
+sequences. The atomic path sends the final CREATE directly and lets VFS
+populate the new dentry from that result.
+
+The generalized `CREATE+CLOSE` helper reuses the same compound shape
+for metadata probes and simple create/unlink-style paths. It is not
+isolated in the table because it shipped together with adjacent VFS
+work, but it is part of the stable baseline.
+
+The SET_INFO compound targets the timestamp restore that `tar xf` runs
+near the end of each file. The win is small because it removes one
+round-trip, while most of the `tar xf` versus `tar -m` gap is host-side
+metadata work in the SET_INFO path.
+
+A future direction is deferred-close + FID-reuse for the utimensat
+path: keep the just-closed write FID briefly and issue timestamp
+SET_INFO on that FID instead of reopening by path. That removes the
+CREATE and CLOSE around each timestamp update; the hard part is
+invalidating the cached handle before sibling rename, unlink, or
+SET_INFO operations conflict with it.
 
 ## Q1 Write Gap Analysis
 
