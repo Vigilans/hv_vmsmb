@@ -992,8 +992,8 @@ static int vmsmb_link(struct dentry *old_dentry, struct inode *dir,
  * Read cached symlink target.
  *
  * Port of CIFS cifs_get_link() (fs/smb/client/cifsfs.c): the target
- * is resolved and cached at lookup time, so get_link just returns
- * the cached copy.
+ * is resolved and cached at lookup time; get_link returns a duplicate
+ * that VFS frees through delayed_call.
  */
 static const char *vmsmb_get_link(struct dentry *dentry, struct inode *inode,
 				   struct delayed_call *done)
@@ -1003,12 +1003,15 @@ static const char *vmsmb_get_link(struct dentry *dentry, struct inode *inode,
 	if (!dentry)
 		return ERR_PTR(-ECHILD);
 
-	target = VMSMB_I(inode)->symlink_target;
-	if (!target)
+	if (!VMSMB_I(inode)->symlink_target)
 		return ERR_PTR(-EOPNOTSUPP);
 
-	set_delayed_call(done, (void (*)(void *))kfree, kstrdup(target, GFP_KERNEL));
-	return VMSMB_I(inode)->symlink_target;
+	target = kstrdup(VMSMB_I(inode)->symlink_target, GFP_KERNEL);
+	if (!target)
+		return ERR_PTR(-ENOMEM);
+
+	set_delayed_call(done, kfree_link, target);
+	return target;
 }
 
 /*
