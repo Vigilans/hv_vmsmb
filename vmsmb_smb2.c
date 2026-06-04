@@ -1206,6 +1206,10 @@ int vmsmb_smb2_write(struct vmsmb_session *sess, u32 tree_id,
 	ret = vmsmb_check_status(hdr, "WRITE");
 	if (ret)
 		goto out;
+	if (resp_len < sizeof(struct smb2_write_rsp)) {
+		ret = -EPROTO;
+		goto out;
+	}
 
 	rsp = (const struct smb2_write_rsp *)resp_buf;
 	*bytes_written = le32_to_cpu(rsp->DataLength);
@@ -1378,6 +1382,10 @@ static void vmsmb_write_async_complete(struct vmsmb_request *req)
 	ret = vmsmb_check_status(hdr, "WRITE(async)");
 	if (ret) {
 		wctx->cb(wctx->priv, ret, 0);
+		goto done;
+	}
+	if (smb2_len < sizeof(struct smb2_write_rsp)) {
+		wctx->cb(wctx->priv, -EPROTO, 0);
 		goto done;
 	}
 
