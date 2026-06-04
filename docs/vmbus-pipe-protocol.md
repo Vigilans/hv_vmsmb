@@ -52,35 +52,19 @@ When the host is fully initialized, responses use standard PipeHeader wrapping:
               8 bytes                        4 bytes                 M bytes
 ```
 
-## Notification Framing (Boot-Time)
+## Receive Path
 
-At boot, the host VSMB may not be fully initialized when the guest driver probes. In this case, some responses are preceded by a **notification message**:
+The driver treats `pkt_type=1` as the only data-bearing pipe message. Non-data pipe messages are ignored by the SMB2 receive path.
 
-```
-[PipeHeader: pkt_type=0, data_size=1, payload=0x84]  [7-byte header]  [SMB2 PDU]
-                   9 bytes                              7 bytes          N bytes
-```
+SMB2 responses are matched by the MessageId in the Direct TCP payload. The channel callback keeps a small scratch buffer for the first bytes of a response, parses the Direct TCP header and SMB2 MessageId once enough bytes arrive, then dispatches the remaining bytes into the matching in-flight request buffer.
 
-The `pkt_type=0` message appears once during channel initialization. The 7-byte header before the SMB2 PDU varies per response and its structure is not fully understood. The SMB2 PDU can be located by scanning for the ProtocolId magic (`0xFE534D42`).
+A single VMBus ring entry may contain part of a response, one complete response, or multiple responses back-to-back. The driver reassembles the Direct TCP byte stream by tracking the current request's expected total length; when that response completes, any remaining bytes in the same ring entry are parsed as the next response.
 
-Notification framing occurs:
-- On the first SMB2 exchange at boot (before the host is ready)
-- Intermittently on subsequent exchanges, mixed with normal PipeHeader responses
-- Never when the module loads after the host is fully initialized
+If a response arrives for an unknown MessageId, the driver skips exactly the Direct TCP frame length for that response and resumes parsing subsequent frames.
 
-### Handling Strategy
+## Boot-Time Readiness
 
-1. After version negotiation, **drain** pending async data (brief wait + read loop)
-2. On receive, if `pkt_type != 1` or `data_size` is unreasonably large (>16MB), enter notification handling
-3. Gather data from overflow buffer + VMBus ring buffer
-4. Scan for SMB2 ProtocolId magic (`0xFE534D42`)
-5. Synthesize standard `PipeHeader + DirectTCP + SMB2` framing for upper layers
-
-## VMBus Packet Coalescing
-
-VMBus may coalesce multiple logical messages into a single ring buffer packet. The last fragment of response N may include the beginning of response N+1.
-
-This is handled with an overflow buffer: after consuming the expected PipeHeader-indicated payload, excess bytes are saved and prepended to the next receive call.
+At early boot, the host VSMB device may accept the VMBus channel and version exchange before the SMB2 layer is ready. The driver handles this by retrying SMB2 NEGOTIATE + SESSION_SETUP a few times after version negotiation. It also drains any pending ring entries after the version exchange before starting SMB2 traffic.
 
 ## VMBusPipeIO — Host-Side Transport Layer
 
@@ -185,10 +169,15 @@ this cause the host to silently not respond.
 This is **not a VMBus protocol limit** — the VMBus transport layer
 (`vmbkmclr.sys`) supports packets up to ~512KB.
 
-Empirically, the maximum safe write data is `65536 - 256 = 65280`
-bytes per SMB2 WRITE PDU. The theoretical limit from the RE analysis
-(`0x11000 - 0x70 = 69520`) has not been achieved in practice — the
-precise framing layers included in the check need dynamic validation.
+Empirically, the maximum safe write data is `65419` bytes per SMB2 WRITE PDU:
+
+```
+0xFFFF - sizeof(smb2_direct_tcp_hdr) - sizeof(struct smb2_write_req)
+= 65535 - 4 - 112
+= 65419 bytes
+```
+
+The limiting value is the 16-bit VMBus pipe payload size field. The host silently drops packets at 65420 bytes and above.
 
 ## VMBus Packet Types
 

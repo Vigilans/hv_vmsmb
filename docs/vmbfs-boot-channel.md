@@ -65,7 +65,7 @@ Example results:
 |--------|-----------|------|
 | Protocol | Custom binary (8 message types) | SMB2 (full command set) |
 | Host transport | Direct pipe framing | VMBusPipeIO layer |
-| Framing | PipeHeader only | PipeHeader + Direct TCP + notification mode |
+| Framing | PipeHeader only | PipeHeader + Direct TCP |
 | Complexity | Simple request/response | Full SMB2 state machine |
 | Purpose | Boot-time driver store / IMC access | General file sharing |
 

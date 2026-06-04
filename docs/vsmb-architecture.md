@@ -268,34 +268,29 @@ See [VMBus Pipe Protocol](vmbus-pipe-protocol.md) for details.
 
 ## Known Host-Side Limitations
 
-### Compound CREATE+SET_INFO+CLOSE crashes vmwp.exe
+### SET_INFO must be terminal in a compound chain
 
-Compound SMB2 requests with SET_INFO as the middle operation cause a
-`FAIL_FAST` (`c0000409 / subcode 7`) in `vmusrv.dll`, crashing the VM
-worker process.
+CIFS-style `CREATE+SET_INFO+CLOSE` is not usable against `vmusrv.dll`.
+When SET_INFO is followed by another PDU, `SrvContinueSetInfo` corrupts
+the compound continuation state after the provider callback succeeds, so
+the host cannot advance to the following CLOSE and no complete response
+is sent.
 
-**Root cause** (confirmed via RE of `vmusrv.dll` build 26100):
-`SrvContinueSetInfo` (`0x18002a850`) assumes the response buffer
-descriptor is already allocated and ≥ 0x42 bytes when the provider
-callback succeeds. In compound mode, the compound dispatcher does not
-pre-allocate this buffer for the SET_INFO leg, so the continuation
-falls through to `_o_terminate()`.
+The safe compound shape is `CREATE+SET_INFO(final)`: SET_INFO is the
+last PDU in the chain, and the client follows it with a standalone
+`CLOSE` on the real FID returned by CREATE.
 
-The IOCTL compound path (`Smb2PostExecuteIoctl`) does not have this
-bug — it checks the response buffer size and allocates a larger one if
-needed before formatting the reply.
-
-**Affected operations**: Any compound containing SET_INFO:
-- `CREATE+SET_INFO(FILE_END_OF_FILE_INFORMATION)+CLOSE` (ftruncate)
-- `CREATE+SET_INFO(FILE_BASIC_INFORMATION)+CLOSE` (chmod/touch)
+**Affected operations**:
+- `SET_INFO(FILE_END_OF_FILE_INFORMATION)` for truncate/extend
+- `SET_INFO(FILE_BASIC_INFORMATION)` for timestamp updates
 
 **Unaffected**: `CREATE+CLOSE`, `CREATE+IOCTL+CLOSE` (readlink), and
-standalone (non-compound) SET_INFO all work correctly.
+standalone SET_INFO all work correctly.
 
-**Our response**: Reverted compound SET_INFO (commit `696e701`). These
-operations use three separate round-trips instead. The performance cost
-is one extra VMBus round-trip (~170μs) per metadata-only operation —
-negligible for data throughput.
+**Current implementation**: metadata SET_INFO paths use a 2-PDU
+`CREATE+SET_INFO(final)` compound plus standalone CLOSE. This reduces
+the previous three-round-trip CREATE → SET_INFO → CLOSE sequence to two
+round-trips while avoiding the broken continuation path.
 
 ### Guest-to-host packet size limit
 
