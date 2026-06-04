@@ -306,13 +306,18 @@ static char *vmsmb_parse_reparse(const void *buf, u32 buf_len,
 	const struct reparse_data_buffer *hdr = buf;
 	const u8 *name_start;
 	u16 name_off, name_len;
-	u32 tag;
+	u32 tag, valid_len, pathbuf_off;
 	char *smb_target, *result, *abs_path, *p;
 	bool relative = false;
 	int utf8_len;
 
 	if (buf_len < sizeof(*hdr))
 		return ERR_PTR(-EINVAL);
+
+	valid_len = sizeof(*hdr) + le16_to_cpu(hdr->ReparseDataLength);
+	if (valid_len > buf_len)
+		return ERR_PTR(-EINVAL);
+	buf_len = valid_len;
 
 	tag = le32_to_cpu(hdr->ReparseTag);
 
@@ -324,7 +329,7 @@ static char *vmsmb_parse_reparse(const void *buf, u32 buf_len,
 
 		name_off = le16_to_cpu(sym->SubstituteNameOffset);
 		name_len = le16_to_cpu(sym->SubstituteNameLength);
-		name_start = sym->PathBuffer + name_off;
+		pathbuf_off = offsetof(struct reparse_symlink_data_buffer, PathBuffer);
 		relative = !!(le32_to_cpu(sym->Flags) & SYMLINK_FLAG_RELATIVE);
 	} else if (tag == IO_REPARSE_TAG_MOUNT_POINT) {
 		const struct reparse_mount_point_data_buffer *mnt = buf;
@@ -334,13 +339,17 @@ static char *vmsmb_parse_reparse(const void *buf, u32 buf_len,
 
 		name_off = le16_to_cpu(mnt->SubstituteNameOffset);
 		name_len = le16_to_cpu(mnt->SubstituteNameLength);
-		name_start = mnt->PathBuffer + name_off;
+		pathbuf_off = offsetof(struct reparse_mount_point_data_buffer, PathBuffer);
 	} else {
 		return ERR_PTR(-EOPNOTSUPP);
 	}
 
-	if (!name_len)
+	if (!name_len || (name_len & 1))
 		return ERR_PTR(-EINVAL);
+	if (pathbuf_off > buf_len || name_off > buf_len - pathbuf_off ||
+	    name_len > buf_len - pathbuf_off - name_off)
+		return ERR_PTR(-EINVAL);
+	name_start = (const u8 *)buf + pathbuf_off + name_off;
 
 	/* UTF-16LE → UTF-8 (keep backslashes for prefix matching) */
 	smb_target = kmalloc(name_len * 2 + 1, GFP_KERNEL);
