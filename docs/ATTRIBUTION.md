@@ -8,9 +8,10 @@ projects use GPL-2.0-compatible licenses.
 
 | Project | Files / API | License | What we use |
 |---------|-------------|---------|-------------|
-| **Linux CIFS client** (`fs/smb/client/`) | `smb2pdu.c`, `smb2maperror.c`, `smb2inode.c`, `cifsfs.c`, `inode.c`, `reparse.c`, `link.c` | LGPL-2.1 | Inode lifecycle patterns, NTSTATUS mapping, VFS integration, reparse/symlink parsing, hardlink |
-| **Linux CIFS common headers** (`fs/smb/common/`) | `smb2pdu.h`, `smb2status.h`, `fscc.h`, `smbfsctl.h` | LGPL-2.1 | SMB2 struct definitions, FSCTL codes, reparse tags (copied, SPDX headers preserved) |
-| **Linux CIFS client headers** (`fs/smb/client/`) | `smb1pdu.h` | LGPL-2.1 | CreateDisposition / CreateOptions host-endian constants (subset extracted) |
+| **Linux CIFS client** (`fs/smb/client/`) | `smb2pdu.c`, `smb2maperror.c`, `smb2inode.c`, `cifsfs.c`, `inode.c`, `reparse.c`, `link.c` | GPL-2.0 / LGPL-2.1 depending on file | Inode lifecycle patterns, NTSTATUS mapping, VFS integration, reparse/symlink parsing, hardlink |
+| **Linux CIFS common headers** (`fs/smb/common/`) | `smb2pdu.h`, `smb2status.h`, `fscc.h` | LGPL-2.1 | SMB2 struct definitions, NTSTATUS values, FSCC structures (copied, SPDX headers preserved) |
+| **Linux CIFS common headers** (`fs/smb/common/`) | `smbfsctl.h` | LGPL-2.1+ | FSCTL codes and reparse tags (copied, SPDX header preserved) |
+| **Linux CIFS client headers** (`fs/smb/client/`) | `smb1pdu.h` | GPL-2.0 | CreateDisposition / CreateOptions host-endian constants (subset extracted) |
 | **Linux hvsock** (`net/vmw_vsock/hyperv_transport.c`) | `hv_pkt_iter` recv loop | GPL-2.0-only | VMBus pipe-mode receive pattern |
 | **Linux kernel** (`lib/unicode.c`) | `utf8s_to_utf16s`, `utf16s_to_utf8s` | GPL-2.0 | UTF-8 / UTF-16LE conversion (called directly) |
 | **Linux netfs** (`fs/netfs/`) | `netfs_read_folio`, `netfs_writepages`, etc. | GPL-2.0 | Page cache read/write via standard netfs API |
@@ -57,8 +58,8 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_smb2_get_reparse` | **Ported** from CIFS `smb2_query_reparse_point()` | Same flags, separate CREATE+IOCTL+CLOSE |
 | `vmsmb_smb2_create_symlink` | **Simplified** from CIFS `create_native_symlink()` | No symlinkroot, directory detection, or xattr contexts |
 | `vmsmb_smb2_queryfs` | **Simplified** from CIFS `smb2_queryfs()` | QUERY_INFO InfoType=FILESYSTEM, FileInfoClass=FS_FULL_SIZE_INFORMATION on share root; CIFS uses compound CREATE+QUERY+CLOSE, we use three round-trips |
-| `vmsmb_smb2_set_basic_info` | **Simplified** from CIFS `smb2_set_file_info_compound()` | SET_INFO InfoType=FILE, FileInfoClass=FILE_BASIC_INFORMATION; three round-trips (CREATE+SET_INFO+CLOSE) instead of CIFS compound |
-| `vmsmb_smb2_set_eof` | **Simplified** from CIFS `smb2_set_file_size()` | SET_INFO InfoType=FILE, FileInfoClass=FILE_END_OF_FILE_INFORMATION; three round-trips (CREATE+SET_INFO+CLOSE) instead of CIFS compound |
+| `vmsmb_smb2_set_basic_info` | **Simplified** from CIFS `smb2_set_file_info_compound()` | SET_INFO InfoType=FILE, FileInfoClass=FILE_BASIC_INFORMATION; 2-PDU `CREATE+SET_INFO(final)` compound plus standalone CLOSE because vmusrv requires SET_INFO to be terminal |
+| `vmsmb_smb2_set_eof` | **Simplified** from CIFS `smb2_set_file_size()` | SET_INFO InfoType=FILE, FileInfoClass=FILE_END_OF_FILE_INFORMATION; same 2-PDU terminal SET_INFO compound plus standalone CLOSE shape |
 | `vmsmb_smb2_flush` | **Ported** from CIFS `SMB2_flush()` | MS-SMB2 2.2.17, single round-trip |
 
 ### vmsmb_vfs.c
@@ -134,8 +135,8 @@ public specification and were discovered through reverse engineering:
 
 | Upstream | License | Compatible with GPL-2.0? |
 |----------|---------|--------------------------|
-| CIFS client (`fs/smb/client/`) | LGPL-2.1 | Yes |
-| CIFS common headers (`fs/smb/common/`) | LGPL-2.1 | Yes |
+| CIFS client (`fs/smb/client/`) | GPL-2.0 / LGPL-2.1 depending on file | Yes |
+| CIFS common headers (`fs/smb/common/`) | LGPL-2.1 / LGPL-2.1+ depending on file | Yes |
 | hvsock (`hyperv_transport.c`) | GPL-2.0-only | Yes |
 | Kernel `lib/unicode.c` | GPL-2.0 | Yes |
 | netfs (`fs/netfs/`) | GPL-2.0 | Yes |

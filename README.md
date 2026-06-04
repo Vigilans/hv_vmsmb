@@ -168,4 +168,4 @@ This module should theoretically work under WSL2, since WSL2 runs on HCS. Howeve
 
 GPL-2.0. See [LICENSE](LICENSE) for the full text.
 
-Header files under `smb2pdu.h`, `smb2status.h`, `fscc.h`, `smbfsctl.h` are from the Linux kernel `fs/smb/common/` and retain their original LGPL-2.1 license.
+Header files copied from the Linux kernel retain their original SPDX licenses: `smb2pdu.h`, `smb2status.h`, and `fscc.h` are LGPL-2.1; `smbfsctl.h` is LGPL-2.1+; `smb1pdu.h` is GPL-2.0.

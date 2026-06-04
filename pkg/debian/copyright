@@ -7,10 +7,20 @@ Files: *
 Copyright: 2025-2026 Vigilans
 License: GPL-2.0-only
 
-Files: smb2pdu.h smb2status.h fscc.h smbfsctl.h smb1pdu.h
+Files: smb2pdu.h smb2status.h fscc.h
 Copyright: Linux kernel contributors
 License: LGPL-2.1-only
-Comment: Derived from Linux kernel fs/smb/common/ headers.
+Comment: Copied from Linux kernel fs/smb/common/ headers.
+
+Files: smbfsctl.h
+Copyright: Linux kernel contributors
+License: LGPL-2.1-or-later
+Comment: Copied from Linux kernel fs/smb/common/ headers.
+
+Files: smb1pdu.h
+Copyright: Linux kernel contributors
+License: GPL-2.0-only
+Comment: Subset derived from Linux kernel fs/smb/client/smb1pdu.h.
 
 License: GPL-2.0-only
  This program is free software; you can redistribute it and/or modify
@@ -24,6 +34,15 @@ License: LGPL-2.1-only
  This library is free software; you can redistribute it and/or modify
  it under the terms of the GNU Lesser General Public License version 2.1
  as published by the Free Software Foundation.
+ .
+ On Debian systems, the full text of the GNU Lesser General Public
+ License version 2.1 can be found in /usr/share/common-licenses/LGPL-2.1.
+
+License: LGPL-2.1-or-later
+ This library is free software; you can redistribute it and/or modify
+ it under the terms of the GNU Lesser General Public License as published
+ by the Free Software Foundation; either version 2.1 of the License, or
+ (at your option) any later version.
  .
  On Debian systems, the full text of the GNU Lesser General Public
  License version 2.1 can be found in /usr/share/common-licenses/LGPL-2.1.
