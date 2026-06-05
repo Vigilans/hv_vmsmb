@@ -38,7 +38,8 @@
  *   must also be a multiple of 4 KB (PAGE_SIZE) or vmbus_open returns
  *   -EINVAL; non-aligned values are rounded down at module load.
  *
- * Default 1024 KB (1 MB) — production-validated by overnight B2 4/4 wins.
+ * Default 1024 KB (1 MB) — balances throughput with bounded kernel memory
+ * use and has been validated under sustained concurrent write load.
  */
 #define VMSMB_RING_SIZE_KB_DEFAULT	1024
 #define VMSMB_RING_SIZE_KB_MIN		256
@@ -56,10 +57,10 @@
 
 /*
  * Guest→host packet size limit.  The VMBus pipe payload (DirectTCP header +
- * SMB2 PDU) must fit in 16 bits, i.e. ≤ 0xFFFF.  At 0x10000 the size
- * overflows and the host silently drops the packet.  Binary-search testing
- * confirms max write data = 0xFFFF - sizeof(smb2_direct_tcp_hdr) -
- * sizeof(struct smb2_write_req) = 65535 - 4 - 112 = 65419.
+ * SMB2 PDU) must fit in 16 bits, i.e. ≤ 0xFFFF.  The maximum write
+ * payload follows from that pipe-level limit:
+ * 0xFFFF - sizeof(smb2_direct_tcp_hdr) - sizeof(struct smb2_write_req)
+ * = 65535 - 4 - 112 = 65419.
  *
  * vmusrv.dll also has Smb2MaxPacketSize = 0x11000 at the SMB2 layer, but
  * the pipe-level 16-bit limit is hit first.
@@ -98,9 +99,9 @@
  * Bounds the worst-case wait; if drain wake never arrives within this
  * window the caller wakes spontaneously and retries (drain wake should
  * have set out_full_flag false on the host side, so we may catch up).
- * Larger than the legacy 100*usleep(100,500)=50ms budget on purpose:
- * we now want to ride out genuine ring saturation without falling back
- * to the EAGAIN-side abandonment that produced the Mode A wedge.
+ * Once a MID has been reserved, the sender must wait for ring space
+ * rather than abandoning the request locally and desynchronizing the
+ * server's MID window.
  */
 #define VMSMB_DRAIN_WAIT_MS	2000
 
@@ -112,10 +113,8 @@
  * the real pool via the CreditRequest field. Subsequent responses
  * replenish; sends decrement by CreditCharge.
  *
- * This supersedes the earlier VMSMB_MAX_ASYNC_INFLIGHT semaphore: credit
- * gating is the protocol-correct way to bound in-flight requests, since
- * the server's MID window — not the ring buffer or guest concurrency — is
- * what wedges the channel under burst.
+ * Credit gating bounds in-flight requests by the server's MID window,
+ * rather than by a guest-side concurrency counter or ring-buffer size.
  */
 #define VMSMB_INITIAL_CREDITS	1
 
@@ -136,9 +135,7 @@
  * VMSMB_MAX_CREDITS: hard ceiling, matching server's VSmbMaxCredits
  * (vmusrv reads HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\
  * Virtualization\Containers\VSmbMaxCredits, default 0x2000=8192).  The
- * server enforces EndMid - StartMid <= MaxWindowSize <= VSmbMaxCredits;
- * sending past this returns STATUS_INVALID_PARAMETER (0xc00000d0)
- * silently — recorded in ETW Event 403 but no response on the wire.
+ * The server enforces EndMid - StartMid <= MaxWindowSize <= VSmbMaxCredits.
  * Once mid_range_size hits this cap, vmsmb_grow_mid_table refuses to grow
  * further and reserve_credits queues senders.
  *
@@ -150,12 +147,11 @@
 /*
  * Initial adaptive target_window (mrxsmb's `target_window` init value).
  *
- * Mirrors `+0x90 target_window` initialization in
- * SmbCeAllocateCreditTransport @0x1c00156eb (init 2).  Floor for the
+ * Mirrors mrxsmb.sys target_window initialization.  Floor for the
  * EWMA-driven shrink path; bucket 16-17 (>4.25s avg latency) divides by
  * 2 each response, so without a floor it would collapse to 0 and stall.
  *
- * 2 is enough to keep the channel breathing during catastrophic latency
+ * 2 is enough to keep forward progress during very high response latency
  * (one CREATE+CLOSE compound = charge 2 fits exactly), so timed-out
  * sends still drain and senders eventually wake.
  */
@@ -165,9 +161,9 @@
  * Reserve-side wait timeout (ms).
  *
  * If the send admission gate (live_window / mid_range_size) keeps a sender
- * blocked beyond this, return -EBUSY.  Surfaces stalls as user-visible
- * errors instead of silent wedges.  Set to match VMSMB_TIMEOUT_MS so a
- * stuck reserve fails before its caller's transact timeout.
+ * blocked beyond this, return -EBUSY.  Surfaces sustained admission stalls
+ * as user-visible errors.  Set to match VMSMB_TIMEOUT_MS so a stuck reserve
+ * fails before its caller's transact timeout.
  */
 #define VMSMB_SEND_TIMEOUT_MS	VMSMB_TIMEOUT_MS
 
@@ -364,14 +360,13 @@ struct vmsmb_session {
 	 * EWMA latency feedback for adaptive target_window (mrxsmb-derived).
 	 *
 	 * On every release the response latency is folded into ct_avg_lat_us
-	 * via mrxsmb's EWMA formula (SmbCeDemuxResponseAndAccumulateCredits
-	 * @0x1c000217c..0x1c00021bc):
+	 * via mrxsmb's EWMA formula:
 	 *
 	 *   avg = (elapsed_us + max(mid_range_size, 8) * old_avg)
 	 *         / (max(mid_range_size, 8) + credit_charge)
 	 *
-	 * The 18-entry bucket table at DAT_1c0072270 then maps avg latency
-	 * into a multiplicative or additive op on ct_target_window:
+	 * The 18-entry bucket table then maps avg latency into a
+	 * multiplicative or additive op on ct_target_window:
 	 *
 	 *   bucket = clamp((2 * avg_us) / 500000, 0, 17)
 	 *
@@ -384,11 +379,11 @@ struct vmsmb_session {
 	 *
 	 *   bound = max(min(live_window, target_window), mid_range_size)
 	 *
-	 * When server enters sustained CR=0 flow control (vmusrv path #3
-	 * zero-grant), per-request latency rises -> bucket index rises ->
-	 * target_window shrinks -> mid_range_size cap shrinks -> in-flight
-	 * count auto-throttles below ring saturation, avoiding Mode A
-	 * over-send.
+	 * When the server enters sustained CR=0 flow control, per-request
+	 * latency rises -> bucket index rises -> target_window shrinks ->
+	 * mid_range_size cap shrinks -> in-flight count auto-throttles
+	 * below ring saturation and keeps the client within the server's
+	 * MID window.
 	 */
 	u64    ct_avg_lat_us;		/* EWMA average response latency, microseconds */
 	u32    ct_target_window;	/* adaptive target, init 2, clamped to max_credits */
@@ -426,7 +421,7 @@ struct vmsmb_sb_info {
  * user-space close().  CLOSE PDU is sent only when the last reference
  * drops, ensuring no in-flight WRITE PDUs race the file teardown — which
  * would otherwise let the host-side NTFS IoManager auto-cancel them as
- * part of NtClose handle cleanup, producing the silent-drop wedge.
+ * part of NtClose handle cleanup without a normal SMB2 response.
  *
  * Mirrors CIFS struct cifsFileInfo (count + file_info_lock); each
  * cifs_init_request takes a ref via cifsFileInfo_get, cifs_free_request

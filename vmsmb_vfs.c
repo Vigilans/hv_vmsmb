@@ -1220,9 +1220,8 @@ static char *vmsmb_inode_path(struct inode *inode)
  * fires only when the refcount drops to zero, so an in-flight async WRITE
  * always extends the ctx lifetime past the user's close().  Without this,
  * the SMB2 CLOSE PDU could race a pending WRITE PDU on the same fid,
- * letting the host IoManager's NtClose cleanup auto-cancel the still-queued
- * WRITE IRP and surface STATUS_CANCELLED — which vmusrv silently drops +
- * replay-queues, wedging the connection.
+ * letting the host IoManager's NtClose cleanup cancel the still-queued
+ * WRITE IRP without producing a matching SMB2 response.
  */
 static void vmsmb_file_ctx_put(struct vmsmb_file_ctx *ctx)
 {
@@ -1405,10 +1404,10 @@ static void vmsmb_begin_writeback(struct netfs_io_request *wreq)
  * Drops the per-WRITE-PDU ref taken in vmsmb_issue_write fast path.  This
  * fires when the wire response for the WRITE arrives via vmsmb_complete_req
  * → async_cb chain, so the ref is released exactly once per acknowledged
- * PDU.  Pending PDUs that never receive a response (silently cancelled by
- * the server) leak their ref permanently — which keeps the ctx alive and
- * blocks CLOSE PDU emission, preserving the wire-level invariant "do not
- * send CLOSE while WRITE PDUs may still be acted on by the server".
+ * PDU. Pending PDUs that never receive a response keep their ref
+ * permanently. That keeps the ctx alive and blocks CLOSE PDU emission,
+ * preserving the wire-level invariant: do not send CLOSE while WRITE
+ * PDUs may still be acted on by the server.
  */
 static void vmsmb_issue_write_complete(void *priv, int status,
 				       u32 bytes_written)
@@ -1606,8 +1605,8 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
  * last reference drops; pending netfs_io_request refs (taken in
  * init_request, dropped in free_request) extend the ctx lifetime past
  * this point.  This serializes CLOSE behind in-flight async WRITEs on
- * the same fid, preventing the host-side IoManager NtClose IRP-cancel
- * race that produces silent server response drops.
+ * the same fid, preventing the host-side IoManager NtClose path from
+ * cancelling queued WRITE IRPs before they produce SMB2 responses.
  *
  * Port of CIFS cifs_close() (fs/smb/client/file.c) which calls
  * _cifsFileInfo_put — the SMB2 CLOSE there fires only inside the

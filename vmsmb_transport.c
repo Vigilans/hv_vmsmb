@@ -173,7 +173,7 @@ void vmsmb_credit_reset(struct vmsmb_session *sess)
  * [mid_range_size, max_credits], spill any overflow back to pending_grant.
  * Caller must hold ct_lock.
  *
- * Mirrors mrxsmb.sys SmbCeFoldPendingCreditsIntoWindow @0x1c00260d0.
+ * Mirrors mrxsmb.sys credit-window fold behavior.
  */
 static void vmsmb_fold_pending_locked(struct vmsmb_session *sess)
 {
@@ -197,8 +197,7 @@ static void vmsmb_fold_pending_locked(struct vmsmb_session *sess)
  * Effective-avail predicate.  Caller must hold ct_lock.
  */
 /*
- * mrxsmb 18-bucket EWMA target_window adaptation table
- * (DAT_1c0072270 in mrxsmb.sys Win11 26100).
+ * mrxsmb-style 18-bucket EWMA target_window adaptation table.
  *
  * Each entry is {op, a, b}:
  *   op=0  -> target = (target * a) / b      (multiplicative)
@@ -210,9 +209,8 @@ static void vmsmb_fold_pending_locked(struct vmsmb_session *sess)
  *   bucket = clamp((2 * avg_us) / 500000, 0, 17)
  *
  * 250000us per bucket step; bucket 0 covers [0..250ms], bucket 17 is
- * the >4.25s saturation slot.  See mrxsmb.md (re-analyst memory) for
- * the recovered table from disasm of
- * SmbCeDemuxResponseAndAccumulateCredits @0x1c00022a0..0x1c00032c7.
+ * the >4.25s saturation slot.  The table was recovered from
+ * SmbCeDemuxResponseAndAccumulateCredits in mrxsmb.sys.
  *
  * Net effect:
  *   buckets 0-7 grow target_window aggressively (x4..x5/4)
@@ -253,8 +251,7 @@ static const struct {
  * Caller must hold ct_lock; @elapsed_us is the just-completed request's
  * response latency in microseconds, @charge is its credit_charge.
  *
- * EWMA formula (mrxsmb SmbCeDemuxResponseAndAccumulateCredits
- *   @0x1c000217c..0x1c00021bc):
+ * EWMA formula, matching mrxsmb.sys credit transport behavior:
  *
  *     avg_new = (elapsed_us + max(mid_range_size, 8) * avg_old)
  *               / (max(mid_range_size, 8) + charge)
@@ -335,7 +332,7 @@ static bool vmsmb_can_reserve_locked(struct vmsmb_session *sess, u16 charge)
  * cap.  Allocates outside ct_lock (GFP_KERNEL OK in process context),
  * then takes ct_lock to rehash + swap.
  *
- * Models mrxsmb.sys SmbCeGrowCreditMidTable @0x1c0048e88.
+ * Matches the mrxsmb.sys grow-on-pressure model.
  */
 static int vmsmb_grow_mid_table(struct vmsmb_session *sess)
 {
@@ -398,7 +395,7 @@ static int vmsmb_grow_mid_table(struct vmsmb_session *sess)
  * demux path to look up @req via mid_table[hdr.MessageId % max_credits]).
  * @req->credit_charge is the TOTAL chain charge (used by release_mid).
  *
- * Models mrxsmb.sys SmbCeReserveCreditsForBufferContexts @0x1c000ba60.
+ * Matches mrxsmb.sys credit reservation semantics.
  */
 static int vmsmb_reserve_credits(struct vmsmb_session *sess,
 				 void *buf, u32 len,
@@ -506,8 +503,7 @@ retry:
  * the next reserve / release_mid path; here we just bump pending_grant
  * and kick the waitqueue.
  *
- * Models mrxsmb.sys SmbCeDemuxResponseAndAccumulateCredits @0x1c000203c
- * (without the EWMA latency feedback — deferred to v2).
+ * Matches mrxsmb.sys receive-side grant accumulation semantics.
  */
 static void vmsmb_accumulate_grant(struct vmsmb_session *sess, u16 grant)
 {
@@ -533,7 +529,7 @@ static void vmsmb_accumulate_grant(struct vmsmb_session *sess, u16 grant)
  * Same shape as vmsmb_unreserve, kept as a separate function because
  * release_mid additionally advances oldest_mid + drains pending_grant.
  *
- * Models mrxsmb.sys SmbCeApplyCreditGrantAndRelease @0x1c000bf10.
+ * Matches mrxsmb.sys credit release semantics.
  */
 static void vmsmb_release_mid(struct vmsmb_session *sess,
 			      struct vmsmb_request *req)
@@ -1137,9 +1133,8 @@ static int vmsmb_send_recv_sync(struct vmsmb_session *sess,
 
 	/*
 	 * Pre-SMB2 single-shot send.  Same drain-wait pattern as vmsmb_submit
-	 * (no MID involved here, so no Mode A risk, but we use the same
-	 * machinery for consistency and to avoid the legacy 100x usleep
-	 * busy-retry).  Pre-SMB2 keeps TASK_KILLABLE since no MID has been
+	 * for consistency and to avoid fixed-count usleep busy-retry.
+	 * Pre-SMB2 keeps TASK_KILLABLE since no MID has been
 	 * allocated yet; SIGKILL during NEGOTIATE / SESSION_SETUP can abort
 	 * cleanly.  vmsmb_submit goes TASK_UNINTERRUPTIBLE because its wait
 	 * happens after MID allocation.
@@ -1265,22 +1260,20 @@ static int vmsmb_send_recv_sync(struct vmsmb_session *sess,
  * patching MIDs into the SMB2 chain in-place.  Then transmits via
  * vmbus_sendpacket (serialized by send_mutex).
  *
- * Backpressure model — admission gate B2 (post-MID, on send_drain_wait):
+ * Backpressure model — post-MID drain wait on send_drain_wait:
  *
  *   try send -> EAGAIN -> sleep on send_drain_wait -> wake on host drain
- *               signal -> retry -> ...
+ *               notification -> retry -> ...
  *
- * Replaces the legacy 100x usleep retry that, on exhaustion, called
- * vmsmb_unreserve to release the MID locally — that abandonment was the
- * Mode A wedge trigger (server's MID window stays pinned at the abandoned
- * MID, client.next_mid drifts to StartMid + MaxWindows, server begins
- * c00000d0 cascade).  Now we keep waiting until the host drains the ring;
- * the MID is never released without a wire commit.
+ * If the outbound ring is full after MIDs are assigned, the client must
+ * keep the reservation and wait for ring space.  Releasing the MID locally
+ * before the PDU reaches the wire can leave the server's MID window behind
+ * the client's next assigned MID.  Therefore the MID is not released until
+ * the send succeeds or the channel fails.
  *
- * Sleep is interruptible (caller may signal-out) and bounded by
- * VMSMB_DRAIN_WAIT_MS per cycle.  Fatal vmbus_sendpacket failures
- * (non-EAGAIN errors, channel rescind) still call vmsmb_unreserve —
- * that path is treated as channel-fatal at the upper layers.
+ * Fatal vmbus_sendpacket failures (non-EAGAIN errors, channel rescind)
+ * still call vmsmb_unreserve — that path is treated as channel-fatal at
+ * the upper layers.
  *
  * Analogous to hvsock's check-then-send + drain-callback wake
  * (net/vmw_vsock/hyperv_transport.c hvs_channel_cb).
@@ -1343,14 +1336,12 @@ static int vmsmb_submit(struct vmsmb_session *sess,
 	 * host drains the ring it will signal our channel callback, which
 	 * wakes send_drain_wait.
 	 *
-	 * The wait is TASK_UNINTERRUPTIBLE: once a MID has been allocated
-	 * the PDU MUST eventually reach the wire — abandoning the MID leaks
-	 * server-side StartMid and triggers Mode A drift.  No signal,
-	 * including SIGKILL, can break the wait.  Each iteration is bounded
-	 * by VMSMB_DRAIN_WAIT_MS, after which the loop retries
-	 * vmbus_sendpacket; if the host genuinely cannot drain the ring the
-	 * caller will block in D-state until hung_task fires, same fate as
-	 * any write to a dead backend.
+	 * The wait is TASK_UNINTERRUPTIBLE: once a MID has been allocated,
+	 * the PDU must either reach the wire or the channel must fail. No
+	 * signal, including SIGKILL, can break the wait. Each iteration is
+	 * bounded by VMSMB_DRAIN_WAIT_MS, after which the loop retries
+	 * vmbus_sendpacket; if the host cannot drain the ring, the caller
+	 * remains blocked in D-state like any write to an unavailable backend.
 	 */
 	for (;;) {
 		mutex_lock(&sess->send_mutex);
@@ -1522,8 +1513,8 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 		 *
 		 * We do NOT refund grants — server may still respond later,
 		 * and incoming CR will accrue via accumulate_grant + fold.
-		 * Treating the channel as wedged (refund-on-timeout) was the
-		 * 253898b mistake amplifying Mode C.
+		 * Refunding locally on timeout would let later responses advance
+		 * the credit window for MIDs whose slots were already released.
 		 */
 		if (vmsmb_unreserve(sess, &req)) {
 			pr_err("transact timeout (mid=%llu)\n",
