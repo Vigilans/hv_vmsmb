@@ -54,7 +54,7 @@ The module auto-loads when the VMBus channel is detected (MODALIAS match on the 
 
 ### Supported kernels
 
-Requires a relatively recent kernel with the `netfs` library (`fs/netfs/`), which provides the page cache read/write infrastructure. Developed and tested on kernel 6.19.
+Requires a relatively recent (6.10+) kernel with the `netfs` library (`fs/netfs/`), which provides the page cache read/write infrastructure. Developed and tested on kernel 6.19.
 
 ## Performance
 
