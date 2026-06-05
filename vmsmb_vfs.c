@@ -467,7 +467,7 @@ out_no_translate:
  * Port of CIFS cifs_d_revalidate() (fs/smb/client/dir.c) minus the
  * oplock / lease machinery we don't have.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
 static int vmsmb_d_revalidate(struct inode *dir, const struct qstr *name,
 			      struct dentry *dentry, unsigned int flags)
 #else
@@ -485,7 +485,7 @@ static int vmsmb_d_revalidate(struct dentry *dentry, unsigned int flags)
 		/* Negative dentry: trust it only while parent's TTL is valid.
 		 * Otherwise the host may have created the file and we'd never
 		 * notice. */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
 		struct dentry *parent = dget_parent(dentry);
 		struct inode *dir = d_inode(parent);
 #endif
@@ -496,7 +496,7 @@ static int vmsmb_d_revalidate(struct dentry *dentry, unsigned int flags)
 			if (time_after(jiffies, vi->meta_expires))
 				ret = 0;
 		}
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
 		dput(parent);
 #endif
 		return ret;
@@ -813,7 +813,7 @@ static int vmsmb_atomic_open(struct inode *dir, struct dentry *dentry,
  * Port of CIFS cifs_mkdir() (fs/smb/client/inode.c): CREATE with
  * FILE_DIRECTORY_FILE + FILE_CREATE, then CLOSE.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
 static struct dentry *vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		       struct dentry *dentry, umode_t mode)
 #else
@@ -830,7 +830,7 @@ static int vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 
 	path = vmsmb_build_path(dentry);
 	if (IS_ERR(path)) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
 		return ERR_CAST(path);
 #else
 		return PTR_ERR(path);
@@ -844,7 +844,7 @@ static int vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	kfree(path);
 
 	if (ret) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
 		return ERR_PTR(ret);
 #else
 		return ret;
@@ -853,7 +853,7 @@ static int vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 
 	inode = vmsmb_iget(dir->i_sb, &info);
 	if (IS_ERR(inode)) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
 		return ERR_CAST(inode);
 #else
 		return PTR_ERR(inode);
@@ -862,7 +862,7 @@ static int vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 
 	vmsmb_invalidate_dir(dir);
 	d_instantiate(dentry, inode);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
 	return NULL;
 #else
 	return 0;
@@ -1335,7 +1335,8 @@ static void vmsmb_issue_read_complete(void *priv, int status,
 	} else {
 		subreq->transferred = len;
 	}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0) || \
+    !defined(NETFS_ICTX_WRITETHROUGH) || defined(NETFS_RREQ_SHORT_TRANSFER)
 	netfs_read_subreq_terminated(subreq);
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	netfs_read_subreq_terminated(subreq, subreq->error, false);
@@ -1387,7 +1388,8 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 		vmsmb_file_ctx_put(ctx);	/* rollback per-PDU ref */
 		/* Submit failed — fall through to sync path for graceful error */
 		subreq->error = ret;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0) || \
+    !defined(NETFS_ICTX_WRITETHROUGH) || defined(NETFS_RREQ_SHORT_TRANSFER)
 		netfs_read_subreq_terminated(subreq);
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 		netfs_read_subreq_terminated(subreq, subreq->error, false);
@@ -1433,7 +1435,8 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 close:
 	vmsmb_smb2_close(sess, sbi->tree_id, &temp_fid);
 out:
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0) || \
+    !defined(NETFS_ICTX_WRITETHROUGH) || defined(NETFS_RREQ_SHORT_TRANSFER)
 	netfs_read_subreq_terminated(subreq);
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	netfs_read_subreq_terminated(subreq, subreq->error, false);
@@ -1489,7 +1492,8 @@ static void vmsmb_issue_write_complete(void *priv, int status,
 	struct netfs_io_subrequest *subreq = priv;
 	struct vmsmb_file_ctx *ctx = subreq->rreq->netfs_priv;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || \
+    !defined(NETFS_ICTX_WRITETHROUGH) || defined(NETFS_RREQ_SHORT_TRANSFER)
 	netfs_write_subrequest_terminated(subreq,
 					  status ? status : (ssize_t)bytes_written);
 #else
@@ -1531,7 +1535,8 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 			 ctx, (long long)subreq->start, subreq->len);
 		buf = kvmalloc(subreq->len, GFP_KERNEL);
 		if (!buf) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || \
+    !defined(NETFS_ICTX_WRITETHROUGH) || defined(NETFS_RREQ_SHORT_TRANSFER)
 			netfs_write_subrequest_terminated(subreq, -ENOMEM);
 #else
 			netfs_write_subrequest_terminated(subreq, -ENOMEM, false);
@@ -1541,7 +1546,8 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 		copied = copy_from_iter(buf, subreq->len, &subreq->io_iter);
 		if (copied == 0) {
 			kvfree(buf);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || \
+    !defined(NETFS_ICTX_WRITETHROUGH) || defined(NETFS_RREQ_SHORT_TRANSFER)
 			netfs_write_subrequest_terminated(subreq, -EFAULT);
 #else
 			netfs_write_subrequest_terminated(subreq, -EFAULT, false);
@@ -1560,7 +1566,8 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 		if (ret == 0)
 			return;
 		vmsmb_file_ctx_put(ctx);	/* rollback per-PDU ref */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || \
+    !defined(NETFS_ICTX_WRITETHROUGH) || defined(NETFS_RREQ_SHORT_TRANSFER)
 		netfs_write_subrequest_terminated(subreq, ret);
 #else
 		netfs_write_subrequest_terminated(subreq, ret, false);
@@ -1571,7 +1578,8 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 	/* Slow path: no fid → transient CREATE+WRITE+CLOSE */
 	path = vmsmb_inode_path(inode);
 	if (IS_ERR(path)) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || \
+    !defined(NETFS_ICTX_WRITETHROUGH) || defined(NETFS_RREQ_SHORT_TRANSFER)
 		netfs_write_subrequest_terminated(subreq, PTR_ERR(path));
 #else
 		netfs_write_subrequest_terminated(subreq, PTR_ERR(path), false);
@@ -1582,7 +1590,8 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 				FILE_OPEN, CREATE_NOT_DIR, &temp_fid, NULL);
 	kfree(path);
 	if (ret) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || \
+    !defined(NETFS_ICTX_WRITETHROUGH) || defined(NETFS_RREQ_SHORT_TRANSFER)
 		netfs_write_subrequest_terminated(subreq, ret);
 #else
 		netfs_write_subrequest_terminated(subreq, ret, false);
@@ -1608,7 +1617,8 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 
 close:
 	vmsmb_smb2_close(sess, sbi->tree_id, &temp_fid);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || \
+    !defined(NETFS_ICTX_WRITETHROUGH) || defined(NETFS_RREQ_SHORT_TRANSFER)
 	netfs_write_subrequest_terminated(subreq,
 					  ret ? ret : (ssize_t)bytes_written);
 #else
