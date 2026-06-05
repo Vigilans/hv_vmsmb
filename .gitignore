@@ -8,3 +8,7 @@ Module.symvers
 modules.order
 .module-common.o
 .tmp_versions/
+
+# Packaging build outputs
+build/
+rpmbuild/

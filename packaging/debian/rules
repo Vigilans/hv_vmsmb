@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+
+PACKAGE_VERSION := $(shell sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' dkms.conf)
+SRC_DIR := /usr/src/hv-vmsmb-$(PACKAGE_VERSION)
+
+%:
+	dh $@ --buildsystem=none --with dkms
+
+override_dh_auto_install:
+	install -d debian/hv-vmsmb-dkms$(SRC_DIR)
+	install -m 0644 Makefile debian/hv-vmsmb-dkms$(SRC_DIR)/
+	install -m 0644 vmsmb_main.c vmsmb_transport.c vmsmb_smb2.c vmsmb_vfs.c debian/hv-vmsmb-dkms$(SRC_DIR)/
+	install -m 0644 fscc.h smb1pdu.h smb2pdu.h smb2status.h smbfsctl.h vmsmb.h debian/hv-vmsmb-dkms$(SRC_DIR)/
+
+override_dh_dkms:
+	dh_dkms -V $(PACKAGE_VERSION) -- dkms.conf

@@ -24,13 +24,13 @@ sudo dkms build hv-vmsmb/0.1.0
 sudo dkms install hv-vmsmb/0.1.0
 ```
 
-Arch Linux: an AUR package is available in `pkg/arch/`.
+Arch Linux: an AUR package is available in `packaging/arch/`.
 
-Debian/Ubuntu: `make deb` builds a `.deb` package (requires `dpkg-dev` and `debhelper`):
+Debian/Ubuntu: `make deb` builds a `.deb` package (requires `dpkg-dev`, `debhelper`, and `dh-dkms`):
 
 ```bash
 make deb
-sudo dpkg -i ../hv-vmsmb-dkms_0.1.0-1_all.deb
+sudo dpkg -i build/debian/hv-vmsmb-dkms_0.1.0-1_all.deb
 ```
 
 Fedora/RHEL: `make rpm` builds an RPM (requires `rpm-build`):
