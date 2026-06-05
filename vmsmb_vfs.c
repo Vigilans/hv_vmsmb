@@ -1331,7 +1331,7 @@ static void vmsmb_issue_read_complete(void *priv, int status,
 	} else {
 		subreq->transferred = len;
 	}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
 	netfs_read_subreq_terminated(subreq);
 #else
 	netfs_read_subreq_terminated(subreq, subreq->error, false);
@@ -1378,7 +1378,7 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 		vmsmb_file_ctx_put(ctx);	/* rollback per-PDU ref */
 		/* Submit failed — fall through to sync path for graceful error */
 		subreq->error = ret;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
 		netfs_read_subreq_terminated(subreq);
 #else
 		netfs_read_subreq_terminated(subreq, subreq->error, false);
@@ -1422,7 +1422,7 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 close:
 	vmsmb_smb2_close(sess, sbi->tree_id, &temp_fid);
 out:
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
 	netfs_read_subreq_terminated(subreq);
 #else
 	netfs_read_subreq_terminated(subreq, subreq->error, false);
@@ -1469,7 +1469,7 @@ static void vmsmb_issue_write_complete(void *priv, int status,
 	struct netfs_io_subrequest *subreq = priv;
 	struct vmsmb_file_ctx *ctx = subreq->rreq->netfs_priv;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
 	netfs_write_subrequest_terminated(subreq,
 					  status ? status : (ssize_t)bytes_written);
 #else
@@ -1511,7 +1511,7 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 			 ctx, (long long)subreq->start, subreq->len);
 		buf = kvmalloc(subreq->len, GFP_KERNEL);
 		if (!buf) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
 			netfs_write_subrequest_terminated(subreq, -ENOMEM);
 #else
 			netfs_write_subrequest_terminated(subreq, -ENOMEM, false);
@@ -1521,7 +1521,7 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 		copied = copy_from_iter(buf, subreq->len, &subreq->io_iter);
 		if (copied == 0) {
 			kvfree(buf);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
 			netfs_write_subrequest_terminated(subreq, -EFAULT);
 #else
 			netfs_write_subrequest_terminated(subreq, -EFAULT, false);
@@ -1540,7 +1540,7 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 		if (ret == 0)
 			return;
 		vmsmb_file_ctx_put(ctx);	/* rollback per-PDU ref */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
 		netfs_write_subrequest_terminated(subreq, ret);
 #else
 		netfs_write_subrequest_terminated(subreq, ret, false);
@@ -1551,7 +1551,7 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 	/* Slow path: no fid → transient CREATE+WRITE+CLOSE */
 	path = vmsmb_inode_path(inode);
 	if (IS_ERR(path)) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
 		netfs_write_subrequest_terminated(subreq, PTR_ERR(path));
 #else
 		netfs_write_subrequest_terminated(subreq, PTR_ERR(path), false);
@@ -1562,7 +1562,7 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 				FILE_OPEN, CREATE_NOT_DIR, &temp_fid, NULL);
 	kfree(path);
 	if (ret) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
 		netfs_write_subrequest_terminated(subreq, ret);
 #else
 		netfs_write_subrequest_terminated(subreq, ret, false);
@@ -1588,7 +1588,7 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 
 close:
 	vmsmb_smb2_close(sess, sbi->tree_id, &temp_fid);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
 	netfs_write_subrequest_terminated(subreq,
 					  ret ? ret : (ssize_t)bytes_written);
 #else
