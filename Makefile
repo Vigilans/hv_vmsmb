@@ -33,10 +33,10 @@ deb:
 	@echo "Built $(DEB_PACKAGE)"
 
 rpm:
-	mkdir -p rpmbuild/{SOURCES,BUILD,RPMS,SRPMS}
+	mkdir -p rpmbuild/SOURCES rpmbuild/BUILD rpmbuild/BUILDROOT rpmbuild/RPMS rpmbuild/SRPMS
 	tar czf rpmbuild/SOURCES/hv-vmsmb-dkms-$(VERSION).tar.gz \
 		--transform='s,^,hv-vmsmb-dkms-$(VERSION)/,' \
-		Makefile dkms.conf *.c *.h LICENSE README.md
+		Makefile dkms.conf $(VMSMB_SRCS) $(VMSMB_HDRS) LICENSE README.md
 	rpmbuild --define "_topdir $(PWD)/rpmbuild" -ba packaging/rpm/hv-vmsmb-dkms.spec
 
 endif
