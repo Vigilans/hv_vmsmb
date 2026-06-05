@@ -43,6 +43,12 @@ static const char *vmsmb_get_link(struct dentry *dentry, struct inode *inode,
 				   struct delayed_call *done);
 static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 			  struct dentry *dentry, const char *target);
+static void vmsmb_file_ctx_put(struct vmsmb_file_ctx *ctx);
+static void vmsmb_register_open_ctx(struct inode *inode,
+					    struct vmsmb_file_ctx *ctx);
+static void vmsmb_unregister_open_ctx(struct inode *inode,
+					      struct vmsmb_file_ctx *ctx);
+static int vmsmb_flush(struct file *file, fl_owner_t id);
 
 /* Inode cache */
 struct kmem_cache *vmsmb_inode_cachep;
@@ -789,8 +795,10 @@ static int vmsmb_atomic_open(struct inode *dir, struct dentry *dentry,
 	refcount_set(&ctx->ref, 1);
 	ctx->sess = sess;
 	ctx->tree_id = sbi->tree_id;
+	INIT_LIST_HEAD(&ctx->inode_node);
+	ctx->f_mode = file->f_mode;
 	file->private_data = ctx;
-	VMSMB_I(inode)->active_ctx = ctx;
+	vmsmb_register_open_ctx(inode, ctx);
 	i_size_write(inode, info.size);
 
 	/* CIFS dir.c:590-591 — only when we know the file was just created */
@@ -799,10 +807,9 @@ static int vmsmb_atomic_open(struct inode *dir, struct dentry *dentry,
 
 	ret = finish_open(file, dentry, generic_file_open);
 	if (ret) {
-		vmsmb_smb2_close(sess, sbi->tree_id, &ctx->fid);
-		VMSMB_I(inode)->active_ctx = NULL;
+		vmsmb_unregister_open_ctx(inode, ctx);
 		file->private_data = NULL;
-		kfree(ctx);
+		vmsmb_file_ctx_put(ctx);
 	}
 	return ret;
 }
@@ -1256,7 +1263,9 @@ static char *vmsmb_inode_path(struct inode *inode)
  *
  * Refs are held by:
  *   - file_open: the user-space-fd reference (released by file_release)
- *   - init_request: each in-flight netfs_io_request (released by free_request)
+ *   - init_request: file-backed in-flight netfs_io_requests
+ *   - begin_writeback: handle-less writeback requests that found this ctx
+ *   - issue_read / issue_write: each submitted async READ/WRITE PDU
  *
  * Port of CIFS _cifsFileInfo_put (fs/smb/client/file.c): server->ops->close
  * fires only when the refcount drops to zero, so an in-flight async WRITE
@@ -1273,13 +1282,57 @@ static void vmsmb_file_ctx_put(struct vmsmb_file_ctx *ctx)
 	}
 }
 
+static void vmsmb_register_open_ctx(struct inode *inode,
+					    struct vmsmb_file_ctx *ctx)
+{
+	struct vmsmb_inode_info *vi = VMSMB_I(inode);
+
+	spin_lock(&vi->open_ctx_lock);
+	list_add_tail(&ctx->inode_node, &vi->open_ctxs);
+	spin_unlock(&vi->open_ctx_lock);
+}
+
+static void vmsmb_unregister_open_ctx(struct inode *inode,
+					      struct vmsmb_file_ctx *ctx)
+{
+	struct vmsmb_inode_info *vi = VMSMB_I(inode);
+
+	spin_lock(&vi->open_ctx_lock);
+	if (!list_empty(&ctx->inode_node))
+		list_del_init(&ctx->inode_node);
+	spin_unlock(&vi->open_ctx_lock);
+}
+
+static int vmsmb_get_writable_ctx(struct inode *inode,
+					  struct vmsmb_file_ctx **out)
+{
+	struct vmsmb_inode_info *vi = VMSMB_I(inode);
+	struct vmsmb_file_ctx *ctx;
+
+	*out = NULL;
+
+	spin_lock(&vi->open_ctx_lock);
+	list_for_each_entry(ctx, &vi->open_ctxs, inode_node) {
+		if (!(ctx->f_mode & FMODE_WRITE))
+			continue;
+		refcount_inc(&ctx->ref);
+		*out = ctx;
+		spin_unlock(&vi->open_ctx_lock);
+		return 0;
+	}
+	spin_unlock(&vi->open_ctx_lock);
+
+	return -EBADF;
+}
+
 /*
  * netfs init_request hook — stash the open file context so issue_read /
  * issue_write can use the existing fid without reopening.
  *
- * Port of CIFS cifs_init_request() (fs/smb/client/file.c): CIFS stashes
- * a cifsFileInfo; we stash vmsmb_file_ctx via rreq->netfs_priv. Also
- * advertises the per-subrequest max chunk size so netfs splits large
+ * Port of CIFS cifs_init_request() (fs/smb/client/file.c): file-backed
+ * requests take a ctx ref here.  Handle-less NETFS_WRITEBACK requests leave
+ * netfs_priv empty; begin_writeback takes a referenced writable ctx later.
+ * Also advertises the per-subrequest max chunk size so netfs splits large
  * reads into chunks we can each fulfil in one async SMB2 round-trip.
  */
 static int vmsmb_init_request(struct netfs_io_request *rreq, struct file *file)
@@ -1300,7 +1353,8 @@ static int vmsmb_init_request(struct netfs_io_request *rreq, struct file *file)
 }
 
 /*
- * netfs free_request hook — drop the ref taken in init_request.
+ * netfs free_request hook — drop the request-level ctx ref taken either in
+ * init_request (file-backed I/O) or begin_writeback (handle-less writeback).
  *
  * Port of CIFS cifs_free_request() (fs/smb/client/file.c).  Last ref
  * drop sends the deferred SMB2 CLOSE and frees the ctx.
@@ -1449,24 +1503,23 @@ out:
 }
 
 /*
- * netfs begin_writeback hook — advertise the per-subrequest max chunk size.
+ * netfs begin_writeback hook — acquire a writable fid for buffered writeback
+ * and advertise the per-subrequest max chunk size.
  *
- * Port of CIFS cifs_begin_writeback() (fs/smb/client/file.c).
- *
- * NOTE: the buffered writeback path is unused in our config
- * (.write_iter = netfs_unbuffered_write_iter, no page cache → no dirty
- * pages → no writeback wreq).  We do NOT stash vi->active_ctx into
- * wreq->netfs_priv here because that would create a refcount imbalance:
- * init_request only takes a ref when file != NULL, but writeback wreqs
- * arrive with file == NULL, so free_request would drop a ref that was
- * never taken.  CIFS handles this via cifs_get_writable_file() under
- * cinode->open_file_lock — port that pattern before re-enabling buffered
- * mode here.  In the meantime, if writeback ever fires (it shouldn't),
- * vmsmb_issue_write will see ctx == NULL and fall to the CREATE+WRITE+CLOSE
- * slow path, which is correct (just slower).
+ * Port of CIFS cifs_begin_writeback() (fs/smb/client/file.c): lookup a
+ * writable open file under the inode open-file lock and stash a referenced
+ * file context in wreq->netfs_priv.  If all writable fds have already closed,
+ * keep the stream available; issue_write will fall back to CREATE+WRITE+CLOSE
+ * by path, which is correct but slower.
  */
 static void vmsmb_begin_writeback(struct netfs_io_request *wreq)
 {
+	struct vmsmb_file_ctx *ctx;
+
+	if (!wreq->netfs_priv &&
+	    vmsmb_get_writable_ctx(wreq->inode, &ctx) == 0)
+		wreq->netfs_priv = ctx;
+
 	wreq->io_streams[0].avail = true;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	wreq->io_streams[0].sreq_max_len = VMSMB_MAX_WRITE_CHUNK;
@@ -1523,6 +1576,7 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 	struct vmsmb_fid temp_fid;
 	void *buf;
 	size_t copied;
+	size_t len;
 	u32 bytes_written = 0;
 	char *path;
 	int ret;
@@ -1533,7 +1587,8 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 	if (ctx && subreq->len <= VMSMB_MAX_WRITE_CHUNK) {
 		pr_debug("issue_write: ASYNC ctx=%p pos=%lld len=%zu\n",
 			 ctx, (long long)subreq->start, subreq->len);
-		buf = kvmalloc(subreq->len, GFP_KERNEL);
+		len = min_t(size_t, subreq->len, VMSMB_MAX_WRITE_CHUNK);
+		buf = kvmalloc(len, GFP_KERNEL);
 		if (!buf) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || \
     !defined(NETFS_ICTX_WRITETHROUGH) || defined(NETFS_RREQ_SHORT_TRANSFER)
@@ -1543,7 +1598,7 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 #endif
 			return;
 		}
-		copied = copy_from_iter(buf, subreq->len, &subreq->io_iter);
+		copied = copy_from_iter(buf, len, &subreq->io_iter);
 		if (copied == 0) {
 			kvfree(buf);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || \
@@ -1556,8 +1611,9 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 		}
 		/* Per-WRITE-PDU ref: held until response is dispatched in
 		 * vmsmb_issue_write_complete.  Strict mirror of wire state —
-		 * needed because wreq-level ref (init_request) is dropped by
-		 * netfs cleanup which can outpace wire-ack on cancel paths. */
+		 * needed because wreq-level refs (init_request / begin_writeback)
+		 * are dropped by netfs cleanup which can outpace wire-ack on
+		 * cancel paths. */
 		refcount_inc(&ctx->ref);
 		ret = vmsmb_smb2_write_async(sess, sbi->tree_id, &ctx->fid,
 					     subreq->start, buf, copied,
@@ -1599,13 +1655,13 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 		return;
 	}
 
-	buf = kvmalloc(min_t(size_t, subreq->len, VMSMB_MAX_WRITE_CHUNK),
-		       GFP_KERNEL);
+	len = min_t(size_t, subreq->len, VMSMB_MAX_WRITE_CHUNK);
+	buf = kvmalloc(len, GFP_KERNEL);
 	if (!buf) {
 		ret = -ENOMEM;
 		goto close;
 	}
-	copied = copy_from_iter(buf, subreq->len, &subreq->io_iter);
+	copied = copy_from_iter(buf, len, &subreq->io_iter);
 	if (copied == 0) {
 		ret = -EFAULT;
 		kvfree(buf);
@@ -1710,9 +1766,11 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 	refcount_set(&ctx->ref, 1);
 	ctx->sess = sess;
 	ctx->tree_id = sbi->tree_id;
+	INIT_LIST_HEAD(&ctx->inode_node);
+	ctx->f_mode = file->f_mode;
 
 	file->private_data = ctx;
-	VMSMB_I(inode)->active_ctx = ctx;
+	vmsmb_register_open_ctx(inode, ctx);
 	return 0;
 }
 
@@ -1734,10 +1792,9 @@ static int vmsmb_file_release(struct inode *inode, struct file *file)
 {
 	struct vmsmb_file_ctx *ctx = file->private_data;
 
+	file->private_data = NULL;
 	if (ctx) {
-		if (VMSMB_I(inode)->active_ctx == ctx)
-			VMSMB_I(inode)->active_ctx = NULL;
-
+		vmsmb_unregister_open_ctx(inode, ctx);
 		vmsmb_file_ctx_put(ctx);
 	}
 	return 0;
@@ -1750,6 +1807,28 @@ static loff_t vmsmb_file_llseek(struct file *file, loff_t offset, int whence)
 	return generic_file_llseek_size(file, offset, whence,
 					MAX_LFS_FILESIZE,
 					i_size_read(inode));
+}
+
+static ssize_t vmsmb_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+{
+	if (iocb->ki_flags & IOCB_DIRECT)
+		return netfs_unbuffered_write_iter(iocb, from);
+	return netfs_file_write_iter(iocb, from);
+}
+
+/*
+ * Flush dirty pages on close while the file ctx is still registered, so
+ * buffered writeback can use the open writable fid instead of reopening by
+ * path after release.
+ */
+static int vmsmb_flush(struct file *file, fl_owner_t id)
+{
+	struct inode *inode = file_inode(file);
+	int ret = 0;
+
+	if (file->f_mode & FMODE_WRITE)
+		ret = filemap_write_and_wait(inode->i_mapping);
+	return ret;
 }
 
 /*
@@ -1782,8 +1861,9 @@ const struct file_operations vmsmb_file_ops = {
 	.open		= vmsmb_file_open,
 	.release	= vmsmb_file_release,
 	.read_iter	= netfs_file_read_iter,
-	.write_iter	= netfs_unbuffered_write_iter,
+	.write_iter	= vmsmb_file_write_iter,
 	.llseek		= vmsmb_file_llseek,
+	.flush		= vmsmb_flush,
 	.fsync		= vmsmb_fsync,
 	.mmap		= generic_file_mmap,
 };
@@ -1953,7 +2033,8 @@ static struct inode *vmsmb_alloc_inode(struct super_block *sb)
 	if (!vi)
 		return NULL;
 
-	vi->active_ctx = NULL;
+	INIT_LIST_HEAD(&vi->open_ctxs);
+	spin_lock_init(&vi->open_ctx_lock);
 	vi->symlink_target = NULL;
 	vi->index_number = 0;
 	return &vi->netfs.inode;

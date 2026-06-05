@@ -9,6 +9,7 @@
 
 #include <linux/hyperv.h>
 #include <linux/completion.h>
+#include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
@@ -433,6 +434,8 @@ struct vmsmb_file_ctx {
 	refcount_t ref;
 	struct vmsmb_session *sess;
 	u32 tree_id;
+	struct list_head inode_node;
+	fmode_t f_mode;
 };
 
 /*
@@ -441,7 +444,8 @@ struct vmsmb_file_ctx {
  */
 struct vmsmb_inode_info {
 	struct netfs_inode netfs;	/* Must be first — contains struct inode */
-	struct vmsmb_file_ctx *active_ctx; /* Open file context for writeback */
+	struct list_head open_ctxs;	/* Protected by open_ctx_lock */
+	spinlock_t open_ctx_lock;
 	char *symlink_target;		/* Cached readlink target, or NULL */
 	u64 index_number;		/* NTFS file reference (dedup key); 0 if unavailable */
 	unsigned long meta_expires;	/* jiffies after which metadata is stale */
