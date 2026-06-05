@@ -1,0 +1,6 @@
+# Keep Linux build and packaging inputs usable from Windows checkouts.
+*.c text eol=lf
+*.h text eol=lf
+Makefile text eol=lf
+dkms.conf text eol=lf
+packaging/** text eol=lf
