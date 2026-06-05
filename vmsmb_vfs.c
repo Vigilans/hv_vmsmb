@@ -1291,7 +1291,11 @@ static int vmsmb_init_request(struct netfs_io_request *rreq, struct file *file)
 		if (ctx)
 			refcount_inc(&ctx->ref);
 	}
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	rreq->io_streams[0].sreq_max_len = VMSMB_MAX_READ_CHUNK;
+#else
+	rreq->io_streams[0].submit_max_len = VMSMB_MAX_READ_CHUNK;
+#endif
 	return 0;
 }
 
@@ -1333,8 +1337,13 @@ static void vmsmb_issue_read_complete(void *priv, int status,
 	}
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
 	netfs_read_subreq_terminated(subreq);
-#else
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	netfs_read_subreq_terminated(subreq, subreq->error, false);
+#else
+	subreq->transferred = 0;
+	netfs_subreq_terminated(subreq,
+				subreq->error ? (ssize_t)subreq->error : (ssize_t)len,
+				false);
 #endif
 
 	if (ctx)
@@ -1380,8 +1389,10 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 		subreq->error = ret;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
 		netfs_read_subreq_terminated(subreq);
-#else
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 		netfs_read_subreq_terminated(subreq, subreq->error, false);
+#else
+		netfs_subreq_terminated(subreq, (ssize_t)ret, false);
 #endif
 		return;
 	}
@@ -1424,8 +1435,13 @@ close:
 out:
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0) || !defined(NETFS_ICTX_WRITETHROUGH)
 	netfs_read_subreq_terminated(subreq);
-#else
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	netfs_read_subreq_terminated(subreq, subreq->error, false);
+#else
+	subreq->transferred = 0;
+	netfs_subreq_terminated(subreq,
+				subreq->error ? (ssize_t)subreq->error : (ssize_t)bytes_read,
+				false);
 #endif
 }
 
@@ -1449,7 +1465,11 @@ out:
 static void vmsmb_begin_writeback(struct netfs_io_request *wreq)
 {
 	wreq->io_streams[0].avail = true;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	wreq->io_streams[0].sreq_max_len = VMSMB_MAX_WRITE_CHUNK;
+#else
+	wreq->io_streams[0].submit_max_len = VMSMB_MAX_WRITE_CHUNK;
+#endif
 }
 
 /*
@@ -1607,7 +1627,11 @@ static void vmsmb_prepare_write(struct netfs_io_subrequest *subreq)
 	struct netfs_io_stream *stream =
 		&subreq->rreq->io_streams[subreq->stream_nr];
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	stream->sreq_max_len = VMSMB_MAX_WRITE_CHUNK;
+#else
+	stream->submit_max_len = VMSMB_MAX_WRITE_CHUNK;
+#endif
 }
 
 const struct netfs_request_ops vmsmb_netfs_ops = {
