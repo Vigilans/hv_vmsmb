@@ -2179,6 +2179,8 @@ const struct file_operations vmsmb_file_ops = {
 	.flush		= vmsmb_flush,
 	.fsync		= vmsmb_fsync,
 	.mmap		= generic_file_mmap,
+	.splice_read	= filemap_splice_read,
+	.splice_write	= iter_file_splice_write,
 };
 
 /* ---- Directory operations ---- */
