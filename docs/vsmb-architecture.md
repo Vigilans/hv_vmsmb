@@ -299,6 +299,24 @@ incoming SMB2 PDUs. This is a host-side implementation limit, not a
 VMBus protocol constraint. See [VMBus Pipe Protocol](vmbus-pipe-protocol.md)
 for details.
 
+### No server-side copy (copychunk)
+
+`vmusrv.dll` does not implement the SMB2 server-side copy FSCTLs, so copy
+offload (`copy_file_range(2)` / `FICLONE`) is impossible — a same-share
+copy cannot be performed host-locally and always streams the data
+guest→host→guest.
+
+The host's FSCTL whitelist (`Smb2IsSupportedFsctl`) rejects all three
+copy-offload control codes; an SMB2 IOCTL for any of them returns
+`STATUS_NOT_SUPPORTED` (0xC00000BB) at validation, before execution:
+
+- `FSCTL_SRV_REQUEST_RESUME_KEY` (0x00140078)
+- `FSCTL_SRV_COPYCHUNK` (0x001440F2)
+- `FSCTL_SRV_COPYCHUNK_WRITE` (0x001480F2)
+
+The client therefore does not implement `.copy_file_range`; the VFS falls
+back to a normal read/write copy.
+
 ## Related Resources
 
 - [hcsshim](https://github.com/microsoft/hcsshim) — `internal/gcs-sidecar/vsmb.go`, `internal/uvm/vsmb.go`
