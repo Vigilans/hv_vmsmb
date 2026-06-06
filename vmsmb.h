@@ -448,6 +448,7 @@ struct vmsmb_inode_info {
 	spinlock_t open_ctx_lock;
 	char *symlink_target;		/* Cached readlink target, or NULL */
 	u64 index_number;		/* NTFS file reference (dedup key); 0 if unavailable */
+	struct timespec64 btime;	/* Creation time (immutable), for STATX_BTIME */
 	unsigned long meta_expires;	/* jiffies after which metadata is stale */
 };
 

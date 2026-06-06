@@ -134,6 +134,7 @@ static void vmsmb_fill_inode(struct inode *inode,
 	inode_set_atime_to_ts(inode, vmsmb_time_to_ts(info->last_access_time));
 	inode_set_mtime_to_ts(inode, vmsmb_time_to_ts(info->last_write_time));
 	inode_set_ctime_to_ts(inode, vmsmb_time_to_ts(info->change_time));
+	VMSMB_I(inode)->btime = vmsmb_time_to_ts(info->creation_time);
 
 	/*
 	 * Initialize netfs context after VFS inode_init_always() has run
@@ -662,6 +663,12 @@ static int vmsmb_getattr(struct mnt_idmap *idmap,
 	}
 
 	generic_fillattr(idmap, request_mask, inode, stat);
+
+	/* Birth time is immutable and stored per-inode; the server always
+	 * provides it via the CREATE response (port of CIFS cifs_getattr
+	 * filling STATX_BTIME from cifsInfo->createtime). */
+	stat->btime = vi->btime;
+	stat->result_mask |= STATX_BTIME;
 	return 0;
 }
 
