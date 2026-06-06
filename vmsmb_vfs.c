@@ -20,6 +20,7 @@
 #include <linux/backing-dev.h>
 #include <linux/nls.h>
 #include <linux/fs_parser.h>
+#include <linux/seq_file.h>
 #include "vmsmb.h"
 #include "smb2pdu.h"
 #include "smb1pdu.h"
@@ -2419,12 +2420,39 @@ static int vmsmb_write_inode(struct inode *inode, struct writeback_control *wbc)
 	return netfs_unpin_writeback(inode, wbc);
 }
 
+/*
+ * Render the active mount options into /proc/mounts.
+ *
+ * Port of CIFS cifs_show_options() (fs/smb/client/cifsfs.c): uid/gid are
+ * emitted through the mounting user namespace, modes in octal. Options are
+ * always shown (not only when non-default) so the mount line round-trips.
+ */
+static int vmsmb_show_options(struct seq_file *s, struct dentry *root)
+{
+	struct vmsmb_sb_info *sbi = VMSMB_SB(root->d_sb);
+
+	seq_printf(s, ",uid=%u",
+		   from_kuid_munged(&init_user_ns, sbi->uid));
+	seq_printf(s, ",gid=%u",
+		   from_kgid_munged(&init_user_ns, sbi->gid));
+	seq_printf(s, ",file_mode=0%o", sbi->file_mode);
+	seq_printf(s, ",dir_mode=0%o", sbi->dir_mode);
+	if (sbi->noperm)
+		seq_puts(s, ",noperm");
+	if (sbi->symlinkroot)
+		seq_show_option(s, "symlinkroot", sbi->symlinkroot);
+	seq_printf(s, ",actimeo=%lu", sbi->actimeo / HZ);
+
+	return 0;
+}
+
 static const struct super_operations vmsmb_super_ops = {
 	.alloc_inode	= vmsmb_alloc_inode,
 	.free_inode	= vmsmb_free_inode,
 	.write_inode	= vmsmb_write_inode,
 	.evict_inode	= vmsmb_evict_inode,
 	.statfs		= vmsmb_statfs,
+	.show_options	= vmsmb_show_options,
 };
 
 /*
