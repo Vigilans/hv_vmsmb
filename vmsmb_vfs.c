@@ -2384,6 +2384,13 @@ static int vmsmb_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_type = 0x564D5342; /* "VMSB" */
 	buf->f_namelen = 255;
 
+	/* Stable filesystem id: hash of the share name (so two mounts of the
+	 * same share report the same fsid) plus the tree id. f_files/f_ffree
+	 * stay 0 — NTFS has no fixed inode table to report, as in CIFS. */
+	buf->f_fsid.val[0] = full_name_hash(NULL, sbi->share_name,
+					    strlen(sbi->share_name));
+	buf->f_fsid.val[1] = sbi->tree_id;
+
 	ret = vmsmb_smb2_queryfs(sbi->sess, sbi->tree_id, &fs);
 	if (ret) {
 		/* Server query failed — fall back to a non-zero but obviously
