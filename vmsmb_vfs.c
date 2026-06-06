@@ -2718,9 +2718,49 @@ static void vmsmb_free_fc(struct fs_context *fc)
 	}
 }
 
+/*
+ * Apply changed mount options to a live superblock on `mount -o remount`.
+ * Only options explicitly given on the remount command are touched; the
+ * rest keep their current values. uid/gid/mode changes affect inodes
+ * instantiated after the remount (cached inodes keep their fill-time
+ * identity), matching CIFS remount semantics. The VFS handles the
+ * generic ro/rw flag separately.
+ */
+static int vmsmb_reconfigure(struct fs_context *fc)
+{
+	struct vmsmb_fs_context *ctx = fc->fs_private;
+	struct vmsmb_sb_info *sbi = VMSMB_SB(fc->root->d_sb);
+
+	if (ctx->uid_set)
+		sbi->uid = ctx->uid;
+	if (ctx->gid_set)
+		sbi->gid = ctx->gid;
+	if (ctx->file_mode_set)
+		sbi->file_mode = ctx->file_mode;
+	if (ctx->dir_mode_set)
+		sbi->dir_mode = ctx->dir_mode;
+	if (ctx->noperm) {
+		sbi->noperm = true;
+		sbi->file_mode = 0777;
+		sbi->dir_mode = 0777;
+	}
+	if (ctx->actimeo_secs)
+		sbi->actimeo = ctx->actimeo_secs * HZ;
+	if (ctx->symlinkroot) {
+		char *old = sbi->symlinkroot;
+
+		sbi->symlinkroot = ctx->symlinkroot;
+		ctx->symlinkroot = NULL;
+		kfree(old);
+	}
+
+	return 0;
+}
+
 static const struct fs_context_operations vmsmb_context_ops = {
 	.parse_param	= vmsmb_parse_param,
 	.get_tree	= vmsmb_get_tree,
+	.reconfigure	= vmsmb_reconfigure,
 	.free		= vmsmb_free_fc,
 };
 
