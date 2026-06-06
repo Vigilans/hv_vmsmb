@@ -1817,100 +1817,107 @@ static loff_t vmsmb_file_llseek(struct file *file, loff_t offset, int whence)
  * a time, which on a sub-ms RTT transport like VMBus collapses throughput
  * vs the pre-patch parallel path.  We pipeline N WRITE PDUs back-to-back,
  * relying on vmsmb_submit's internal ring/credit/MID admission for natural
- * backpressure, then wait on a single completion for all callbacks.
+ * backpressure.
  *
- * Semantics match FUSE async direct I/O (fuse_aio_complete) rather than
- * netfs strict-sequence:
- *   - Return value is the contiguous prefix of bytes acknowledged by the
- *     server (FUSE pos accounting).
- *   - On mid-pipeline failure (ENOSPC, server error) later chunks may
- *     already have landed on the server past the returned prefix.  Caller
- *     is expected to handle short writes / fsync as usual.
- *   - wait_for_completion is TASK_UNINTERRUPTIBLE; signals do not abort
- *     in-flight chunks.  Worst-case Ctrl-C latency = slowest in-flight
- *     chunk RTT (sub-ms on VSMB), matching FUSE async DIO behaviour.
- *   - Short writes are NOT reissued (FUSE behaviour); caller loops if
- *     it wants full data.
+ * Return value is the contiguous prefix of bytes acknowledged by the server
+ * (FUSE async DIO accounting).  On mid-pipeline failure later chunks may
+ * already have landed on the server past the returned prefix.
  */
 
-/*
- * Per-chunk record.  status uses errno sentinels:
- *   -EINPROGRESS : submitted, awaiting callback
- *   0            : callback delivered; written = server-ACKed bytes
- *   <0           : hard error (submit failure or callback error)
- *   -ECHILD      : never submitted (earlier chunk aborted the loop)
- */
 struct vmsmb_dio_chunk {
 	struct vmsmb_dio_state *state;
 	loff_t  pos;
 	u32     requested;
 	u32     written;
-	int     status;
+	int     status;		/* -EINPROGRESS / 0 / <0 / -ECHILD */
 };
 
-/*
- * inflight is seeded at 1 (submitter self-ref); each successful submit +1;
- * each callback -1; submitter -1 after the loop.  all_done fires when
- * inflight hits zero, guaranteeing every callback has retired.
- */
 struct vmsmb_dio_state {
 	atomic_t                inflight;
-	struct completion       all_done;
+	struct completion       all_done;	/* sync path only */
 	struct vmsmb_dio_chunk *chunks;
 	size_t                  nchunks;
+	size_t                  submitted_bytes;
+	/* async path (iocb != NULL): */
+	struct kiocb           *iocb;
+	struct inode           *inode;
+	loff_t                  pos;
 };
+
+static void vmsmb_dio_finalize_async(struct vmsmb_dio_state *state)
+{
+	struct kiocb *iocb = state->iocb;
+	struct inode *inode = state->inode;
+	ssize_t transferred = 0;
+	int first_err = 0;
+	size_t i;
+
+	for (i = 0; i < state->nchunks; i++) {
+		struct vmsmb_dio_chunk *c = &state->chunks[i];
+
+		if (c->status == -ECHILD)
+			break;
+		if (c->status != 0) {
+			first_err = c->status;
+			break;
+		}
+		transferred += c->written;
+		if (c->written < c->requested)
+			break;
+	}
+
+	if (transferred > 0) {
+		iocb->ki_pos = state->pos + transferred;
+		if (iocb->ki_pos > i_size_read(inode))
+			i_size_write(inode, iocb->ki_pos);
+	}
+
+	inode_dio_end(inode);
+	iocb->ki_complete(iocb, transferred ?: first_err);
+	kvfree(state->chunks);
+	kfree(state);
+}
 
 static void vmsmb_dio_chunk_complete(void *priv, int status, u32 bytes_written)
 {
 	struct vmsmb_dio_chunk *c = priv;
+	struct vmsmb_dio_state *state = c->state;
 
 	c->written = bytes_written;
 	c->status  = status;
-	if (atomic_dec_and_test(&c->state->inflight))
-		complete(&c->state->all_done);
+
+	if (!atomic_dec_and_test(&state->inflight))
+		return;
+
+	if (state->iocb)
+		vmsmb_dio_finalize_async(state);
+	else
+		complete(&state->all_done);
 }
 
 /*
- * Pipeline core: submit each chunk via vmsmb_smb2_write_async without
- * waiting between submits; wait for all callbacks; compute contiguous
- * prefix; revert iter tail that didn't make it into the prefix.
- *
- * On entry @iter holds the data to write; on exit @iter has been advanced
- * by the returned byte count (or 0 on hard error).
+ * Submit loop shared by sync and async paths.  Copies data from @iter in
+ * the caller's context (user pages still mapped), submits each chunk via
+ * vmsmb_smb2_write_async, and returns the first hard error (0 if all chunks
+ * were submitted).  Caller must have seeded state->inflight to 1.
  */
-static ssize_t vmsmb_dio_pipeline(struct vmsmb_session *sess, u32 tree_id,
-				  struct vmsmb_fid *fid,
-				  loff_t pos, struct iov_iter *iter)
+static int vmsmb_unbuffered_write(struct vmsmb_dio_state *state,
+				  struct vmsmb_session *sess, u32 tree_id,
+				  struct vmsmb_fid *fid, loff_t pos,
+				  struct iov_iter *iter, size_t total)
 {
-	const size_t total      = iov_iter_count(iter);
-	const size_t chunk_size = VMSMB_MAX_WRITE_CHUNK;
-	struct vmsmb_dio_state state;
-	size_t nchunks, submitted_bytes = 0;
-	size_t i, last_submitted = 0;
-	ssize_t transferred = 0;
+	size_t submitted_bytes = 0, last_submitted = 0;
 	int first_err = 0;
-	int ret;
+	size_t i;
 
-	if (!total)
-		return 0;
-
-	nchunks = DIV_ROUND_UP(total, chunk_size);
-	state.chunks = kvmalloc_array(nchunks, sizeof(state.chunks[0]),
-				      GFP_KERNEL);
-	if (!state.chunks)
-		return -ENOMEM;
-
-	atomic_set(&state.inflight, 1);
-	init_completion(&state.all_done);
-	state.nchunks = nchunks;
-
-	for (i = 0; i < nchunks; i++) {
-		struct vmsmb_dio_chunk *c = &state.chunks[i];
-		size_t remaining = total - submitted_bytes;
-		u32 n = (u32)min_t(size_t, remaining, chunk_size);
+	for (i = 0; i < state->nchunks; i++) {
+		struct vmsmb_dio_chunk *c = &state->chunks[i];
+		u32 n = (u32)min_t(size_t, total - submitted_bytes,
+				   VMSMB_MAX_WRITE_CHUNK);
 		void *buf;
+		int ret;
 
-		c->state     = &state;
+		c->state     = state;
 		c->pos       = pos + submitted_bytes;
 		c->requested = n;
 		c->written   = 0;
@@ -1919,28 +1926,25 @@ static ssize_t vmsmb_dio_pipeline(struct vmsmb_session *sess, u32 tree_id,
 		buf = kvmalloc(n, GFP_KERNEL);
 		if (!buf) {
 			c->status = -ENOMEM;
-			if (!first_err)
-				first_err = -ENOMEM;
+			first_err = -ENOMEM;
 			break;
 		}
 		if (copy_from_iter(buf, n, iter) != n) {
 			kvfree(buf);
 			c->status = -EFAULT;
-			if (!first_err)
-				first_err = -EFAULT;
+			first_err = -EFAULT;
 			break;
 		}
 
-		atomic_inc(&state.inflight);
+		atomic_inc(&state->inflight);
 		ret = vmsmb_smb2_write_async(sess, tree_id, fid,
 					     c->pos, buf, n,
 					     vmsmb_dio_chunk_complete, c);
 		kvfree(buf);
 		if (ret) {
-			atomic_dec(&state.inflight);
+			atomic_dec(&state->inflight);
 			c->status = ret;
-			if (!first_err)
-				first_err = ret;
+			first_err = ret;
 			break;
 		}
 
@@ -1948,16 +1952,81 @@ static ssize_t vmsmb_dio_pipeline(struct vmsmb_session *sess, u32 tree_id,
 		last_submitted   = i + 1;
 	}
 
-	for (size_t j = last_submitted; j < nchunks; j++)
-		if (state.chunks[j].status == -EINPROGRESS)
-			state.chunks[j].status = -ECHILD;
+	for (i = last_submitted; i < state->nchunks; i++)
+		if (state->chunks[i].status == -EINPROGRESS)
+			state->chunks[i].status = -ECHILD;
 
-	if (atomic_dec_and_test(&state.inflight))
-		complete(&state.all_done);
-	wait_for_completion(&state.all_done);
+	state->submitted_bytes = submitted_bytes;
+	return first_err;
+}
 
-	for (i = 0; i < nchunks; i++) {
-		struct vmsmb_dio_chunk *c = &state.chunks[i];
+static ssize_t vmsmb_unbuffered_write_iter_locked(struct kiocb *iocb,
+						  struct iov_iter *from)
+{
+	struct file *file = iocb->ki_filp;
+	struct inode *inode = file_inode(file);
+	struct vmsmb_file_ctx *ctx = file->private_data;
+	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
+	bool async = !is_sync_kiocb(iocb);
+	size_t total = iov_iter_count(from);
+	struct vmsmb_dio_state state_local, *state;
+	ssize_t transferred = 0;
+	int first_err;
+	size_t i;
+
+	if (!ctx)
+		return -EBADF;
+	if (!total)
+		return 0;
+
+	if (async) {
+		state = kzalloc(sizeof(*state), GFP_KERNEL);
+		if (!state)
+			return -ENOMEM;
+		state->iocb  = iocb;
+		state->inode = inode;
+		state->pos   = iocb->ki_pos;
+	} else {
+		memset(&state_local, 0, sizeof(state_local));
+		state = &state_local;
+		init_completion(&state->all_done);
+	}
+
+	state->nchunks = DIV_ROUND_UP(total, VMSMB_MAX_WRITE_CHUNK);
+	state->chunks  = kvmalloc_array(state->nchunks,
+					sizeof(state->chunks[0]), GFP_KERNEL);
+	if (!state->chunks) {
+		if (async)
+			kfree(state);
+		return -ENOMEM;
+	}
+
+	atomic_set(&state->inflight, 1);
+	inode_dio_begin(inode);
+
+	first_err = vmsmb_unbuffered_write(state, ctx->sess, sbi->tree_id,
+					   &ctx->fid, iocb->ki_pos, from,
+					   total);
+
+	if (async) {
+		if (state->submitted_bytes == 0) {
+			inode_dio_end(inode);
+			kvfree(state->chunks);
+			kfree(state);
+			return first_err ?: -EIO;
+		}
+		if (atomic_dec_and_test(&state->inflight))
+			vmsmb_dio_finalize_async(state);
+		return -EIOCBQUEUED;
+	}
+
+	/* Sync: wait for all chunks, compute contiguous prefix. */
+	if (atomic_dec_and_test(&state->inflight))
+		complete(&state->all_done);
+	wait_for_completion(&state->all_done);
+
+	for (i = 0; i < state->nchunks; i++) {
+		struct vmsmb_dio_chunk *c = &state->chunks[i];
 
 		if (c->status == -ECHILD)
 			break;
@@ -1971,127 +2040,19 @@ static ssize_t vmsmb_dio_pipeline(struct vmsmb_session *sess, u32 tree_id,
 			break;
 	}
 
-	if (transferred < (ssize_t)submitted_bytes)
-		iov_iter_revert(iter, submitted_bytes - transferred);
+	if (transferred < (ssize_t)state->submitted_bytes)
+		iov_iter_revert(from, state->submitted_bytes - transferred);
 
-	kvfree(state.chunks);
+	inode_dio_end(inode);
+
+	if (transferred > 0) {
+		iocb->ki_pos += transferred;
+		if (iocb->ki_pos > i_size_read(inode))
+			i_size_write(inode, iocb->ki_pos);
+	}
+
+	kvfree(state->chunks);
 	return transferred ?: first_err;
-}
-
-static ssize_t vmsmb_unbuffered_write_iter_locked(struct kiocb *iocb,
-						  struct iov_iter *from)
-{
-	struct file *file = iocb->ki_filp;
-	struct inode *inode = file_inode(file);
-	struct vmsmb_file_ctx *ctx = file->private_data;
-	loff_t pos = iocb->ki_pos;
-	ssize_t ret;
-
-	if (!ctx)
-		return -EBADF;
-
-	inode_dio_begin(inode);
-	ret = vmsmb_dio_pipeline(ctx->sess, ctx->tree_id, &ctx->fid,
-				 pos, from);
-	inode_dio_end(inode);
-
-	if (ret > 0) {
-		iocb->ki_pos = pos + ret;
-		if (iocb->ki_pos > i_size_read(inode))
-			i_size_write(inode, iocb->ki_pos);
-	}
-	return ret;
-}
-
-/*
- * Async kiocb (io_uring / libaio) path: pin user pages so the chunk loop
- * can safely copy_from_iter from workqueue context, then queue the
- * pipeline.  Submitter returns -EIOCBQUEUED; ki_complete fires from the
- * workqueue when all chunks have retired.
- */
-struct vmsmb_dio_async {
-	struct work_struct work;
-	struct kiocb      *iocb;
-	struct iov_iter    iter;
-	struct bio_vec    *bv;
-	size_t             bv_count;
-	bool               bv_unpin;
-};
-
-static void vmsmb_dio_async_unpin(struct vmsmb_dio_async *a)
-{
-	size_t i;
-
-	if (a->bv) {
-		if (a->bv_unpin) {
-			for (i = 0; i < a->bv_count; i++)
-				if (a->bv[i].bv_page)
-					unpin_user_page(a->bv[i].bv_page);
-		}
-		kvfree(a->bv);
-	}
-}
-
-static void vmsmb_dio_async_work(struct work_struct *work)
-{
-	struct vmsmb_dio_async *a = container_of(work, struct vmsmb_dio_async,
-						 work);
-	struct kiocb *iocb = a->iocb;
-	struct file *file = iocb->ki_filp;
-	struct inode *inode = file_inode(file);
-	struct vmsmb_file_ctx *ctx = file->private_data;
-	loff_t pos = iocb->ki_pos;
-	ssize_t ret;
-
-	if (!ctx) {
-		ret = -EBADF;
-		goto done;
-	}
-
-	inode_dio_begin(inode);
-	ret = vmsmb_dio_pipeline(ctx->sess, ctx->tree_id, &ctx->fid,
-				 pos, &a->iter);
-	inode_dio_end(inode);
-
-	if (ret > 0) {
-		iocb->ki_pos = pos + ret;
-		if (iocb->ki_pos > i_size_read(inode))
-			i_size_write(inode, iocb->ki_pos);
-	}
-done:
-	vmsmb_dio_async_unpin(a);
-	iocb->ki_complete(iocb, ret);
-	kfree(a);
-}
-
-static ssize_t vmsmb_unbuffered_write_iter_async(struct kiocb *iocb,
-						 struct iov_iter *from)
-{
-	struct vmsmb_dio_async *a;
-	ssize_t n;
-
-	a = kzalloc(sizeof(*a), GFP_KERNEL);
-	if (!a)
-		return -ENOMEM;
-	a->iocb = iocb;
-
-	if (user_backed_iter(from)) {
-		n = netfs_extract_user_iter(from, iov_iter_count(from),
-					    &a->iter, 0);
-		if (n < 0) {
-			kfree(a);
-			return n;
-		}
-		a->bv       = (struct bio_vec *)a->iter.bvec;
-		a->bv_count = n;
-		a->bv_unpin = iov_iter_extract_will_pin(from);
-	} else {
-		a->iter = *from;
-	}
-
-	INIT_WORK(&a->work, vmsmb_dio_async_work);
-	queue_work(system_dfl_wq, &a->work);
-	return -EIOCBQUEUED;
 }
 
 /*
@@ -2153,10 +2114,7 @@ static ssize_t vmsmb_unbuffered_write_iter(struct kiocb *iocb,
 	if (end > ictx->zero_point)
 		ictx->zero_point = end;
 
-	if (is_sync_kiocb(iocb))
-		ret = vmsmb_unbuffered_write_iter_locked(iocb, from);
-	else
-		ret = vmsmb_unbuffered_write_iter_async(iocb, from);
+	ret = vmsmb_unbuffered_write_iter_locked(iocb, from);
 
 out:
 	netfs_end_io_direct(inode);

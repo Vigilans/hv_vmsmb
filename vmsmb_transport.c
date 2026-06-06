@@ -673,7 +673,7 @@ static inline void vmsmb_complete_req(struct vmsmb_request *req)
 
 	if (req->async_cb) {
 		INIT_WORK(&req->work, vmsmb_async_work);
-		schedule_work(&req->work);
+		queue_work(system_unbound_wq, &req->work);
 	} else {
 		complete(&req->done);
 	}
