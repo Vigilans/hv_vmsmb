@@ -3060,9 +3060,8 @@ static int vmsmb_init_fs_context(struct fs_context *fc)
 }
 
 /*
- * Release superblock resources on unmount — free sbi's strings + the
- * sbi struct. No TREE_DISCONNECT: the host cleans up all tree connects
- * when the VMBus channel closes.
+ * Release superblock resources on unmount — drop the tree connect, then
+ * free sbi's strings + the sbi struct.
  *
  * Port of CIFS cifs_kill_sb() (fs/smb/client/cifsfs.c) simplified: no
  * per-sb cifs_sb_tlink_tree / tcon teardown.
@@ -3074,7 +3073,15 @@ static void vmsmb_kill_sb(struct super_block *sb)
 	kill_anon_super(sb);
 
 	if (sbi) {
-		/* Nice to have: TREE_DISCONNECT */
+		/*
+		 * Best-effort TREE_DISCONNECT after kill_anon_super() has
+		 * evicted all inodes (so no file ops remain on this tree).
+		 * Ignore the result: the host releases the tree connect anyway
+		 * when the VMBus channel closes, and a slow/failed teardown
+		 * must not block unmount.
+		 */
+		if (sbi->sess && sbi->tree_id)
+			vmsmb_smb2_tree_disconnect(sbi->sess, sbi->tree_id);
 		kfree(sbi->share_name);
 		kfree(sbi->symlinkroot);
 		kfree(sbi);

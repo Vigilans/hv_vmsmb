@@ -496,6 +496,7 @@ int vmsmb_smb2_negotiate(struct vmsmb_session *sess);
 int vmsmb_smb2_session_setup(struct vmsmb_session *sess);
 int vmsmb_smb2_tree_connect(struct vmsmb_session *sess, const char *share_name,
 			    u32 *tree_id_out);
+int vmsmb_smb2_tree_disconnect(struct vmsmb_session *sess, u32 tree_id);
 int vmsmb_smb2_create(struct vmsmb_session *sess, u32 tree_id,
 		      const char *path,
 		      u32 desired_access, u32 disposition, u32 create_options,

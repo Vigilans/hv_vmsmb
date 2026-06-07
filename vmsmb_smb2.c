@@ -2430,3 +2430,51 @@ out:
 	kfree(resp_buf);
 	return ret;
 }
+
+/*
+ * SMB2 TREE_DISCONNECT — drop a tree connection at unmount.
+ *
+ * Port of CIFS SMB2_tdis() (fs/smb/client/smb2pdu.c). MS-SMB2 2.2.11/2.2.12:
+ * a 4-byte request with a trivial response. Best-effort cleanup — the host
+ * also releases every tree connect when the VMBus channel closes — so the
+ * caller (unmount) ignores the result.
+ */
+int vmsmb_smb2_tree_disconnect(struct vmsmb_session *sess, u32 tree_id)
+{
+	struct smb2_tree_disconnect_req *req;
+	const struct smb2_hdr *hdr;
+	u8 *pdu_buf, *resp_buf;
+	u32 resp_len;
+	int ret;
+
+	pdu_buf = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!pdu_buf)
+		return -ENOMEM;
+
+	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
+	if (!resp_buf) {
+		kfree(pdu_buf);
+		return -ENOMEM;
+	}
+
+	req = (struct smb2_tree_disconnect_req *)pdu_buf;
+	vmsmb_fill_hdr(&req->hdr, SMB2_TREE_DISCONNECT_HE, sess, tree_id);
+	req->StructureSize = cpu_to_le16(4);
+
+	ret = vmsmb_smb2_transact(sess, pdu_buf, sizeof(*req),
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	kfree(pdu_buf);
+	if (ret)
+		goto out;
+
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
+	if (!hdr) {
+		ret = -EPROTO;
+		goto out;
+	}
+	ret = vmsmb_check_status(hdr, "TREE_DISCONNECT");
+
+out:
+	kfree(resp_buf);
+	return ret;
+}
