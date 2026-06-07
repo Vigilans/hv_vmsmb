@@ -39,6 +39,9 @@ rpm:
 		Makefile dkms.conf $(VMSMB_SRCS) $(VMSMB_HDRS) LICENSE README.md
 	rpmbuild --define "_topdir $(PWD)/rpmbuild" -ba packaging/rpm/hv-vmsmb-dkms.spec
 
+wsl:
+	$(MAKE) -C packaging/wsl
+
 endif
 
-.PHONY: all clean deb rpm
+.PHONY: all clean deb rpm wsl
