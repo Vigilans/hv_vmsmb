@@ -140,6 +140,7 @@ static void vmsmb_fill_inode(struct inode *inode,
 	inode_set_mtime_to_ts(inode, vmsmb_time_to_ts(info->last_write_time));
 	inode_set_ctime_to_ts(inode, vmsmb_time_to_ts(info->change_time));
 	VMSMB_I(inode)->btime = vmsmb_time_to_ts(info->creation_time);
+	VMSMB_I(inode)->attributes = info->attributes;
 
 	/*
 	 * Initialize netfs context after VFS inode_init_always() has run
@@ -179,6 +180,7 @@ static void vmsmb_refresh_inode(struct inode *inode,
 	inode_set_atime_to_ts(inode, vmsmb_time_to_ts(info->last_access_time));
 	inode_set_mtime_to_ts(inode, new_mtime);
 	inode_set_ctime_to_ts(inode, vmsmb_time_to_ts(info->change_time));
+	vi->attributes = info->attributes;
 
 	/*
 	 * If mtime advanced on the server, the file content has changed;
@@ -674,6 +676,16 @@ static int vmsmb_getattr(struct mnt_idmap *idmap,
 	 * filling STATX_BTIME from cifsInfo->createtime). */
 	stat->btime = vi->btime;
 	stat->result_mask |= STATX_BTIME;
+
+	/*
+	 * Surface the NTFS DOS attributes the server reports. Port of CIFS
+	 * cifs_getattr (fs/smb/client/inode.c), which maps the same two bits.
+	 */
+	stat->attributes_mask |= STATX_ATTR_COMPRESSED | STATX_ATTR_ENCRYPTED;
+	if (vi->attributes & FILE_ATTRIBUTE_COMPRESSED)
+		stat->attributes |= STATX_ATTR_COMPRESSED;
+	if (vi->attributes & FILE_ATTRIBUTE_ENCRYPTED)
+		stat->attributes |= STATX_ATTR_ENCRYPTED;
 	return 0;
 }
 

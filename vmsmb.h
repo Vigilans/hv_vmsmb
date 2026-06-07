@@ -455,6 +455,7 @@ struct vmsmb_inode_info {
 	char *symlink_target;		/* Cached readlink target, or NULL */
 	u64 index_number;		/* NTFS file reference (dedup key); 0 if unavailable */
 	struct timespec64 btime;	/* Creation time (immutable), for STATX_BTIME */
+	u32 attributes;			/* FILE_ATTRIBUTE_* bitmap, for STATX_ATTR_* */
 	unsigned long meta_expires;	/* jiffies after which metadata is stale */
 };
 
