@@ -2074,7 +2074,9 @@ static ssize_t vmsmb_unbuffered_write_iter(struct kiocb *iocb,
 	struct file *file = iocb->ki_filp;
 	struct address_space *mapping = file->f_mapping;
 	struct inode *inode = mapping->host;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 0, 11)
 	struct netfs_inode *ictx = netfs_inode(inode);
+#endif
 	loff_t pos = iocb->ki_pos;
 	loff_t end;
 	size_t count = iov_iter_count(from);
@@ -2119,8 +2121,17 @@ static ssize_t vmsmb_unbuffered_write_iter(struct kiocb *iocb,
 	if (ret < 0)
 		goto out;
 	end = iocb->ki_pos + iov_iter_count(from);
+	/*
+	 * netfs renamed zero_point -> _zero_point and added accessors (taking a
+	 * struct inode *) in 7.1, backported to 7.0.x stable from 7.0.11.
+	 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 11)
+	if (end > netfs_read_zero_point(inode))
+		netfs_write_zero_point(inode, end);
+#else
 	if (end > ictx->zero_point)
 		ictx->zero_point = end;
+#endif
 
 	ret = vmsmb_unbuffered_write_iter_locked(iocb, from);
 
