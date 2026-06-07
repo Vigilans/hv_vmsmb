@@ -14,6 +14,7 @@
 #include <linux/fs_context.h>
 #include <linux/filelock.h>
 #include <linux/fcntl.h>
+#include <linux/falloc.h>
 #include <linux/delay.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
@@ -2288,6 +2289,91 @@ static int vmsmb_file_flock(struct file *file, int cmd, struct file_lock *fl)
 	return vmsmb_setlk(file, fl);
 }
 
+/* ---- fallocate ---- */
+
+/*
+ * fallocate — preallocate space, punch holes, or zero ranges.
+ *
+ * Port of CIFS smb3_fallocate()/smb3_punch_hole()/smb3_zero_range()
+ * (fs/smb/client/smb2ops.c).  PUNCH_HOLE and ZERO_RANGE go through the
+ * SET_SPARSE / SET_ZERO_DATA FSCTLs (both on vmusrv's whitelist); plain
+ * preallocation (mode 0) just extends EOF, since NTFS files are non-sparse —
+ * hence already fully allocated — by default.
+ *
+ * We have no oplock, so unlike CIFS we neither cache the sparse attribute nor
+ * gate on cached read state: SET_SPARSE is issued unconditionally before a
+ * punch and the server is authoritative for size.  COLLAPSE/INSERT_RANGE have
+ * no SMB2 equivalent and are rejected.
+ */
+static long vmsmb_fallocate(struct file *file, int mode, loff_t offset,
+			    loff_t len)
+{
+	struct vmsmb_file_ctx *ctx = file->private_data;
+	struct inode *inode = file_inode(file);
+	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
+	struct file_zero_data_information zd = {
+		.FileOffset = cpu_to_le64(offset),
+		.BeyondFinalZero = cpu_to_le64(offset + len),
+	};
+	loff_t end = offset + len;
+	int ret;
+
+	if (mode & (FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_INSERT_RANGE))
+		return -EOPNOTSUPP;
+
+	if (mode & FALLOC_FL_PUNCH_HOLE) {
+		u8 set_sparse = 1;
+
+		/* Make the file sparse so the range is actually deallocated. */
+		ret = vmsmb_smb2_ioctl(ctx->sess, sbi->tree_id, &ctx->fid,
+				       FSCTL_SET_SPARSE, &set_sparse, 1,
+				       NULL, 0, NULL);
+		if (ret)
+			return ret;
+
+		filemap_invalidate_lock(inode->i_mapping);
+		truncate_pagecache_range(inode, offset, end - 1);
+		ret = vmsmb_smb2_ioctl(ctx->sess, sbi->tree_id, &ctx->fid,
+				       FSCTL_SET_ZERO_DATA, &zd, sizeof(zd),
+				       NULL, 0, NULL);
+		filemap_invalidate_unlock(inode->i_mapping);
+		return ret;
+	}
+
+	if (mode & FALLOC_FL_ZERO_RANGE) {
+		filemap_invalidate_lock(inode->i_mapping);
+		filemap_write_and_wait_range(inode->i_mapping, offset, end - 1);
+		truncate_pagecache_range(inode, offset, end - 1);
+		ret = vmsmb_smb2_ioctl(ctx->sess, sbi->tree_id, &ctx->fid,
+				       FSCTL_SET_ZERO_DATA, &zd, sizeof(zd),
+				       NULL, 0, NULL);
+		filemap_invalidate_unlock(inode->i_mapping);
+		if (ret)
+			return ret;
+		/* fall through for the optional EOF extend below */
+	}
+
+	/*
+	 * Extend EOF when a non-KEEP_SIZE request runs past the current end.
+	 * For KEEP_SIZE, or a mode-0 range within the file, there is nothing to
+	 * do: NTFS files are non-sparse and thus already fully allocated.
+	 * Mirrors vmsmb_setattr()'s ATTR_SIZE path.
+	 */
+	if (!(mode & FALLOC_FL_KEEP_SIZE) && end > i_size_read(inode)) {
+		char *path = vmsmb_build_path(file_dentry(file));
+
+		if (IS_ERR(path))
+			return PTR_ERR(path);
+		ret = vmsmb_smb2_set_eof(sbi->sess, sbi->tree_id, path, end);
+		kfree(path);
+		if (ret)
+			return ret;
+		truncate_setsize(inode, end);
+	}
+
+	return 0;
+}
+
 const struct file_operations vmsmb_file_ops = {
 	.open		= vmsmb_file_open,
 	.release	= vmsmb_file_release,
@@ -2301,6 +2387,7 @@ const struct file_operations vmsmb_file_ops = {
 	.splice_write	= iter_file_splice_write,
 	.lock		= vmsmb_file_lock,
 	.flock		= vmsmb_file_flock,
+	.fallocate	= vmsmb_fallocate,
 };
 
 /* ---- Directory operations ---- */
