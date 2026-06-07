@@ -1813,13 +1813,76 @@ static int vmsmb_file_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+/*
+ * llseek — add SEEK_HOLE / SEEK_DATA for sparse files via
+ * FSCTL_QUERY_ALLOCATED_RANGES.  Port of CIFS smb3_llseek()
+ * (fs/smb/client/smb2ops.c); other whences use the generic size-based seek.
+ *
+ * Unlike CIFS we do not cache the sparse attribute, so we always issue the
+ * query: for a non-sparse file the server returns a single range covering
+ * [offset, EOF), which gives SEEK_DATA == offset and SEEK_HOLE == EOF.
+ */
 static loff_t vmsmb_file_llseek(struct file *file, loff_t offset, int whence)
 {
 	struct inode *inode = file_inode(file);
+	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
+	struct vmsmb_file_ctx *ctx = file->private_data;
+	struct file_allocated_range_buffer in_data, out_data = {};
+	loff_t isize = i_size_read(inode);
+	u32 out_len = 0;
+	int ret;
 
-	return generic_file_llseek_size(file, offset, whence,
-					MAX_LFS_FILESIZE,
-					i_size_read(inode));
+	if (!ctx || (whence != SEEK_HOLE && whence != SEEK_DATA))
+		return generic_file_llseek_size(file, offset, whence,
+						MAX_LFS_FILESIZE, isize);
+
+	if (offset < 0 || offset >= isize)
+		return -ENXIO;
+
+	/*
+	 * Flush dirty data first: the server won't reflect recent writes in
+	 * QUERY_ALLOCATED_RANGES until they are written out.  The page-cache
+	 * writeback above pushes them to the server; the extra SMB2 FLUSH is
+	 * only meaningful — and only permitted — on a writable handle (FLUSH on
+	 * a read-only fid returns STATUS_ACCESS_DENIED).
+	 */
+	filemap_write_and_wait(inode->i_mapping);
+	if (file->f_mode & FMODE_WRITE)
+		vmsmb_smb2_flush(sbi->sess, sbi->tree_id, &ctx->fid);
+
+	in_data.file_offset = cpu_to_le64(offset);
+	in_data.length = cpu_to_le64(isize - offset);
+
+	ret = vmsmb_smb2_ioctl(ctx->sess, sbi->tree_id, &ctx->fid,
+			       FSCTL_QUERY_ALLOCATED_RANGES,
+			       &in_data, sizeof(in_data),
+			       &out_data, sizeof(out_data), &out_len);
+	/* -E2BIG just means more ranges exist; the first one is all we need. */
+	if (ret == -E2BIG)
+		ret = 0;
+	if (ret)
+		return ret;
+
+	if (out_len == 0) {
+		/* No allocated range from @offset to EOF: the rest is a hole. */
+		if (whence == SEEK_DATA)
+			return -ENXIO;
+		goto out;	/* SEEK_HOLE: @offset is in the trailing hole */
+	}
+	if (out_len < sizeof(out_data))
+		return -EINVAL;
+
+	if (whence == SEEK_DATA) {
+		offset = le64_to_cpu(out_data.file_offset);
+		goto out;
+	}
+	/* SEEK_HOLE */
+	if (offset < le64_to_cpu(out_data.file_offset))
+		goto out;	/* @offset lies in a hole before the first range */
+	offset = le64_to_cpu(out_data.file_offset) +
+		 le64_to_cpu(out_data.length);
+out:
+	return vfs_setpos(file, offset, inode->i_sb->s_maxbytes);
 }
 
 /*

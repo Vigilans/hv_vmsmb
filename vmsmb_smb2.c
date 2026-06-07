@@ -1817,9 +1817,20 @@ int vmsmb_smb2_ioctl(struct vmsmb_session *sess, u32 tree_id,
 		goto free_resp;
 	}
 
-	ret = vmsmb_check_status(hdr, "IOCTL");
-	if (ret)
-		goto free_resp;
+	if (hdr->Status == STATUS_BUFFER_OVERFLOW) {
+		/*
+		 * Not a failure: the server filled the output buffer with as
+		 * much as fit (e.g. QUERY_ALLOCATED_RANGES with more ranges
+		 * than requested) and the partial data is valid. Mirror CIFS
+		 * SMB2_ioctl(), which returns -E2BIG yet still hands back the
+		 * output.
+		 */
+		ret = -E2BIG;
+	} else {
+		ret = vmsmb_check_status(hdr, "IOCTL");
+		if (ret)
+			goto free_resp;
+	}
 
 	rsp = (const struct smb2_ioctl_rsp *)resp_buf;
 	rsp_out_off = le32_to_cpu(rsp->OutputOffset);
