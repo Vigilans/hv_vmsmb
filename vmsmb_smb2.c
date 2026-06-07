@@ -2331,3 +2331,91 @@ out:
 	kfree(resp_buf);
 	return ret;
 }
+
+/*
+ * SMB2 LOCK — acquire or release a single byte-range lock on an open file.
+ *
+ * Port of CIFS SMB2_lock()/smb2_lockv() (fs/smb/client/smb2pdu.c) for the
+ * single-element case; MS-SMB2 2.2.26. @lock_flags is an SMB2_LOCKFLAG_*
+ * combination (SHARED/EXCLUSIVE/UNLOCK, optionally | FAIL_IMMEDIATELY).
+ *
+ * @pid is stamped into the SMB2 header ProcessId for lock-owner attribution
+ * (current->tgid, matching CIFS); on SMB2 the FileId is the primary owner key.
+ *
+ * Unlike CIFS — whose transport parks indefinitely on the async response —
+ * our transact is synchronous with a fixed timeout (VMSMB_TIMEOUT_MS), so a
+ * server-side blocking wait would spuriously time out and corrupt MID state.
+ * Callers therefore always set FAIL_IMMEDIATELY and emulate F_SETLKW by
+ * retrying (see vmsmb_setlk).
+ *
+ * Returns 0 on grant/release, -EAGAIN on lock conflict (so fcntl/flock report
+ * EAGAIN rather than the generic EACCES vmsmb_check_status() would assign), or
+ * a negative errno.
+ */
+int vmsmb_smb2_lock(struct vmsmb_session *sess, u32 tree_id,
+		    struct vmsmb_fid *fid, u32 pid,
+		    u64 offset, u64 length, u32 lock_flags)
+{
+	struct smb2_lock_req *req;
+	const struct smb2_hdr *hdr;
+	u8 *pdu_buf, *resp_buf;
+	u32 resp_len;
+	int ret;
+
+	pdu_buf = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!pdu_buf)
+		return -ENOMEM;
+
+	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
+	if (!resp_buf) {
+		kfree(pdu_buf);
+		return -ENOMEM;
+	}
+
+	req = (struct smb2_lock_req *)pdu_buf;
+	vmsmb_fill_hdr(&req->hdr, SMB2_LOCK_HE, sess, tree_id);
+	req->hdr.Id.SyncId.ProcessId = cpu_to_le32(pid);
+	req->StructureSize = cpu_to_le16(48); /* includes one lock element */
+	req->LockCount = cpu_to_le16(1);
+	req->LockSequenceNumber = 0;
+	req->PersistentFileId = fid->persistent;
+	req->VolatileFileId = fid->volatile_id;
+	req->lock.Offset = cpu_to_le64(offset);
+	req->lock.Length = cpu_to_le64(length);
+	req->lock.Flags = cpu_to_le32(lock_flags);
+	req->lock.Reserved = 0;
+
+	ret = vmsmb_smb2_transact(sess, pdu_buf, sizeof(*req),
+				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
+	kfree(pdu_buf);
+	if (ret)
+		goto out;
+
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
+	if (!hdr) {
+		ret = -EPROTO;
+		goto out;
+	}
+
+	if (hdr->Status == STATUS_LOCK_NOT_GRANTED ||
+	    hdr->Status == STATUS_FILE_LOCK_CONFLICT) {
+		ret = -EAGAIN;
+		goto out;
+	}
+	/*
+	 * A coalesced VFS unlock can target a range that does not exactly
+	 * match any single server lock (we keep no per-range list); report
+	 * that as -ENOLCK so vmsmb_setlk() can treat it as benign. The
+	 * residual server lock, if any, is released at CLOSE.
+	 */
+	if (hdr->Status == STATUS_RANGE_NOT_LOCKED) {
+		ret = -ENOLCK;
+		goto out;
+	}
+
+	ret = vmsmb_check_status(hdr, "LOCK");
+
+out:
+	kfree(resp_buf);
+	return ret;
+}

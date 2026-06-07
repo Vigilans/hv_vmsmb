@@ -81,6 +81,12 @@
  * is sub-millisecond, so 10s is generous even for host-side disk I/O. */
 #define VMSMB_TIMEOUT_MS	10000
 
+/* Poll interval (ms) for emulating a blocking lock (F_SETLKW / flock without
+ * LOCK_NB). Our synchronous transport cannot park on a server-side wait, so
+ * vmsmb_setlk() retries a non-blocking lock at this cadence. See
+ * vmsmb_smb2_lock(). */
+#define VMSMB_LOCK_RETRY_MS	100
+
 /*
  * Outbound-ring drain watermark.
  *
@@ -554,6 +560,9 @@ int vmsmb_smb2_set_eof(struct vmsmb_session *sess, u32 tree_id,
 		       const char *path, u64 eof);
 int vmsmb_smb2_flush(struct vmsmb_session *sess, u32 tree_id,
 		     struct vmsmb_fid *fid);
+int vmsmb_smb2_lock(struct vmsmb_session *sess, u32 tree_id,
+		    struct vmsmb_fid *fid, u32 pid,
+		    u64 offset, u64 length, u32 lock_flags);
 
 /* vmsmb_vfs.c */
 extern struct file_system_type vmsmb_fs_type;

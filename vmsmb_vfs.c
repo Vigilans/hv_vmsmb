@@ -12,6 +12,10 @@
 #include <linux/version.h>
 #include <linux/fs.h>
 #include <linux/fs_context.h>
+#include <linux/filelock.h>
+#include <linux/fcntl.h>
+#include <linux/delay.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/pagemap.h>
 #include <linux/statfs.h>
@@ -2188,6 +2192,102 @@ static int vmsmb_fsync(struct file *file, loff_t start, loff_t end,
 	return ret;
 }
 
+/* ---- Byte-range (fcntl) and whole-file (flock) locking ---- */
+
+/*
+ * Push a lock/unlock to the server and mirror it into the VFS lock list.
+ *
+ * Port of CIFS cifs_setlk()/cifs_read_flock() (fs/smb/client/file.c) minus the
+ * cifsLockInfo range-coalescing list: we rely on the VFS's own POSIX/flock list
+ * (via locks_lock_file_wait) and on FID CLOSE to release any residual server
+ * lock left behind by a coalesced unlock. SMB2 enforces conflicts per FileId,
+ * so distinct opens — including across the host and other VMs — coordinate
+ * correctly.
+ *
+ * Blocking requests (FL_SLEEP) are emulated by retrying the non-blocking server
+ * lock, because the synchronous transport cannot park on a server-side wait
+ * (see vmsmb_smb2_lock).
+ */
+static int vmsmb_setlk(struct file *file, struct file_lock *fl)
+{
+	struct vmsmb_file_ctx *ctx = file->private_data;
+	struct vmsmb_sb_info *sbi = VMSMB_SB(file_inode(file)->i_sb);
+	bool wait = fl->c.flc_flags & FL_SLEEP;
+	u64 offset = fl->fl_start;
+	u64 length = fl->fl_end - fl->fl_start + 1; /* cifs_flock_len() */
+	u32 pid = current->tgid;
+	u32 lock_flags;
+	int ret;
+
+	if (lock_is_unlock(fl)) {
+		/*
+		 * Server unlock is best-effort: a coalesced range may not match
+		 * (-ENOLCK) and the server drops every lock at CLOSE anyway, so
+		 * never let it block the local unlock. Mirrors CIFS treating
+		 * unlock failures as non-fatal.
+		 */
+		vmsmb_smb2_lock(ctx->sess, sbi->tree_id, &ctx->fid, pid,
+				offset, length, SMB2_LOCKFLAG_UNLOCK);
+		return locks_lock_file_wait(file, fl);
+	}
+
+	lock_flags = lock_is_read(fl) ? SMB2_LOCKFLAG_SHARED
+				      : SMB2_LOCKFLAG_EXCLUSIVE;
+	lock_flags |= SMB2_LOCKFLAG_FAIL_IMMEDIATELY;
+
+	for (;;) {
+		ret = vmsmb_smb2_lock(ctx->sess, sbi->tree_id, &ctx->fid, pid,
+				      offset, length, lock_flags);
+		if (ret != -EAGAIN || !wait)
+			break;
+		if (msleep_interruptible(VMSMB_LOCK_RETRY_MS))
+			return -ERESTARTSYS;
+	}
+	if (ret)
+		return ret;
+
+	/*
+	 * Record the lock locally for POSIX/flock semantics and close-time
+	 * cleanup. If that fails, roll back the server lock we just took so the
+	 * two views stay consistent.
+	 */
+	ret = locks_lock_file_wait(file, fl);
+	if (ret)
+		vmsmb_smb2_lock(ctx->sess, sbi->tree_id, &ctx->fid, pid,
+				offset, length, SMB2_LOCKFLAG_UNLOCK);
+	return ret;
+}
+
+/*
+ * F_GETLK — report conflicts known to the local VFS lock list.
+ *
+ * We deliberately do not probe the server (cifs_getlk-style test-lock): the
+ * probe would run on our own FileId and false-positive on ranges this open
+ * already holds. Cross-client *enforcement* still works via F_SETLK (the server
+ * rejects conflicting locks); only cross-client F_GETLK *queries* are limited
+ * to locally-visible conflicts.
+ */
+static int vmsmb_getlk(struct file *file, struct file_lock *fl)
+{
+	posix_test_lock(file, fl);
+	return 0;
+}
+
+static int vmsmb_file_lock(struct file *file, int cmd, struct file_lock *fl)
+{
+	if (IS_GETLK(cmd))
+		return vmsmb_getlk(file, fl);
+	return vmsmb_setlk(file, fl);
+}
+
+static int vmsmb_file_flock(struct file *file, int cmd, struct file_lock *fl)
+{
+	if (!(fl->c.flc_flags & FL_FLOCK))
+		return -ENOLCK;
+	/* flock() is whole-file and never F_GETLK; reuse the setlk backend. */
+	return vmsmb_setlk(file, fl);
+}
+
 const struct file_operations vmsmb_file_ops = {
 	.open		= vmsmb_file_open,
 	.release	= vmsmb_file_release,
@@ -2199,6 +2299,8 @@ const struct file_operations vmsmb_file_ops = {
 	.mmap		= generic_file_mmap,
 	.splice_read	= filemap_splice_read,
 	.splice_write	= iter_file_splice_write,
+	.lock		= vmsmb_file_lock,
+	.flock		= vmsmb_file_flock,
 };
 
 /* ---- Directory operations ---- */
