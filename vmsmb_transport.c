@@ -1581,7 +1581,6 @@ int vmsmb_negotiate_version(struct vmsmb_session *sess)
 	} __packed req;
 	u8 resp_buf[64];
 	u32 resp_len;
-	const struct vmpipe_hdr *pipe_resp;
 	const struct smb2_stream_hdr *stream_resp;
 	const struct vsmb_version_payload *ver_resp;
 	int ret;
@@ -1603,7 +1602,6 @@ int vmsmb_negotiate_version(struct vmsmb_session *sess)
 		return -EPROTO;
 	}
 
-	pipe_resp = (const struct vmpipe_hdr *)resp_buf;
 	stream_resp = (const struct smb2_stream_hdr *)
 		      (resp_buf + sizeof(struct vmpipe_hdr));
 	ver_resp = (const struct vsmb_version_payload *)

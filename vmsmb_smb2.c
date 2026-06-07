@@ -1121,7 +1121,7 @@ int vmsmb_smb2_read(struct vmsmb_session *sess, u32 tree_id,
 		goto out;
 
 	rsp = (const struct smb2_read_rsp *)resp_buf;
-	data_offset = le16_to_cpu(rsp->DataOffset);
+	data_offset = rsp->DataOffset;
 	data_len = le32_to_cpu(rsp->DataLength);
 
 	if (data_offset + data_len > resp_len) {
@@ -1276,7 +1276,7 @@ static void vmsmb_read_async_complete(struct vmsmb_request *req)
 	}
 
 	rsp = (const struct smb2_read_rsp *)smb2_buf;
-	data_offset = le16_to_cpu(rsp->DataOffset);
+	data_offset = rsp->DataOffset;
 	data_len = le32_to_cpu(rsp->DataLength);
 
 	if ((u64)data_offset + data_len > smb2_len) {
