@@ -30,7 +30,8 @@ FEED := https://pkgs.dev.azure.com/shine-oss/wsl/_packaging/WslDependencies/nuge
 # a custom kernel + its modules vhd. Its presence switches the whole pipeline to
 # "custom": build against the running kernel's mounted build tree and inject into
 # that vhd. Otherwise everything comes from the official Microsoft.WSL.Kernel nuget.
-WSLCONFIG  := $(shell w=$$(wslpath "$$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r\n')" 2>/dev/null)/.wslconfig; [ -f "$$w" ] && echo "$$w")
+USERPROFILE := $(shell cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')
+WSLCONFIG  := $(shell w=$$(wslpath '$(USERPROFILE)')/.wslconfig; [ -f "$$w" ] && echo "$$w")
 WSL_KERNEL := $(and $(WSLCONFIG),$(shell sed -n 's/\r$$//; s#^kernel=##p' '$(WSLCONFIG)' | head -1))
 WSL_KMODS  := $(and $(WSLCONFIG),$(shell sed -n 's/\r$$//; s#^kernelModules=##p' '$(WSLCONFIG)' | head -1))
 
@@ -106,7 +107,7 @@ endif
 # matching its compiler (LLVM=-21 -> clang-21/ld.lld-21) when present, else LLVM=1.
 MAKE_K = $(MAKE) -C $(KBUILD) $$(if [ -n '$(LLVM)' ]; then echo LLVM=$(LLVM); elif grep -q '^CONFIG_CC_IS_CLANG=y' $(KBUILD)/.config 2>/dev/null; then v=$$(sed -n 's/.*clang version \([0-9]*\).*/\1/p' $(KBUILD)/.config | head -1); if [ -n "$$v" ] && command -v clang-$$v >/dev/null 2>&1; then echo LLVM=-$$v; else echo LLVM=1; fi; fi)
 
-.PHONY: all module vhd vhdx msi clean
+.PHONY: all module vhd vhdx msi install_vhd install_vhdx clean
 all: msi
 
 # --- official kernel package: anonymous download + unzip (no nuget.exe) --------
@@ -214,6 +215,27 @@ $(MSI): $(MODVHD)
 	  cmake --build build --config Release --target msipackage -- /m /p:UseEnv=true
 	cp "$(WSL_SRC)/build/bin/$(ARCH)/Release/wsl.msi" $@
 msi: $(MSI)
+
+# --- install_vhd: point .wslconfig at the built modules vhd, in place -----------
+# WSL boots the vhd straight from build/wsl/ — no copy, no extra location, since
+# kernelModules takes any absolute Windows path. Grants the RX ACLs WSL 2.7.1+
+# needs (icacls by SID, locale-independent), sets kernelModules= to it, and leaves
+# kernel= if present (custom) or adds the stock WSL kernel (WSL refuses
+# kernelModules without a kernel). The vhd lives in the build tree, so `make clean`
+# undoes this — it is an in-place dev install. Apply with `wsl --shutdown`.
+install_vhd install_vhdx: $(MODVHD)
+	set -e; \
+	win=$$(wslpath -w "$(MODVHD)"); destm=$$(wslpath -m "$(MODVHD)"); \
+	icacls.exe "$$win" /grant '*S-1-5-32-545:(RX)' '*S-1-15-2-1:(RX)' '*S-1-15-2-2:(RX)' >/dev/null; \
+	cfg=$$(wslpath '$(USERPROFILE)')/.wslconfig; touch "$$cfg"; \
+	grep -q '^\[wsl2\]' "$$cfg" || printf '\n[wsl2]\n' >> "$$cfg"; \
+	grep -q '^kernel=' "$$cfg" || sed -i '/^\[wsl2\]/a kernel=C:/Program Files/WSL/tools/kernel' "$$cfg"; \
+	if grep -q '^kernelModules=' "$$cfg"; then \
+	  sed -i "s|^kernelModules=.*|kernelModules=$$destm|" "$$cfg"; \
+	else \
+	  sed -i "/^\[wsl2\]/a kernelModules=$$destm" "$$cfg"; \
+	fi; \
+	echo ">>> .wslconfig kernelModules -> $$win; run 'wsl --shutdown' to apply"
 
 clean:
 	rm -rf $(O)
