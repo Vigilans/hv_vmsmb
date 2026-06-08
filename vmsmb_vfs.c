@@ -1194,6 +1194,17 @@ static int vmsmb_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (ret)
 		return ret;
 
+	/*
+	 * Flush dirty data before changing timestamps or size.  Writes are
+	 * async (netfs writeback) and the server bumps the file's modification
+	 * time on every WRITE; without this, writeback that lands after the
+	 * SET_INFO overwrites the timestamp we just set (e.g. tar restoring an
+	 * archived mtime ends up with the extraction time).  Port of CIFS
+	 * cifs_setattr_nounix() (fs/smb/client/inode.c).
+	 */
+	if (attr->ia_valid & (ATTR_MTIME | ATTR_SIZE | ATTR_CTIME))
+		filemap_write_and_wait(inode->i_mapping);
+
 	if (attr->ia_valid & ATTR_SIZE) {
 		loff_t newsize = attr->ia_size;
 
