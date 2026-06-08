@@ -498,24 +498,20 @@ static int vmsmb_d_revalidate(struct dentry *dentry, unsigned int flags)
 
 	inode = d_inode(dentry);
 	if (!inode) {
-		/* Negative dentry: trust it only while parent's TTL is valid.
-		 * Otherwise the host may have created the file and we'd never
-		 * notice. */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
-		struct dentry *parent = dget_parent(dentry);
-		struct inode *dir = d_inode(parent);
-#endif
-		int ret = 1;
+		/*
+		 * Negative dentry: expire it actimeo after its own lookup stamp
+		 * (dentry->d_time), so a file the host created after we cached the
+		 * miss becomes visible.  Must not key off the parent dir's
+		 * meta_expires: the path walk revalidates the parent first and
+		 * refreshes its meta_expires on every traversal, which would pin
+		 * the cached miss forever.  Mirrors cifs_d_revalidate()'s
+		 * cifs_get_time(dentry) + timeout check (fs/smb/client/dir.c).
+		 */
+		struct vmsmb_sb_info *sbi = VMSMB_SB(dentry->d_sb);
 
-		if (dir) {
-			vi = VMSMB_I(dir);
-			if (time_after(jiffies, vi->meta_expires))
-				ret = 0;
-		}
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
-		dput(parent);
-#endif
-		return ret;
+		if (time_after(jiffies, dentry->d_time + sbi->actimeo))
+			return 0;
+		return 1;
 	}
 
 	vi = VMSMB_I(inode);
@@ -579,8 +575,11 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 				      &info);
 	kfree(path);
 
-	if (ret == -ENOENT)
+	if (ret == -ENOENT) {
+		/* Stamp the miss so vmsmb_d_revalidate can expire it after actimeo. */
+		dentry->d_time = jiffies;
 		return d_splice_alias(NULL, dentry);
+	}
 	if (ret)
 		return ERR_PTR(ret);
 
