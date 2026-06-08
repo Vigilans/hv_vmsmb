@@ -1491,7 +1491,16 @@ static void vmsmb_issue_read_complete(void *priv, int status,
 	struct netfs_io_subrequest *subreq = priv;
 	struct vmsmb_file_ctx *ctx = subreq->rreq->netfs_priv;
 
-	if (status) {
+	if (status == -ENODATA) {
+		/*
+		 * Read at/past EOF (e.g. the read-modify-write probe of a folio
+		 * beyond i_size, or a sparse region) returns STATUS_END_OF_FILE.
+		 * That is not an error: flag EOF so netfs zero-fills the rest of
+		 * the subrequest.  Port of CIFS smb2_readv_callback()
+		 * (fs/smb/client/smb2pdu.c), which maps -ENODATA to HIT_EOF.
+		 */
+		__set_bit(NETFS_SREQ_HIT_EOF, &subreq->flags);
+	} else if (status) {
 		subreq->error = status;
 	} else if (len && copy_to_iter(data, len, &subreq->io_iter) != len) {
 		subreq->error = -EFAULT;
@@ -1585,7 +1594,10 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 
 	ret = vmsmb_smb2_read(sess, sbi->tree_id, &temp_fid,
 			      subreq->start, subreq->len, buf, &bytes_read);
-	if (ret) {
+	if (ret == -ENODATA) {
+		/* Read past EOF / sparse hole — zero-fill (see issue_read_complete). */
+		__set_bit(NETFS_SREQ_HIT_EOF, &subreq->flags);
+	} else if (ret) {
 		subreq->error = ret;
 	} else if (bytes_read &&
 		   copy_to_iter(buf, bytes_read, &subreq->io_iter) != bytes_read) {
