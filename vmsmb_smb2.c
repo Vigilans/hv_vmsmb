@@ -491,6 +491,7 @@ out:
 int vmsmb_smb2_create(struct vmsmb_session *sess, u32 tree_id,
 		      const char *path,
 		      u32 desired_access, u32 disposition, u32 create_options,
+		      u8 *oplock,
 		      struct vmsmb_fid *fid, struct vmsmb_file_info *info)
 {
 	u8 *pdu_buf, *resp_buf;
@@ -541,6 +542,7 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, u32 tree_id,
 			   FILE_SHARE_DELETE_LE;
 	req->CreateDisposition = cpu_to_le32(disposition);
 	req->CreateOptions = cpu_to_le32(create_options);
+	req->RequestedOplockLevel = oplock ? *oplock : SMB2_OPLOCK_LEVEL_NONE;
 	/*
 	 * NameOffset must point past the header even when name is empty.
 	 * Some servers reject NameOffset=0.
@@ -592,6 +594,10 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, u32 tree_id,
 	if (fid) {
 		fid->persistent = rsp->PersistentFileId;
 		fid->volatile_id = rsp->VolatileFileId;
+	}
+	if (oplock) {
+		*oplock = rsp->OplockLevel;
+		pr_debug("CREATE: granted oplock=0x%x\n", rsp->OplockLevel);
 	}
 	if (info) {
 		u32 rsp_ctx_off = le32_to_cpu(rsp->CreateContextsOffset);
@@ -1571,7 +1577,7 @@ int vmsmb_smb2_rename(struct vmsmb_session *sess, u32 tree_id,
 
 	/* Step 1: Open source with DELETE access */
 	ret = vmsmb_smb2_create(sess, tree_id, old_path, DELETE,
-				FILE_OPEN, 0, &fid, NULL);
+				FILE_OPEN, 0, NULL, &fid, NULL);
 	if (ret)
 		return ret;
 
@@ -1668,7 +1674,7 @@ int vmsmb_smb2_hardlink(struct vmsmb_session *sess, u32 tree_id,
 	int ret;
 
 	ret = vmsmb_smb2_create(sess, tree_id, src_path, FILE_READ_ATTRIBUTES,
-				FILE_OPEN, 0, &fid, NULL);
+				FILE_OPEN, 0, NULL, &fid, NULL);
 	if (ret)
 		return ret;
 
@@ -1943,7 +1949,7 @@ int vmsmb_smb2_create_symlink(struct vmsmb_session *sess, u32 tree_id,
 				GENERIC_WRITE | DELETE,
 				FILE_CREATE,
 				OPEN_REPARSE_POINT,
-				&fid, NULL);
+				NULL, &fid, NULL);
 	if (ret) {
 		kfree(target_utf16);
 		return ret;
@@ -2013,7 +2019,7 @@ int vmsmb_smb2_queryfs(struct vmsmb_session *sess, u32 tree_id,
 
 	/* Open the share root with minimum access for FS info query */
 	ret = vmsmb_smb2_create(sess, tree_id, "", FILE_READ_ATTRIBUTES,
-				FILE_OPEN, 0, &fid, &info);
+				FILE_OPEN, 0, NULL, &fid, &info);
 	if (ret)
 		return ret;
 

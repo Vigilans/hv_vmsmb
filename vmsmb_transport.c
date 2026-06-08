@@ -680,6 +680,22 @@ static inline void vmsmb_complete_req(struct vmsmb_request *req)
 }
 
 /*
+ * A fully-accumulated unsolicited OPLOCK_BREAK PDU sits in sess->oplock_scratch.
+ * Validate it is a classic break (StructureSize 24; a lease break is 44) and
+ * dispatch it.  Runs in channel_cb softirq context.
+ */
+static void vmsmb_dispatch_oplock_break(struct vmsmb_session *sess)
+{
+	const struct smb2_oplock_break *brk =
+		(const struct smb2_oplock_break *)
+		(sess->oplock_scratch + sizeof(struct smb2_stream_hdr));
+
+	if (le16_to_cpu(brk->StructureSize) == 24)
+		vmsmb_oplock_break_received(sess, brk->PersistentFid,
+					    brk->VolatileFid);
+}
+
+/*
  * Process one vmpipe DATA payload chunk in the channel callback.
  *
  * The VSMB byte stream is: [StreamHdr(4)] [SMB2 PDU(N)] per response.
@@ -698,6 +714,27 @@ static void vmsmb_process_data(struct vmsmb_session *sess,
 {
 	while (len > 0) {
 		struct vmsmb_request *req = sess->current_recv;
+
+		/* Accumulating an unsolicited OPLOCK_BREAK (no matching MID). */
+		if (sess->recv_oplock) {
+			u32 have = sess->oplock_scratch_len;
+			u32 remaining = sess->oplock_expected - have;
+			u32 copy = min3(len, remaining,
+					(u32)sizeof(sess->oplock_scratch) - have);
+
+			memcpy(sess->oplock_scratch + have, data, copy);
+			sess->oplock_scratch_len += copy;
+			data += copy;
+			len -= copy;
+
+			if (sess->oplock_scratch_len >= sess->oplock_expected) {
+				vmsmb_dispatch_oplock_break(sess);
+				sess->recv_oplock = false;
+				sess->oplock_scratch_len = 0;
+				sess->oplock_expected = 0;
+			}
+			continue;
+		}
 
 		if (!req) {
 			/*
@@ -765,6 +802,28 @@ static void vmsmb_process_data(struct vmsmb_session *sess,
 			spin_unlock(&sess->ct_lock);
 
 			if (!req) {
+				/*
+				 * Unsolicited classic OPLOCK_BREAK (Command 0x12,
+				 * 88-byte PDU): accumulate the full PDU into
+				 * oplock_scratch (scratch[] holds only the first
+				 * 36 bytes; the FileId lives past that), then
+				 * dispatch.  A lease break (108-byte PDU) falls
+				 * through to skip.
+				 */
+				if (le16_to_cpu(smb2h->Command) ==
+					    SMB2_OPLOCK_BREAK_HE &&
+				    body_size == sizeof(struct smb2_oplock_break)) {
+					memcpy(sess->oplock_scratch, sess->scratch,
+					       sess->scratch_len);
+					sess->oplock_scratch_len = sess->scratch_len;
+					sess->oplock_expected =
+						sizeof(struct smb2_stream_hdr) +
+						body_size;
+					sess->recv_oplock = true;
+					sess->scratch_len = 0;
+					continue;
+				}
+
 				pr_warn("recv: no pending request for MessageId=%llu\n",
 					mid);
 				/*
@@ -894,7 +953,14 @@ static void vmsmb_channel_cb(void *ctx)
 	 * dispatch responses. Otherwise, leave packets in the ring
 	 * buffer for the synchronous receive path (version negotiation).
 	 */
-	if (READ_ONCE(sess->ct_mid_range_size) || sess->current_recv) {
+	/*
+	 * Once negotiation is done (recv_async), always drain the inbound ring:
+	 * the host can send an unsolicited OPLOCK_BREAK with no request of ours
+	 * in flight, and nothing else would pick it up.  Before that, leave
+	 * packets for the synchronous version-negotiation path.
+	 */
+	if (READ_ONCE(sess->recv_async) ||
+	    READ_ONCE(sess->ct_mid_range_size) || sess->current_recv) {
 		struct hv_ring_buffer_info *rbi = &sess->channel->inbound;
 		u8 *ring = hv_get_ring_buffer(rbi);
 		bool processed_any = false;
@@ -992,6 +1058,9 @@ int vmsmb_open_channel(struct vmsmb_session *sess)
 	mutex_init(&sess->send_mutex);
 	init_waitqueue_head(&sess->send_drain_wait);
 
+	INIT_LIST_HEAD(&sess->open_ctx_list);
+	spin_lock_init(&sess->open_ctx_list_lock);
+
 	spin_lock_init(&sess->ct_lock);
 	init_waitqueue_head(&sess->ct_send_wait);
 	sess->ct_oldest_mid  = 0;
@@ -1014,6 +1083,7 @@ int vmsmb_open_channel(struct vmsmb_session *sess)
 	sess->current_recv = NULL;
 	sess->scratch_len = 0;
 	sess->skip_bytes = 0;
+	sess->recv_async = false;
 	init_completion(&sess->recv_done);
 
 	/*
@@ -1643,6 +1713,13 @@ int vmsmb_negotiate_version(struct vmsmb_session *sess)
 			pr_info("drained %d pending ring entries\n",
 				drain_count);
 	}
+
+	/*
+	 * Negotiation (and its one-shot sync drain above) is complete; from here
+	 * the channel_cb owns the inbound ring and must drain unsolicited
+	 * server packets (oplock breaks) even when no request is in flight.
+	 */
+	WRITE_ONCE(sess->recv_async, true);
 
 	return 0;
 }

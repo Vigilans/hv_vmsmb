@@ -55,6 +55,7 @@ static void vmsmb_register_open_ctx(struct inode *inode,
 static void vmsmb_unregister_open_ctx(struct inode *inode,
 					      struct vmsmb_file_ctx *ctx);
 static int vmsmb_flush(struct file *file, fl_owner_t id);
+static void vmsmb_oplock_break_work(struct work_struct *work);
 
 /* Inode cache */
 struct kmem_cache *vmsmb_inode_cachep;
@@ -757,6 +758,7 @@ static int vmsmb_atomic_open(struct inode *dir, struct dentry *dentry,
 	char *path;
 	u32 access = 0;
 	u32 disposition;
+	u8 oplock = sbi->oplocks ? SMB2_OPLOCK_LEVEL_II : SMB2_OPLOCK_LEVEL_NONE;
 	int ret;
 
 	if (!(open_flag & O_CREAT)) {
@@ -788,8 +790,9 @@ static int vmsmb_atomic_open(struct inode *dir, struct dentry *dentry,
 	if (file->f_mode & FMODE_WRITE)
 		access |= VMSMB_WRITE_ACCESS;
 
-	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, access, disposition,
-				CREATE_NOT_DIR, &ctx->fid, &info);
+	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, access,
+				disposition, CREATE_NOT_DIR,
+				&oplock, &ctx->fid, &info);
 	kfree(path);
 	if (ret) {
 		kfree(ctx);
@@ -822,6 +825,11 @@ static int vmsmb_atomic_open(struct inode *dir, struct dentry *dentry,
 	ctx->tree_id = sbi->tree_id;
 	INIT_LIST_HEAD(&ctx->inode_node);
 	ctx->f_mode = file->f_mode;
+	ctx->oplock_level = oplock;
+	ctx->inode = inode;
+	ihold(inode);		/* pinned for the ctx lifetime (break work) */
+	INIT_LIST_HEAD(&ctx->sess_node);
+	INIT_WORK(&ctx->oplock_break, vmsmb_oplock_break_work);
 	file->private_data = ctx;
 	vmsmb_register_open_ctx(inode, ctx);
 	i_size_write(inode, info.size);
@@ -1125,7 +1133,7 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, FILE_READ_ATTRIBUTES,
 				FILE_OPEN,
 				OPEN_REPARSE_POINT,
-				&fid, &info);
+				NULL, &fid, &info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, sbi->tree_id, &fid);
 
@@ -1303,6 +1311,7 @@ static void vmsmb_file_ctx_put(struct vmsmb_file_ctx *ctx)
 {
 	if (refcount_dec_and_test(&ctx->ref)) {
 		vmsmb_smb2_close(ctx->sess, ctx->tree_id, &ctx->fid);
+		iput(ctx->inode);
 		kfree(ctx);
 	}
 }
@@ -1315,12 +1324,22 @@ static void vmsmb_register_open_ctx(struct inode *inode,
 	spin_lock(&vi->open_ctx_lock);
 	list_add_tail(&ctx->inode_node, &vi->open_ctxs);
 	spin_unlock(&vi->open_ctx_lock);
+
+	/* Session-global list, walked by the break dispatch to map fid->ctx. */
+	spin_lock_bh(&ctx->sess->open_ctx_list_lock);
+	list_add_tail(&ctx->sess_node, &ctx->sess->open_ctx_list);
+	spin_unlock_bh(&ctx->sess->open_ctx_list_lock);
 }
 
 static void vmsmb_unregister_open_ctx(struct inode *inode,
 					      struct vmsmb_file_ctx *ctx)
 {
 	struct vmsmb_inode_info *vi = VMSMB_I(inode);
+
+	spin_lock_bh(&ctx->sess->open_ctx_list_lock);
+	if (!list_empty(&ctx->sess_node))
+		list_del_init(&ctx->sess_node);
+	spin_unlock_bh(&ctx->sess->open_ctx_list_lock);
 
 	spin_lock(&vi->open_ctx_lock);
 	if (!list_empty(&ctx->inode_node))
@@ -1348,6 +1367,66 @@ static int vmsmb_get_writable_ctx(struct inode *inode,
 	spin_unlock(&vi->open_ctx_lock);
 
 	return -EBADF;
+}
+
+/*
+ * Oplock-break work — flush dirty data, then drop cached pages and metadata so
+ * subsequent access re-fetches from the server.  Queued by the receive path
+ * with a ctx ref held; that ref is dropped here.
+ *
+ * Port of CIFS cifs_oplock_break() (fs/smb/client/file.c).  A LEVEL_II break to
+ * NONE is a one-way notification and is not acknowledged.  In-flight writes are
+ * drained first so the server sees our data: DIO via inode_dio_wait(), buffered
+ * (page cache) via filemap_write_and_wait().
+ */
+static void vmsmb_oplock_break_work(struct work_struct *work)
+{
+	struct vmsmb_file_ctx *ctx =
+		container_of(work, struct vmsmb_file_ctx, oplock_break);
+	struct inode *inode = ctx->inode;
+
+	pr_debug("oplock break: ino=%lu held=0x%x\n",
+		 inode->i_ino, ctx->oplock_level);
+
+	inode_dio_wait(inode);
+	filemap_write_and_wait(inode->i_mapping);
+	invalidate_inode_pages2(inode->i_mapping);
+	VMSMB_I(inode)->meta_expires = jiffies - 1;
+
+	ctx->oplock_level = SMB2_OPLOCK_LEVEL_NONE;
+	vmsmb_file_ctx_put(ctx);
+}
+
+/*
+ * Receive-path entry: a server OPLOCK_BREAK arrived for (persistent,volatile).
+ * Find the open ctx, pin it, and queue the break work.  Runs in the
+ * channel_cb softirq, so it must not sleep — the heavy lifting is in
+ * vmsmb_oplock_break_work().  Ports CIFS smb2_is_valid_oplock_break() +
+ * cifs_queue_oplock_break().
+ */
+void vmsmb_oplock_break_received(struct vmsmb_session *sess, u64 persistent,
+				 u64 volatile_id)
+{
+	struct vmsmb_file_ctx *ctx;
+
+	spin_lock(&sess->open_ctx_list_lock);
+	list_for_each_entry(ctx, &sess->open_ctx_list, sess_node) {
+		if (ctx->fid.persistent != persistent ||
+		    ctx->fid.volatile_id != volatile_id)
+			continue;
+
+		refcount_inc(&ctx->ref);
+		/*
+		 * On already-queued, drop the ref we just took.  The pending
+		 * work still holds its own ref, so this never reaches zero —
+		 * refcount_dec (not vmsmb_file_ctx_put) keeps us off the
+		 * sleeping CLOSE path while under the spinlock in softirq.
+		 */
+		if (!queue_work(system_unbound_wq, &ctx->oplock_break))
+			refcount_dec(&ctx->ref);
+		break;
+	}
+	spin_unlock(&sess->open_ctx_list_lock);
 }
 
 /*
@@ -1485,7 +1564,7 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 		goto out;
 	}
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, VMSMB_READ_ACCESS,
-				FILE_OPEN, CREATE_NOT_DIR, &temp_fid, NULL);
+				FILE_OPEN, CREATE_NOT_DIR, NULL, &temp_fid, NULL);
 	kfree(path);
 	if (ret) {
 		subreq->error = ret;
@@ -1668,7 +1747,7 @@ static void vmsmb_issue_write(struct netfs_io_subrequest *subreq)
 		return;
 	}
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, VMSMB_WRITE_ACCESS,
-				FILE_OPEN, CREATE_NOT_DIR, &temp_fid, NULL);
+				FILE_OPEN, CREATE_NOT_DIR, NULL, &temp_fid, NULL);
 	kfree(path);
 	if (ret) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0) || \
@@ -1752,6 +1831,7 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 	char *path;
 	u32 access = 0;
 	u32 disposition;
+	u8 oplock = sbi->oplocks ? SMB2_OPLOCK_LEVEL_II : SMB2_OPLOCK_LEVEL_NONE;
 	int ret;
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
@@ -1774,9 +1854,9 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 	else
 		disposition = FILE_OPEN;
 
-	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, access, disposition,
-				CREATE_NOT_DIR,
-				&ctx->fid, &info);
+	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, access,
+				disposition, CREATE_NOT_DIR,
+				&oplock, &ctx->fid, &info);
 
 	kfree(path);
 
@@ -1793,6 +1873,11 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 	ctx->tree_id = sbi->tree_id;
 	INIT_LIST_HEAD(&ctx->inode_node);
 	ctx->f_mode = file->f_mode;
+	ctx->oplock_level = oplock;
+	ctx->inode = inode;
+	ihold(inode);		/* pinned for the ctx lifetime (break work) */
+	INIT_LIST_HEAD(&ctx->sess_node);
+	INIT_WORK(&ctx->oplock_break, vmsmb_oplock_break_work);
 
 	file->private_data = ctx;
 	vmsmb_register_open_ctx(inode, ctx);
@@ -2532,7 +2617,7 @@ static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, path, VMSMB_DIR_ACCESS,
 				FILE_OPEN, CREATE_NOT_FILE,
-				&fid, NULL);
+				NULL, &fid, NULL);
 	if (ret) {
 		pr_debug("readdir: CREATE '%s' failed: %d\n", path, ret);
 		kfree(path);
@@ -2733,6 +2818,7 @@ static int vmsmb_show_options(struct seq_file *s, struct dentry *root)
 	if (sbi->symlinkroot)
 		seq_show_option(s, "symlinkroot", sbi->symlinkroot);
 	seq_printf(s, ",actimeo=%lu", sbi->actimeo / HZ);
+	seq_puts(s, sbi->oplocks ? ",oplock" : ",nooplock");
 
 	return 0;
 }
@@ -2794,7 +2880,7 @@ static int vmsmb_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	ret = vmsmb_smb2_create(sess, sbi->tree_id, "", FILE_READ_ATTRIBUTES,
 				FILE_OPEN, CREATE_NOT_FILE,
-				&root_fid, &root_info);
+				NULL, &root_fid, &root_info);
 	if (ret == 0)
 		vmsmb_smb2_close(sess, sbi->tree_id, &root_fid);
 
@@ -2825,6 +2911,7 @@ enum vmsmb_param {
 	Opt_noperm,
 	Opt_symlinkroot,
 	Opt_actimeo,
+	Opt_oplock,
 };
 
 static const struct fs_parameter_spec vmsmb_fs_parameters[] = {
@@ -2835,6 +2922,7 @@ static const struct fs_parameter_spec vmsmb_fs_parameters[] = {
 	fsparam_flag("noperm",		Opt_noperm),
 	fsparam_string("symlinkroot",	Opt_symlinkroot),
 	fsparam_u32("actimeo",		Opt_actimeo),
+	fsparam_flag_no("oplock",	Opt_oplock),
 	{}
 };
 
@@ -2854,6 +2942,8 @@ struct vmsmb_fs_context {
 	bool noperm;
 	char *symlinkroot;
 	unsigned int actimeo_secs;	/* 0 = use default */
+	bool oplocks;
+	bool oplocks_set;
 };
 
 /*
@@ -2908,6 +2998,10 @@ static int vmsmb_parse_param(struct fs_context *fc,
 	case Opt_actimeo:
 		ctx->actimeo_secs = result.uint_32;
 		break;
+	case Opt_oplock:
+		ctx->oplocks = !result.negated;
+		ctx->oplocks_set = true;
+		break;
 	}
 
 	return 0;
@@ -2955,6 +3049,8 @@ static int vmsmb_get_tree(struct fs_context *fc)
 
 	/* Default 1 second — matches CIFS actimeo default */
 	sbi->actimeo = ctx->actimeo_secs ? (ctx->actimeo_secs * HZ) : HZ;
+
+	sbi->oplocks = ctx->oplocks;
 
 	/* noperm: open all permissions so VFS checks always pass */
 	if (sbi->noperm) {
@@ -3028,6 +3124,8 @@ static int vmsmb_reconfigure(struct fs_context *fc)
 	}
 	if (ctx->actimeo_secs)
 		sbi->actimeo = ctx->actimeo_secs * HZ;
+	if (ctx->oplocks_set)
+		sbi->oplocks = ctx->oplocks;
 	if (ctx->symlinkroot) {
 		char *old = sbi->symlinkroot;
 

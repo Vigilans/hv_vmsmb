@@ -400,6 +400,26 @@ struct vmsmb_session {
 	u8 scratch[64];		/* accumulate initial bytes of new response */
 	u32 scratch_len;
 	u32 skip_bytes;		/* bytes to skip for unmatched response */
+	bool recv_async;	/* negotiation done: drain unsolicited packets (oplock breaks) even with no request in flight */
+
+	/*
+	 * Session-global list of open vmsmb_file_ctx (ports CIFS
+	 * tcon->openFileList); walked by the break dispatch to resolve a
+	 * break's FileId -> ctx -> inode.  Mutated in process context under
+	 * spin_lock_bh.
+	 */
+	struct list_head open_ctx_list;
+	spinlock_t open_ctx_list_lock;
+
+	/*
+	 * Accumulation for an unsolicited inbound OPLOCK_BREAK: the shared
+	 * scratch[] above only holds the first 36 bytes, but the break's
+	 * StructureSize/FileId live past that.  Touched only by channel_cb.
+	 */
+	u8 oplock_scratch[96];		/* StreamHdr(4) + smb2_oplock_break(88) */
+	u32 oplock_scratch_len;
+	u32 oplock_expected;		/* total bytes to accumulate, 0 = not in break */
+	bool recv_oplock;
 
 	/* Synchronous send+recv for pre-SMB2 (version negotiation) */
 	struct completion recv_done;
@@ -419,6 +439,7 @@ struct vmsmb_sb_info {
 	bool noperm;		/* skip VFS permission checks */
 	char *symlinkroot;	/* mount option: translate Windows abs symlinks to {symlinkroot}/x/... */
 	unsigned long actimeo;	/* metadata cache TTL in jiffies (mount option, default 1s) */
+	bool oplocks;		/* mount option: request LEVEL_II oplocks for coherence (default off) */
 };
 
 /*
@@ -442,6 +463,12 @@ struct vmsmb_file_ctx {
 	u32 tree_id;
 	struct list_head inode_node;
 	fmode_t f_mode;
+
+	/* Oplock state (ports CIFS cfile->oplock_level / ->tlist / ->oplock_break) */
+	u8 oplock_level;		/* granted SMB2_OPLOCK_LEVEL_*; 0 = none */
+	struct inode *inode;		/* back-pointer for break lookup; pinned by the open file */
+	struct list_head sess_node;	/* membership in sess->open_ctx_list */
+	struct work_struct oplock_break;
 };
 
 /*
@@ -500,6 +527,7 @@ int vmsmb_smb2_tree_disconnect(struct vmsmb_session *sess, u32 tree_id);
 int vmsmb_smb2_create(struct vmsmb_session *sess, u32 tree_id,
 		      const char *path,
 		      u32 desired_access, u32 disposition, u32 create_options,
+		      u8 *oplock,
 		      struct vmsmb_fid *fid, struct vmsmb_file_info *info);
 int vmsmb_smb2_close(struct vmsmb_session *sess, u32 tree_id,
 		     struct vmsmb_fid *fid);
@@ -562,6 +590,8 @@ int vmsmb_smb2_set_eof(struct vmsmb_session *sess, u32 tree_id,
 		       const char *path, u64 eof);
 int vmsmb_smb2_flush(struct vmsmb_session *sess, u32 tree_id,
 		     struct vmsmb_fid *fid);
+void vmsmb_oplock_break_received(struct vmsmb_session *sess, u64 persistent,
+				 u64 volatile_id);
 int vmsmb_smb2_lock(struct vmsmb_session *sess, u32 tree_id,
 		    struct vmsmb_fid *fid, u32 pid,
 		    u64 offset, u64 length, u32 lock_flags);
