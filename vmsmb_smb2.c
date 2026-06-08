@@ -3,6 +3,10 @@
  * vmsmb_smb2.c - SMB2 command construction for VSMB
  *
  * Uses struct definitions from smb2pdu.h (copied from kernel fs/smb/common/).
+ *
+ * Portions derived from the Linux kernel CIFS client (fs/smb/client/),
+ * copyright held by its respective upstream authors. See docs/ATTRIBUTION.md
+ * for per-function provenance.
  */
 
 #define pr_fmt(fmt) "hv_vmsmb: " fmt

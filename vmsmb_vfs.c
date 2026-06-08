@@ -4,6 +4,10 @@
  *
  * Implements mount/umount, inode operations, file operations,
  * and directory operations for the vsmb filesystem type.
+ *
+ * Portions derived from the Linux kernel CIFS client (fs/smb/client/) and
+ * netfs (fs/netfs/), copyright held by their respective upstream authors.
+ * See docs/ATTRIBUTION.md for per-function provenance.
  */
 
 #define pr_fmt(fmt) "hv_vmsmb: " fmt

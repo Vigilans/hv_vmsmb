@@ -15,6 +15,10 @@
  *
  * Version negotiation (pre-SMB2) uses a separate synchronous path since
  * there is no concurrency at that point.
+ *
+ * Portions derived from the Linux kernel Hyper-V vsock transport
+ * (net/vmw_vsock/hyperv_transport.c), copyright held by its respective
+ * upstream authors. See docs/ATTRIBUTION.md for per-function provenance.
  */
 
 #define pr_fmt(fmt) "hv_vmsmb: " fmt

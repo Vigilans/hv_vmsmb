@@ -8,7 +8,7 @@ projects use GPL-2.0-compatible licenses.
 
 | Project | Files / API | License | What we use |
 |---------|-------------|---------|-------------|
-| **Linux CIFS client** (`fs/smb/client/`) | `smb2pdu.c`, `smb2maperror.c`, `smb2inode.c`, `cifsfs.c`, `inode.c`, `reparse.c`, `link.c` | GPL-2.0 / LGPL-2.1 depending on file | Inode lifecycle patterns, NTSTATUS mapping, VFS integration, reparse/symlink parsing, hardlink |
+| **Linux CIFS client** (`fs/smb/client/`) | `smb2pdu.c`, `smb2ops.c`, `smb2maperror.c`, `smb2inode.c`, `cifsfs.c`, `inode.c`, `file.c`, `dir.c`, `reparse.c`, `link.c` | GPL-2.0 / LGPL-2.1 depending on file | Inode lifecycle patterns, NTSTATUS mapping, VFS integration, reparse/symlink parsing, hardlink, oplock, byte-range locks, fallocate, SEEK_HOLE/DATA, getattr STATX |
 | **Linux CIFS common headers** (`fs/smb/common/`) | `smb2pdu.h`, `smb2status.h`, `fscc.h` | LGPL-2.1 | SMB2 struct definitions, NTSTATUS values, FSCC structures (copied, SPDX headers preserved) |
 | **Linux CIFS common headers** (`fs/smb/common/`) | `smbfsctl.h` | LGPL-2.1+ | FSCTL codes and reparse tags (copied, SPDX header preserved) |
 | **Linux CIFS client headers** (`fs/smb/client/`) | `smb1pdu.h` | GPL-2.0 | CreateDisposition / CreateOptions host-endian constants (subset extracted) |
@@ -47,7 +47,7 @@ projects use GPL-2.0-compatible licenses.
 | NEGOTIATE / SESSION_SETUP | **Simplified** from CIFS | Single dialect, no auth (VSMB-specific) |
 | TREE_CONNECT | **VSMB-specific** | UNC path `\\vsmb\<ShareName>` discovered via reverse engineering |
 | `vmsmb_path_to_utf16` | **Ported** from kernel `utf8s_to_utf16s()` | Corresponds to CIFS `cifs_strtoUTF16()`, without NLS/SFU/SFM |
-| CREATE | **Simplified** from CIFS `SMB2_open()` | No create contexts, oplock, lease, compound |
+| CREATE | **Simplified** from CIFS `SMB2_open()` | No create contexts or lease; oplock requested via an in/out argument (see oplock rows below) |
 | CLOSE | **Ported** from CIFS `SMB2_close_flags()` | Skips optional `POSTQUERY_ATTRIB` flag |
 | READ / WRITE | **Simplified** from CIFS `smb2_async_readv()` / `smb2_async_writev()` | Synchronous, single credit charge |
 | QUERY_DIR | **Simplified** from CIFS `SMB2_query_directory()` | No resumption, single info class |
@@ -61,6 +61,11 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_smb2_set_basic_info` | **Simplified** from CIFS `smb2_set_file_info_compound()` | SET_INFO InfoType=FILE, FileInfoClass=FILE_BASIC_INFORMATION; 2-PDU `CREATE+SET_INFO(final)` compound plus standalone CLOSE because vmusrv requires SET_INFO to be terminal |
 | `vmsmb_smb2_set_eof` | **Simplified** from CIFS `smb2_set_file_size()` | SET_INFO InfoType=FILE, FileInfoClass=FILE_END_OF_FILE_INFORMATION; same 2-PDU terminal SET_INFO compound plus standalone CLOSE shape |
 | `vmsmb_smb2_flush` | **Ported** from CIFS `SMB2_flush()` | MS-SMB2 2.2.17, single round-trip |
+| `vmsmb_smb2_oplock_break_ack` | **Ported** from CIFS `SMB2_oplock_break()` | 24-byte oplock-break acknowledgment (MS-SMB2 2.2.24) |
+| `vmsmb_smb2_lock` | **Ported** (single-element) from CIFS `SMB2_lock()` / `smb2_lockv()` | SMB2 LOCK request backing flock()/fcntl() byte-range locks |
+| `vmsmb_smb2_tree_disconnect` | **Ported** from CIFS `SMB2_tdis()` | Sent on unmount; result ignored |
+| SEEK_HOLE/SEEK_DATA IOCTL | **Ported** from CIFS `smb3_llseek()` (`smb2ops.c`) | `FSCTL_QUERY_ALLOCATED_RANGES`; `STATUS_BUFFER_OVERFLOW` treated as success-with-data |
+| fallocate IOCTLs | **Ported** from CIFS `smb3_fallocate()` / `smb3_punch_hole()` / `smb3_zero_range()` (`smb2ops.c`) | `FSCTL_SET_SPARSE` / `SET_ZERO_DATA`; SET_SPARSE issued unconditionally (no oplock-gated attribute caching) |
 
 ### vmsmb_vfs.c
 
@@ -95,11 +100,18 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_file_open` / `release` | **Ported** from CIFS `cifs_open` / `cifs_close` | Open flags to SMB2 disposition mapping |
 | `vmsmb_readdir` | **Ported** from CIFS `cifs_readdir` | Parses `FILE_DIRECTORY_INFO` chain |
 | `vmsmb_utf16_name_to_utf8` | **Ported** from kernel `utf16s_to_utf8s()` | Corresponds to CIFS `cifs_from_utf16()`, without NLS/SFU/SFM |
-| `vmsmb_issue_read` / `issue_write` | **Ported** from CIFS `smb2_async_readv` / `smb2_async_writev` | Async submit + completion callback into netfs |
+| `vmsmb_issue_read` / `issue_write` | **Ported** from CIFS `smb2_async_readv` / `smb2_async_writev`; read completion (EOF zero-fill) from CIFS `smb2_readv_callback()` | Async submit + completion callback into netfs |
 | `vmsmb_prepare_write` | **Ported** from CIFS `cifs_prepare_write` | Sets `sreq_max_len` for unbuffered write path |
 | `vmsmb_statfs` | **Ported** from CIFS `cifs_statfs` | Calls `vmsmb_smb2_queryfs()` and converts FS_FULL_SIZE_INFORMATION to `kstatfs` |
-| `vmsmb_getattr` | **Ported** from CIFS `cifs_getattr` | Re-issues CREATE+CLOSE when stale (actimeo expired); `generic_fillattr` |
+| `vmsmb_getattr` | **Ported** from CIFS `cifs_getattr` (`inode.c`) | Re-issues CREATE+CLOSE when stale (actimeo expired); `generic_fillattr`; reports `STATX_BTIME` and `STATX_ATTR_COMPRESSED`/`ENCRYPTED` |
 | `vmsmb_setattr` | **Ported** from CIFS `cifs_setattr()` | Pushes atime/mtime/ctime via `vmsmb_smb2_set_basic_info()` and size via `vmsmb_smb2_set_eof()` + `truncate_setsize()`; uid/gid/mode stay local |
+| `vmsmb_setlk` / `vmsmb_getlk` | **Ported** from CIFS `cifs_setlk()` / `cifs_read_flock()` (`file.c`) | flock()/fcntl() byte-range locks via SMB2 LOCK; `nobrl` keeps them guest-local by default |
+| `vmsmb_fallocate` | **Ported** from CIFS `smb3_fallocate()` / `smb3_punch_hole()` / `smb3_zero_range()` (`smb2ops.c`) | preallocate / punch hole / zero range |
+| `vmsmb_llseek` (SEEK_HOLE/DATA) | **Ported** from CIFS `smb3_llseek()` (`smb2ops.c`) | hole/data via QUERY_ALLOCATED_RANGES; other whences use generic |
+| Oplock break handling + per-inode open-ctx list | **Ported** from CIFS oplock pattern (`cifs_oplock_break`) | SMB2 LEVEL_II/BATCH oplock cache coherence; each open ctx joins a session-global list |
+| `splice_read` / `splice_write` | **Standard** netfs (`filemap_splice_read`) | sendfile() support, matching CIFS/9p/ceph |
+| Unbuffered/DIO write pipeline | **Modeled on** netfs `netfs_unbuffered_write_iter` | Reimplemented as a VSMB-native async chunk pipeline; supersedes the earlier synchronous issue_write path |
+| `vmsmb_d_revalidate` (negative dentries) | **Mirrors** CIFS `cifs_d_revalidate()` (`dir.c`) | Negative dentry expiry off its own lookup stamp |
 
 ## Protocol Discovery
 
