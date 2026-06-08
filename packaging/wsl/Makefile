@@ -53,7 +53,7 @@ KTAG := linux-msft-wsl-$(firstword $(subst -, ,$(KVER)))
 # used AS-IS (its working tree / git is never touched). Keep it on the Windows fs;
 # the Windows cmake.exe build chokes on \\wsl$ paths.
 WSL_REPO ?= https://github.com/Vigilans/WSL
-WSL_REF  ?= vigilans/virtualsmb
+WSL_REF  ?= virtual-smb
 WSL_SRC  ?= $(O)/WSL
 
 VMSMB := $(abspath $(CURDIR)/../..)
@@ -188,6 +188,9 @@ vhd vhdx: $(MODVHD)
 # self-contained xanmod kernel; official = hv_vmsmb in the official modules.vhd).
 # The old MSI is deleted first — wix keys off the .wxs, not the File Source bytes,
 # and would otherwise repackage a stale cached MSI.
+# Build out-of-source into out/ — upstream's .gitignore ignores out/ (but not
+# build/), so the fork tree stays clean; -B build leaves out/_deps (boost, GSL,
+# yaml-cpp, ...) as ~90k untracked files.
 $(MSI): $(MODVHD)
 	@if [ -e "$(WSL_SRC)/CMakeLists.txt" ]; then \
 	  echo ">>> Using existing WSL checkout as-is (git untouched): $(WSL_SRC)"; \
@@ -202,18 +205,18 @@ $(MSI): $(MODVHD)
 	vcvars="$$vsdir\\VC\\Auxiliary\\Build\\vcvars64.bat"; \
 	winsrc=$$(wslpath -w "$(WSL_SRC)"); \
 	echo ">>> Configuring WSL build (restores the official kernel package)"; \
-	cmd.exe /c cd /d "$$winsrc" '&&' cmake -S . -B build -DCMAKE_BUILD_TYPE=Release; \
+	cmd.exe /c cd /d "$$winsrc" '&&' cmake -S . -B out -DCMAKE_BUILD_TYPE=Release; \
 	kver=$$(sed -n 's/.*Microsoft\.WSL\.Kernel" *version="\([^"]*\)".*/\1/p' "$(WSL_SRC)/packages.config"); \
-	ksd="$(WSL_SRC)/build/packages/Microsoft.WSL.Kernel.$$kver/build/native/bin/$(ARCH)"; \
+	ksd="$(WSL_SRC)/out/packages/Microsoft.WSL.Kernel.$$kver/build/native/bin/$(ARCH)"; \
 	echo ">>> Bundling our kernel + modules (with hv_vmsmb) into $$ksd"; \
 	cp "$(KIMG)" "$$ksd/kernel"; \
 	rm -f "$$ksd/modules.vhd"; \
 	qemu-img convert -O vpc "$(MODVHD)" "$$ksd/modules.vhd"; \
 	echo ">>> Building wsl.msi (vcvars + UseEnv=true)"; \
-	rm -f "$(WSL_SRC)/build/bin/$(ARCH)/Release/wsl.msi"; \
+	rm -f "$(WSL_SRC)/out/bin/$(ARCH)/Release/wsl.msi"; \
 	cmd.exe /c cd /d "$$winsrc" '&&' call "$$vcvars" '&&' \
-	  cmake --build build --config Release --target msipackage -- /m /p:UseEnv=true
-	cp "$(WSL_SRC)/build/bin/$(ARCH)/Release/wsl.msi" $@
+	  cmake --build out --config Release --target msipackage -- /m /p:UseEnv=true
+	cp "$(WSL_SRC)/out/bin/$(ARCH)/Release/wsl.msi" $@
 msi: $(MSI)
 
 # --- install_vhd: point .wslconfig at the built modules vhd, in place -----------
