@@ -69,7 +69,7 @@ KSRC  := $(W)/ksrc
 PREP  := $(KSRC)/scripts/mod/modpost       # real product of modules_prepare
 KO    := $(W)/hv_vmsmb.ko
 MODVHD := $(O)/modules-$(KVER).$(if $(filter vhdx,$(VHD_FMT)),vhdx,vhd)
-MSI    := $(O)/wsl-$(KVER).msi
+MSI    := $(O)/wsl-$(KVER)-$(WSL_REF).msi
 
 # --- source paths: explicit vars > .wslconfig custom kernel > nuget ------------
 # Each input is overridable with a path, e.g. make KBUILD=/path MODULES_VHD=/path.
