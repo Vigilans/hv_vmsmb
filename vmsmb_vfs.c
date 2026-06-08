@@ -2453,8 +2453,19 @@ static int vmsmb_getlk(struct file *file, struct file_lock *fl)
 
 static int vmsmb_file_lock(struct file *file, int cmd, struct file_lock *fl)
 {
+	struct vmsmb_sb_info *sbi = VMSMB_SB(file_inode(file)->i_sb);
+
 	if (IS_GETLK(cmd))
 		return vmsmb_getlk(file, fl);
+	/*
+	 * Default: keep fcntl/OFD byte-range locks guest-local advisory.  SMB2
+	 * byte-range locks are mandatory (a shared lock blocks even the owner's
+	 * own overlapping write — breaks qemu-img et al.), so only send them to
+	 * the server under "brl".  flock is a separate mechanism and is
+	 * unaffected; "brl" governs byte-range locks only (mount.cifs nobrl).
+	 */
+	if (!sbi->brl)
+		return locks_lock_file_wait(file, fl);
 	return vmsmb_setlk(file, fl);
 }
 
@@ -2836,6 +2847,7 @@ static int vmsmb_show_options(struct seq_file *s, struct dentry *root)
 		seq_show_option(s, "symlinkroot", sbi->symlinkroot);
 	seq_printf(s, ",actimeo=%lu", sbi->actimeo / HZ);
 	seq_puts(s, sbi->oplocks ? ",oplock" : ",nooplock");
+	seq_puts(s, sbi->brl ? ",brl" : ",nobrl");
 
 	return 0;
 }
@@ -2929,6 +2941,7 @@ enum vmsmb_param {
 	Opt_symlinkroot,
 	Opt_actimeo,
 	Opt_oplock,
+	Opt_brl,
 };
 
 static const struct fs_parameter_spec vmsmb_fs_parameters[] = {
@@ -2940,6 +2953,7 @@ static const struct fs_parameter_spec vmsmb_fs_parameters[] = {
 	fsparam_string("symlinkroot",	Opt_symlinkroot),
 	fsparam_u32("actimeo",		Opt_actimeo),
 	fsparam_flag_no("oplock",	Opt_oplock),
+	fsparam_flag_no("brl",		Opt_brl),
 	{}
 };
 
@@ -2961,6 +2975,8 @@ struct vmsmb_fs_context {
 	unsigned int actimeo_secs;	/* 0 = use default */
 	bool oplocks;
 	bool oplocks_set;
+	bool brl;
+	bool brl_set;
 };
 
 /*
@@ -3019,6 +3035,10 @@ static int vmsmb_parse_param(struct fs_context *fc,
 		ctx->oplocks = !result.negated;
 		ctx->oplocks_set = true;
 		break;
+	case Opt_brl:
+		ctx->brl = !result.negated;
+		ctx->brl_set = true;
+		break;
 	}
 
 	return 0;
@@ -3068,6 +3088,7 @@ static int vmsmb_get_tree(struct fs_context *fc)
 	sbi->actimeo = ctx->actimeo_secs ? (ctx->actimeo_secs * HZ) : HZ;
 
 	sbi->oplocks = ctx->oplocks;
+	sbi->brl = ctx->brl;
 
 	/* noperm: open all permissions so VFS checks always pass */
 	if (sbi->noperm) {
@@ -3143,6 +3164,8 @@ static int vmsmb_reconfigure(struct fs_context *fc)
 		sbi->actimeo = ctx->actimeo_secs * HZ;
 	if (ctx->oplocks_set)
 		sbi->oplocks = ctx->oplocks;
+	if (ctx->brl_set)
+		sbi->brl = ctx->brl;
 	if (ctx->symlinkroot) {
 		char *old = sbi->symlinkroot;
 
