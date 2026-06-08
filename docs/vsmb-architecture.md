@@ -133,7 +133,7 @@ struct {
 
 ### Host-Side Mechanism
 
-`vmusrv.dll` handles `0x1403cc` in `CFile::QueryDirectAccessExtents`:
+`vmusrv.dll` handles `0x1403cc` as follows:
 1. `NtCreateSection` creates a section-backed mapping from the file
 2. Section size is rounded up to 4KB pages
 3. Quota is charged against the DirectMap budget
@@ -149,7 +149,7 @@ max 65536 MB, default from `DirectFileMappingInMB` in the VM config).
 - **Use**: Guest accesses file data directly via mapped pages
 - **Teardown refused**: File close / tree close / share removal are
   blocked while DirectMap is active
-- **Destroy**: Explicit teardown via `CDirectMapping::Destroy`
+- **Destroy**: Explicit teardown
 - **Save/Restore**: Validates `PageCount` and `OriginalImageBase` unchanged
 
 ### Coherence
@@ -161,12 +161,10 @@ visible through the mapping.
 
 ### Windows Guest Implementation
 
-`mrxsmb.sys` uses a per-dialect callback table (installed by
-`MRxSmbSetServerEntryDialect`) for the section-synchronization path.
-Per-file DirectMap state is stored at `fcb + 0x88` (extension) with
-nested state at `extension + 0x60` (node type `0xe400`). The downstream
-consumer (`FUN_1c00533dc`) chooses between `MmMapLockedPagesSpecifyCache`
-(map path) and `RtlCopyMdlToBuffer` (copy path).
+On Windows, `mrxsmb.sys` implements the guest side of this
+section-synchronization path, choosing per request between mapping the
+section pages directly (`MmMapLockedPagesSpecifyCache`) and copying them
+(`RtlCopyMdlToBuffer`).
 
 Windows guests use only 20KB (5-page) ring buffers per direction —
 DirectMap handles data transfer, and the ring carries only SMB2 control
@@ -175,18 +173,16 @@ PDUs.
 ### Host-Side GPA Mapping (vid.sys)
 
 `vmwp.exe` installs DirectMap pages into guest physical address space via
-`vid.sys` VID APIs. RE of `vid.sys` (build 26100) reveals two distinct
-GPA mapping paths:
+`vid.sys`, which uses two distinct GPA mapping paths:
 
 | Path | API | EPT Memory Type | Use |
 |------|-----|-----------------|-----|
 | Normal RAM / hot-add | `WinHvAddPhysicalMemory` | WB (write-back) | Guest RAM |
 | DirectMap / VA-backed | `WinHvMapGpaPagesSpecial` | UC/WT (uncached) | File sections |
 
-The routing is controlled by an internal map-type flag table
-(`DAT_1c0036f20`): map types with bits `0x30000` set are normalized to
-`0x10000` and dispatched to the "Special" mapper. Observed special-map
-flag values: `0x10000`, `0x4010000`, `0x8010000`.
+VA-backed (file-section) mappings are dispatched to the "Special" mapper,
+while ordinary guest RAM uses the normal mapper; this is what gives
+DirectMap pages their UC/WT EPT memory type.
 
 There is **no cache-type selector** in the recovered API surface — the
 EPT memory type is implicitly determined by the mapper path.
@@ -271,8 +267,8 @@ See [VMBus Pipe Protocol](vmbus-pipe-protocol.md) for details.
 ### SET_INFO must be terminal in a compound chain
 
 CIFS-style `CREATE+SET_INFO+CLOSE` is not usable against `vmusrv.dll`.
-When SET_INFO is followed by another PDU, `SrvContinueSetInfo` corrupts
-the compound continuation state after the provider callback succeeds, so
+When SET_INFO is followed by another PDU, the host's compound-continuation
+path corrupts the chain state after the provider callback succeeds, so
 the host cannot advance to the following CLOSE and no complete response
 is sent.
 

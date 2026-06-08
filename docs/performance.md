@@ -291,8 +291,8 @@ round-trips.
 ### CREATE+SET_INFO+CLOSE — SET_INFO must be terminal
 
 The CIFS-style 3-PDU `CREATE+SET_INFO+CLOSE` compound is not usable
-against `vmusrv.dll`. `SrvContinueSetInfo` corrupts the compound chain
-state after a successful SET_INFO, so the host cannot advance to the
+against `vmusrv.dll`: the host's compound-continuation path corrupts the
+chain state after a successful SET_INFO, so it cannot advance to the
 following CLOSE and no response is sent.
 
 The implemented form is `CREATE+SET_INFO(final)` plus a standalone
