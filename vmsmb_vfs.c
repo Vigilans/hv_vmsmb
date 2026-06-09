@@ -3203,6 +3203,7 @@ static int vmsmb_init_fs_context(struct fs_context *fc)
 
 	fc->fs_private = ctx;
 	fc->ops = &vmsmb_context_ops;
+	ctx->oplocks = true;	/* LEVEL_II coherence on by default; nooplock disables */
 	return 0;
 }
 

@@ -439,7 +439,7 @@ struct vmsmb_sb_info {
 	bool noperm;		/* skip VFS permission checks */
 	char *symlinkroot;	/* mount option: translate Windows abs symlinks to {symlinkroot}/x/... */
 	unsigned long actimeo;	/* metadata cache TTL in jiffies (mount option, default 1s) */
-	bool oplocks;		/* mount option: request LEVEL_II oplocks for coherence (default off) */
+	bool oplocks;		/* request LEVEL_II oplocks for coherence (default on; nooplock disables) */
 	bool brl;		/* mount option: send fcntl byte-range locks to the server (default off = guest-local advisory) */
 };
 
