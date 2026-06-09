@@ -761,7 +761,7 @@ static int vmsmb_atomic_open(struct inode *dir, struct dentry *dentry,
 	char *path;
 	u32 access = 0;
 	u32 disposition;
-	u8 oplock = sbi->oplocks ? SMB2_OPLOCK_LEVEL_BATCH : SMB2_OPLOCK_LEVEL_NONE;
+	u8 oplock = sbi->oplocks ? SMB2_OPLOCK_LEVEL_II : SMB2_OPLOCK_LEVEL_NONE;
 	int ret;
 
 	if (!(open_flag & O_CREAT)) {
@@ -1388,22 +1388,19 @@ static int vmsmb_get_writable_ctx(struct inode *inode,
  * subsequent access re-fetches from the server.  Queued by the receive path
  * with a ctx ref held; that ref is dropped here.
  *
- * Port of CIFS cifs_oplock_break() (fs/smb/client/file.c).  In-flight writes
- * are drained first so the server sees our data: DIO via inode_dio_wait(),
- * buffered (page cache) via filemap_write_and_wait().  An exclusive/batch break
- * is then acknowledged down to NONE; a LEVEL_II break to NONE is one-way and
- * needs no ack (MS-SMB2 3.2.5.19.2).
+ * Port of CIFS cifs_oplock_break() (fs/smb/client/file.c).  A LEVEL_II break to
+ * NONE is a one-way notification and is not acknowledged.  In-flight writes are
+ * drained first so the server sees our data: DIO via inode_dio_wait(), buffered
+ * (page cache) via filemap_write_and_wait().
  */
 static void vmsmb_oplock_break_work(struct work_struct *work)
 {
 	struct vmsmb_file_ctx *ctx =
 		container_of(work, struct vmsmb_file_ctx, oplock_break);
 	struct inode *inode = ctx->inode;
-	bool ack = ctx->oplock_level == SMB2_OPLOCK_LEVEL_BATCH ||
-		   ctx->oplock_level == SMB2_OPLOCK_LEVEL_EXCLUSIVE;
 
-	pr_debug("oplock break: ino=%lu held=0x%x ack=%d\n",
-		 inode->i_ino, ctx->oplock_level, ack);
+	pr_debug("oplock break: ino=%lu held=0x%x\n",
+		 inode->i_ino, ctx->oplock_level);
 
 	inode_dio_wait(inode);
 	filemap_write_and_wait(inode->i_mapping);
@@ -1411,9 +1408,6 @@ static void vmsmb_oplock_break_work(struct work_struct *work)
 	VMSMB_I(inode)->meta_expires = jiffies - 1;
 
 	ctx->oplock_level = SMB2_OPLOCK_LEVEL_NONE;
-	if (ack)
-		vmsmb_smb2_oplock_break_ack(ctx->sess, ctx->tree_id, &ctx->fid,
-					    SMB2_OPLOCK_LEVEL_NONE);
 	vmsmb_file_ctx_put(ctx);
 }
 
@@ -1863,7 +1857,7 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 	char *path;
 	u32 access = 0;
 	u32 disposition;
-	u8 oplock = sbi->oplocks ? SMB2_OPLOCK_LEVEL_BATCH : SMB2_OPLOCK_LEVEL_NONE;
+	u8 oplock = sbi->oplocks ? SMB2_OPLOCK_LEVEL_II : SMB2_OPLOCK_LEVEL_NONE;
 	int ret;
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);

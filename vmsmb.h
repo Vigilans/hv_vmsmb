@@ -591,8 +591,6 @@ int vmsmb_smb2_set_eof(struct vmsmb_session *sess, u32 tree_id,
 		       const char *path, u64 eof);
 int vmsmb_smb2_flush(struct vmsmb_session *sess, u32 tree_id,
 		     struct vmsmb_fid *fid);
-int vmsmb_smb2_oplock_break_ack(struct vmsmb_session *sess, u32 tree_id,
-				struct vmsmb_fid *fid, u8 level);
 void vmsmb_oplock_break_received(struct vmsmb_session *sess, u64 persistent,
 				 u64 volatile_id);
 int vmsmb_smb2_lock(struct vmsmb_session *sess, u32 tree_id,

@@ -2354,60 +2354,6 @@ out:
 }
 
 /*
- * SMB2 OPLOCK_BREAK acknowledgment — tell the server we have flushed and are
- * relinquishing the oplock down to `level`.  Sent in response to a server break
- * of an exclusive/batch oplock; a LEVEL_II break to NONE is one-way and is
- * never acked (MS-SMB2 3.2.5.19.2).
- *
- * Same 24-byte structure as the inbound break notification, but client-
- * initiated with a normal MessageId.  MS-SMB2 2.2.24.
- */
-int vmsmb_smb2_oplock_break_ack(struct vmsmb_session *sess, u32 tree_id,
-				struct vmsmb_fid *fid, u8 level)
-{
-	u8 *pdu_buf, *resp_buf;
-	struct smb2_oplock_break *req;
-	const struct smb2_hdr *hdr;
-	u32 resp_len;
-	int ret;
-
-	pdu_buf = kzalloc(sizeof(*req), GFP_KERNEL);
-	if (!pdu_buf)
-		return -ENOMEM;
-
-	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
-	if (!resp_buf) {
-		kfree(pdu_buf);
-		return -ENOMEM;
-	}
-
-	req = (struct smb2_oplock_break *)pdu_buf;
-	vmsmb_fill_hdr(&req->hdr, SMB2_OPLOCK_BREAK_HE, sess, tree_id);
-	req->StructureSize = cpu_to_le16(24);
-	req->OplockLevel = level;
-	req->PersistentFid = fid->persistent;
-	req->VolatileFid = fid->volatile_id;
-
-	ret = vmsmb_smb2_transact(sess, pdu_buf, sizeof(*req),
-				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
-	kfree(pdu_buf);
-	if (ret)
-		goto out;
-
-	hdr = vmsmb_check_resp(resp_buf, resp_len);
-	if (!hdr) {
-		ret = -EPROTO;
-		goto out;
-	}
-
-	ret = vmsmb_check_status(hdr, "OPLOCK_BREAK_ACK");
-
-out:
-	kfree(resp_buf);
-	return ret;
-}
-
-/*
  * SMB2 LOCK — acquire or release a single byte-range lock on an open file.
  *
  * Port of CIFS SMB2_lock()/smb2_lockv() (fs/smb/client/smb2pdu.c) for the
