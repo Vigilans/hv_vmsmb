@@ -16,7 +16,11 @@ name: build
 on:
   push:
     branches: [dev, master, main]
+    paths-ignore:
+      - '**/*.md'
   pull_request:
+    paths-ignore:
+      - '**/*.md'
   workflow_dispatch:
 
 permissions:
