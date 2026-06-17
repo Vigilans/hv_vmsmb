@@ -40,6 +40,22 @@ make rpm
 sudo rpm -i rpmbuild/RPMS/noarch/hv-vmsmb-dkms-0.1.0-1.*.noarch.rpm
 ```
 
+WSL2: `make wsl` builds a patched WSL MSI and a modules VHD containing `hv_vmsmb`:
+
+```bash
+make wsl   # full WSL build flow: modules VHD + patched MSI
+```
+
+For individual WSL packaging steps:
+
+```bash
+cd packaging/wsl
+make vhd   # modules VHD only
+make msi   # patched WSL installer
+```
+
+See [WSL2 Support](#wsl2-support) for the WSL-specific setup.
+
 ### Mount
 
 ```bash
@@ -56,18 +72,29 @@ The module auto-loads when the VMBus channel is detected (MODALIAS match on the 
 
 Requires a relatively recent (6.10+) kernel with the `netfs` library (`fs/netfs/`), which provides the page cache read/write infrastructure. Developed and tested on kernel 6.19.
 
+## WSL2 Support
+
+WSL2 can use hv_vmsmb when run with a patched WSL build that creates a VirtualSmb device for the utility VM and enables `wsl2.virtualSmb`. The packaging helper in [packaging/wsl/](packaging/wsl/) builds the required pieces:
+
+- a modules VHD containing `hv_vmsmb.ko`; and
+- a patched `wsl.msi` whose service accepts `virtualSmb=true` and whose guest init mounts Windows drives through `mount -t vsmb`.
+
+After installing the MSI, configure `.wslconfig` with the produced kernel/modules VHD and `virtualSmb=true`, then restart WSL. See [packaging/wsl/README.md](packaging/wsl/README.md) for the full flow.
+
+If VSMB is unavailable, the patched guest falls back to the normal WSL drive-sharing backend.
+
 ## Performance
 
 Benchmarked on NVMe-backed host (128 GB RAM), 16 GB guest.
 
-### fio-cdm (1 GB, host page cache warm)
+### fio-cdm (1 GB, N=3 average, host page cache warm)
 
 | Workload | Read | Write |
 |----------|------|-------|
-| SEQ1M Q8T1 | 7,856 MB/s | 3,853 MB/s |
-| SEQ1M Q1T1 | 2,481 MB/s | 1,697 MB/s |
-| RND4K Q32T16 | 456 MB/s | 578 MB/s |
-| RND4K Q1T1 | 27 MB/s (6,900 IOPS) | 27 MB/s (6,900 IOPS) |
+| SEQ1M Q8T1 | 5,967 MB/s | 3,236 MB/s |
+| SEQ1M Q1T1 | 1,829 MB/s | 1,543 MB/s |
+| RND4K Q32T16 | 475 MB/s (116K IOPS) | 685 MB/s (167K IOPS) |
+| RND4K Q1T1 | 22 MB/s (5,400 IOPS) | 26 MB/s (6,300 IOPS) |
 
 ### Real-world sequential read (LLM model weights, `dd`)
 
@@ -79,11 +106,37 @@ Benchmarked on NVMe-backed host (128 GB RAM), 16 GB guest.
 
 Tested with 4.7-47 GB model shards (Qwen3, GLM-4.5, Qwen3.5-122B).
 
+### WSL2 backend comparison
+
+fio-cdm (1 GB, N=1), stock WSL kernel 6.18.26, same host as the benchmarks above.
+
+| Workload | 9p (DrvFs) | virtiofs | VSMB |
+|----------|-----------|----------|------|
+| SEQ1M Q8T1 Read | 209 | 3,398 | **4,295** |
+| SEQ1M Q8T1 Write | 448 | 2,065 | **3,430** |
+| SEQ1M Q1T1 Read | 223 | **2,285** | 2,191 |
+| SEQ1M Q1T1 Write | 177 | 1,443 | **1,598** |
+| RND4K Q32T16 Read | 91 | 186 | **325** |
+| RND4K Q32T16 Write | 47 | 231 | **674** |
+| RND4K Q1T1 Read | 18.5 | **28.4** | 25.4 |
+| RND4K Q1T1 Write | 8.1 | 28.8 | **30.3** |
+
+Real-world workloads:
+
+| Workload | 9p | virtiofs | VSMB |
+|----------|-----------|----------|------|
+| tar xf linux-6.12 (86K files) | 475s | 271s | **135s** |
+| dd write 1GB (fdatasync) | 6.3s | **1.75s** | 1.83s |
+| dd read 1GB (host cache warm) | 4.9s | 1.31s | **0.28s** |
+| create 10K small files | 23.9s | **12.2s** | 15.8s |
+
+VSMB leads in sequential throughput, high-queue-depth 4K random writes, and tar extraction.
+
 See [docs/performance.md](docs/performance.md) for the full optimization journey from initial prototype to current numbers.
 
 ### Filesystem correctness
 
-[pjdfstest](https://github.com/pjd/pjdfstest): 8,787 / 8,789 pass. The 2 failures are `utimensat` timestamp precision (Windows FILETIME granularity vs POSIX nanoseconds).
+[pjdfstest](https://github.com/pjd/pjdfstest): 4,664 / 8,792 subtests pass (53%). Failures are NTFS/VSMB inherent limitations: no POSIX permission enforcement (chmod/chown), no special files (mkfifo/mknod), and incomplete POSIX error code mapping (e.g. ENAMETOOLONG).
 
 ## Hardlinks and symlinks
 
@@ -118,6 +171,9 @@ sudo python vsmb_enable_symlink.py <vm-name>
 
 The script should be run on the host as Administrator, after the VM has booted and a share is mounted, and lasts until the next cold restart of the VM.
 
+> [!NOTE]
+> The WSL2 integration includes equivalent service-side unlock logic, so the patched WSL service enables symlink creation for its VirtualSmb session automatically. See [Vigilans/WSL@1f7327a](https://github.com/Vigilans/WSL/commit/1f7327ab94ec41b1f38b81b464e6caba75659adf).
+
 For startup automation, use `--wait [seconds]` to wait for the VM and VSMB session before flipping the byte:
 
 ```powershell
@@ -133,7 +189,7 @@ sudo nssm set <service-name> AppEvents Start/Post `
 
 ## Maintenance Status
 
-This project is primarily for personal use. I will maintain it for my own needs but do not plan to provide support beyond that scope.
+This project is primarily for personal use. I actively use it in Linux HCS VMs created with [NanaBox](https://github.com/M2Team/NanaBox), where the only practical host-file-sharing option was 9p (as in [RelayLab](https://github.com/SherryPlatform/RelayLab/blob/main/RelayLab.Tools/RelayLab.Tools/main.cpp)), while WSL2's virtiofs backend is totally unavailable. I will maintain it for my own needs but do not plan to provide support beyond that scope.
 
 Contributions are welcome. Also feel free to fork and maintain your own version based on this reference implementation.
 
@@ -150,10 +206,6 @@ The implementation is based on reverse engineering of Windows host and guest com
 The VMBus transport layer draws from the kernel's `hv_sock` (`hyperv_transport.c`) for the receive loop and from `storvsc`/`netvsc` for packet buffer sizing. The SMB2 layer is a simplified subset of the kernel CIFS client (`fs/smb/`), reusing its struct definitions and NTSTATUS mapping. The VFS layer integrates with the kernel's `netfs` infrastructure for page cache management.
 
 See [docs/ATTRIBUTION.md](docs/ATTRIBUTION.md) for per-function upstream source attribution.
-
-## WSL Support
-
-This module should theoretically work under WSL2, since WSL2 runs on HCS. However, WSL does not expose HCS schema customization to the user, so a VirtualSmb device may not be present by default. If WSL's underlying HCS configuration already includes a VirtualSmb device, it may be possible to add shares via `HcsModifyComputeSystem`. This has not been tested.
 
 ## References
 
