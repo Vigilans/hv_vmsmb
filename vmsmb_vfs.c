@@ -1508,7 +1508,11 @@ static void vmsmb_issue_read_complete(void *priv, int status,
 		 * the subrequest.  Port of CIFS smb2_readv_callback()
 		 * (fs/smb/client/smb2pdu.c), which maps -ENODATA to HIT_EOF.
 		 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
 		__set_bit(NETFS_SREQ_HIT_EOF, &subreq->flags);
+#else
+		__set_bit(NETFS_SREQ_SHORT_IO, &subreq->flags);
+#endif
 	} else if (status) {
 		subreq->error = status;
 	} else if (len && copy_to_iter(data, len, &subreq->io_iter) != len) {
@@ -1605,7 +1609,11 @@ static void vmsmb_issue_read(struct netfs_io_subrequest *subreq)
 			      subreq->start, subreq->len, buf, &bytes_read);
 	if (ret == -ENODATA) {
 		/* Read past EOF / sparse hole — zero-fill (see issue_read_complete). */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
 		__set_bit(NETFS_SREQ_HIT_EOF, &subreq->flags);
+#else
+		__set_bit(NETFS_SREQ_SHORT_IO, &subreq->flags);
+#endif
 	} else if (ret) {
 		subreq->error = ret;
 	} else if (bytes_read &&
