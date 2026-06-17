@@ -1,5 +1,5 @@
 Name:           hv-vmsmb-dkms
-Version:        0.1.0
+Version:        1.0.0
 Release:        1%{?dist}
 Summary:        Hyper-V VSMB filesystem client kernel module (DKMS)
 
@@ -48,5 +48,5 @@ fi
 %{_usrsrc}/hv-vmsmb-%{version}
 
 %changelog
-* Sun Apr 19 2026 Vigilans <vigilans@foxmail.com> - 0.1.0-1
+* Sun Apr 19 2026 Vigilans <vigilans@foxmail.com> - 1.0.0-1
 - Initial DKMS packaging

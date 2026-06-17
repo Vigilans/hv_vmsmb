@@ -20,8 +20,8 @@ sudo insmod hv_vmsmb.ko
 
 # DKMS (persists across kernel updates)
 sudo dkms add .
-sudo dkms build hv-vmsmb/0.1.0
-sudo dkms install hv-vmsmb/0.1.0
+sudo dkms build hv-vmsmb/1.0.0
+sudo dkms install hv-vmsmb/1.0.0
 ```
 
 Arch Linux: an AUR package is available in `packaging/arch/`.
@@ -30,14 +30,14 @@ Debian/Ubuntu: `make deb` builds a `.deb` package (requires `dpkg-dev`, `debhelp
 
 ```bash
 make deb
-sudo dpkg -i build/debian/hv-vmsmb-dkms_0.1.0-1_all.deb
+sudo dpkg -i build/debian/hv-vmsmb-dkms_1.0.0-1_all.deb
 ```
 
 Fedora/RHEL: `make rpm` builds an RPM (requires `rpm-build`):
 
 ```bash
 make rpm
-sudo rpm -i rpmbuild/RPMS/noarch/hv-vmsmb-dkms-0.1.0-1.*.noarch.rpm
+sudo rpm -i rpmbuild/RPMS/noarch/hv-vmsmb-dkms-1.0.0-1.*.noarch.rpm
 ```
 
 WSL2: `make wsl` builds a patched WSL MSI and a modules VHD containing `hv_vmsmb`:

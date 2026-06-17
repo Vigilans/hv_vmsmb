@@ -1,4 +1,4 @@
-hv-vmsmb-dkms (0.1.0-1) unstable; urgency=medium
+hv-vmsmb-dkms (1.0.0-1) unstable; urgency=medium
 
   * Initial DKMS packaging.
 

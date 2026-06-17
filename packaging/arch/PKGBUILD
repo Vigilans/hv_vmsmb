@@ -1,7 +1,7 @@
 # Maintainer: Vigilans <vigilans@foxmail.com>
 _pkgbase=hv-vmsmb
 pkgname=${_pkgbase}-dkms-git
-pkgver=0.1.0
+pkgver=1.0.0
 pkgrel=1
 pkgdesc="Hyper-V VSMB (Virtual SMB) filesystem client kernel module"
 arch=('x86_64')
@@ -21,7 +21,7 @@ pkgver() {
     if _tag=$(git describe --long --tags 2>/dev/null); then
         echo "${_tag}" | sed 's/^v//;s/-/.r/;s/-/./g'
     else
-        printf '0.1.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+        printf '1.0.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
     fi
 }
 
