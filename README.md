@@ -108,7 +108,7 @@ Tested with 4.7-47 GB model shards (Qwen3, GLM-4.5, Qwen3.5-122B).
 
 ### WSL2 backend comparison
 
-fio-cdm (1 GB, N=1), stock WSL kernel 6.18.26, same host as the benchmarks above.
+fio-cdm (1 GB, N=1), stock WSL kernel 6.18.26, same host as the benchmarks above. The virtiofs numbers were measured after the [per-device SWIOTLB pool optimization](https://www.boxofcables.dev/wsl2-per-device-swiotlb-pools-for-virtiofs-and-virtioproxy/).
 
 | Workload | 9p (DrvFs) | virtiofs | VSMB |
 |----------|-----------|----------|------|
