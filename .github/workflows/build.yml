@@ -165,6 +165,10 @@ jobs:
           - fmt: arch
             image: "archlinux:latest"
     steps:
+      - name: Install git for checkout (Arch)
+        if: matrix.fmt == 'arch'
+        run: pacman -Sy --noconfirm --needed archlinux-keyring git
+
       - uses: actions/checkout@v4
 
       - name: Build ${{ matrix.fmt }} package
