@@ -88,5 +88,7 @@ back to 9p automatically, so the drives still mount.
 
 ## CI
 
-TODO: a Linux runner (`make vhd`) and a Windows runner (`make msi`) publishing a
-release together — not yet wired up.
+The release workflow builds WSL artifacts alongside the DKMS packages: a Linux
+runner executes `make -C packaging/wsl vhd`, and a Windows runner builds the
+patched MSI through the native CMake/MSBuild path (hosted Windows runners cannot
+run WSL2). Both artifacts are attached to the draft GitHub Release.

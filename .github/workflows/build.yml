@@ -1,0 +1,287 @@
+name: build
+
+# Continuous integration for the hv_vmsmb out-of-tree module.
+#
+# Validates a change; it does not publish (releases live in the separate release
+# workflow). Functional tests (mount -t vsmb, fio) cannot run here — a VSMB
+# channel only exists inside a Hyper-V guest, not on a hosted runner — so CI is
+# build correctness + static analysis + packaging.
+#
+# PR check layout:
+#   official (kernel 6.10) ... official (kernel 7.0)   one per kernel.org version
+#   distro (ubuntu-hwe) ... distro (opensuse)          one per patched distro kernel
+#   package (deb|rpm|arch)                             packaging recipe + artifact (deb also dkms-builds)
+#   static                                             sparse / W=1 / modinfo / checkpatch
+
+on:
+  push:
+    branches: [dev, master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # One cell per kernel.org version. Vanilla tarballs are the ground truth every
+  # #if LINUX_VERSION_CODE gate (6.10..6.19) is written against, and the only way
+  # to compile-test EOL'd non-LTS lines whose gates the module still carries.
+  # 7.0 is past the top gate (>=6.19) — compiling there proves the latest stable
+  # still builds (or flags that a 7.0 gate is needed).
+  official:
+    name: official (kernel ${{ matrix.kver }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kver: ["6.10", "6.11", "6.12", "6.13", "6.14", "6.15", "6.16", "6.17", "6.18", "6.19", "7.0"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev cpio xz-utils
+
+      - name: Fetch & prepare kernel ${{ matrix.kver }}
+        run: |
+          set -eux
+          KVER="${{ matrix.kver }}"
+          MAJOR="${KVER%%.*}"   # 6.x lives under v6.x/, 7.0 under v7.x/
+          curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KVER}.tar.xz" | tar xJ
+          cd "linux-${KVER}"
+          make defconfig
+          # Enable the subsystems the module builds against; drop BTF so prepare
+          # needs neither pahole nor a full vmlinux.
+          ./scripts/config -e CONFIG_HYPERV -e CONFIG_NETFS_SUPPORT -d CONFIG_DEBUG_INFO_BTF
+          make olddefconfig
+          make modules_prepare -j"$(nproc)"
+
+      - name: Build module
+        run: |
+          # No Module.symvers from a prepared-only tree → vendor symbols are
+          # unresolved at modpost; KBUILD_MODPOST_WARN=1 keeps that a warning so
+          # per-file compilation (the gate test) decides success.
+          make -C "linux-${{ matrix.kver }}" M="$GITHUB_WORKSPACE" modules \
+            KBUILD_MODPOST_WARN=1 -j"$(nproc)"
+
+  # One cell per distro whose kernel carries patches touching our compile surface
+  # (netfs / hyperv-vmbus / fs-smb / vfs / module ABI). Excluded as redundant or
+  # out-of-window: Debian (near-vanilla 6.12 == the tarball cell), Mint (== Ubuntu
+  # kernel), Rocky/RHEL 9 + Ubuntu GA 6.8 + stock WSL 6.6.y (all below our 6.10
+  # netfs minimum — cannot build), Arch compile (near-vanilla; covered by the 7.0
+  # tarball cell + already exercised by the arch packaging job).
+  distro:
+    name: distro (${{ matrix.id }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: alma10,       image: "almalinux:10" }        # RHEL family el10 6.12, backports + kABI
+          - { id: ubuntu-hwe,   image: "ubuntu:24.04" }        # Canonical SAUCE + netfs backports (HWE 6.17; GA 6.8 is below our min)
+          - { id: ubuntu-azure, image: "ubuntu:24.04" }        # Hyper-V/Azure-optimized vmbus kernel (6.17)
+          - { id: wsl2,         image: "ubuntu:24.04" }        # Microsoft Hyper-V/VMBus stack + WSL config (6.18)
+          - { id: fedora,       image: "fedora:latest" }       # latest stable (7.0.11) + distro config
+          - { id: opensuse,     image: "opensuse/tumbleweed" } # SUSE patch series, rides newest stable (7.0.11)
+    env:
+      # Stock WSL2 kernel: the wsl2 cell resolves this to the newest on Microsoft's
+      # feed at run time (same KVER->KTAG mapping as packaging/wsl/Makefile), so it
+      # tracks releases without a manual bump. The legacy linux-msft-wsl-6.6.y line
+      # is below our 6.10 minimum and is never selected.
+      WSL_KERNEL_FEED: https://pkgs.dev.azure.com/shine-oss/wsl/_packaging/WslDependencies/nuget/v3/flat2/microsoft.wsl.kernel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install headers & resolve KDIR
+        id: kdir
+        run: |
+          set -eux
+          case "${{ matrix.id }}" in
+          ubuntu-hwe)
+            apt-get update
+            apt-get install -y --no-install-recommends build-essential linux-headers-generic-hwe-24.04
+            KDIR=$(ls -d /usr/src/linux-headers-*-generic | head -1) ;;
+          ubuntu-azure)
+            apt-get update
+            apt-get install -y --no-install-recommends build-essential linux-headers-azure
+            KDIR=$(ls -d /usr/src/linux-headers-*-azure | head -1) ;;
+          fedora)
+            dnf install -y kernel-devel gcc make elfutils-libelf-devel
+            KDIR=$(ls -d /usr/src/kernels/*/ | head -1) ;;
+          alma10)
+            dnf install -y kernel-devel gcc make elfutils-libelf-devel
+            KDIR=$(ls -d /usr/src/kernels/*/ | head -1) ;;
+          opensuse)
+            # gawk is needed by kbuild's .mod step and is absent from the minimal image.
+            zypper --non-interactive --gpg-auto-import-keys install \
+              kernel-default-devel gcc make tar gawk
+            KDIR=$(ls -d /usr/src/linux-*-obj/*/default | head -1) ;;
+          wsl2)
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              build-essential bc bison flex libelf-dev libssl-dev curl ca-certificates tar
+            # Newest WSL kernel on the feed -> source tag (drop the -N nuget
+            # suffix), same mapping as packaging/wsl/Makefile.
+            kver=$(curl -fsSL "$WSL_KERNEL_FEED/index.json" | tr ',][' '\n' \
+                     | grep -oE '[0-9][0-9.]+[^"]*' | sort -V | tail -1)
+            tag="linux-msft-wsl-${kver%%-*}"
+            echo "wsl2 kernel: $kver -> $tag"
+            mkdir -p /tmp/wsl-kernel
+            # Release tarball, not a git clone — same source tree without the .git
+            # history, much faster to fetch.
+            curl -fsSL "https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/${tag}.tar.gz" \
+              | tar xz -C /tmp/wsl-kernel --strip-components=1
+            make -C /tmp/wsl-kernel KCONFIG_CONFIG=Microsoft/config-wsl olddefconfig
+            make -C /tmp/wsl-kernel KCONFIG_CONFIG=Microsoft/config-wsl modules_prepare -j"$(nproc)"
+            KDIR=/tmp/wsl-kernel ;;
+          esac
+          test -n "$KDIR" && test -d "$KDIR"
+          echo "kdir=$KDIR" >> "$GITHUB_OUTPUT"
+
+      - name: Build module
+        run: |
+          make -C "${{ steps.kdir.outputs.kdir }}" M="$GITHUB_WORKSPACE" modules \
+            KBUILD_MODPOST_WARN=1 -j"$(nproc)"
+
+  # Build each distro package and upload it as an artifact. DKMS packages ship
+  # source (they compile on the target at install time), so this validates the
+  # packaging recipe — not the module compile, which the matrices above cover.
+  # Logged-in users can download the artifacts to test a PR build.
+  package:
+    name: package (${{ matrix.fmt }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fmt: deb
+            image: "debian:trixie"   # neutral home of dpkg/debhelper; the DKMS .deb installs on Debian+Ubuntu+Mint
+          - fmt: rpm
+            image: "fedora:latest"
+          - fmt: arch
+            image: "archlinux:latest"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ${{ matrix.fmt }} package
+        run: |
+          set -eux
+          case "${{ matrix.fmt }}" in
+          deb)
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              make build-essential dpkg-dev debhelper dh-dkms lintian git linux-headers-amd64
+            git config --global --add safe.directory "$PWD"
+            make deb
+            lintian build/debian/*.deb || true
+            mkdir -p out && cp build/debian/*.deb out/
+            # Install the package so dh-dkms compiles the module from the packaged
+            # source against the distro (Debian 6.12) headers. Validates dkms.conf
+            # and catches a source file missing from the package.
+            apt-get install -y ./build/debian/hv-vmsmb-dkms_*.deb
+            dkms status | grep -q "hv-vmsmb.*installed"
+            ;;
+          rpm)
+            dnf install -y make rpm-build rpmlint git
+            git config --global --add safe.directory "$PWD"
+            make rpm
+            rpmlint rpmbuild/RPMS/noarch/*.rpm || true
+            mkdir -p out && cp rpmbuild/RPMS/noarch/*.rpm out/
+            ;;
+          arch)
+            pacman -Sy --noconfirm --needed archlinux-keyring
+            pacman -Syu --noconfirm --needed --overwrite '*' base-devel namcap git
+            git config --global --add safe.directory '*'
+            # The AUR -git PKGBUILD clones from GitHub; repoint it at the checkout
+            # so the package built (and uploaded) reflects this PR, not upstream.
+            sed -i "s#source=(.*#source=(\"\${_pkgbase}::git+file://$GITHUB_WORKSPACE\")#" packaging/arch/PKGBUILD
+            useradd -m builder
+            chown -R builder .
+            # makepkg refuses to run as root.
+            su builder -c "git config --global --add safe.directory '*'; cd packaging/arch && makepkg -f --nodeps --skipinteg"
+            namcap packaging/arch/*.pkg.tar.zst || true
+            mkdir -p out && cp packaging/arch/*.pkg.tar.zst out/
+            ;;
+          esac
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: hv-vmsmb-${{ matrix.fmt }}
+          path: out/*
+          retention-days: 30
+
+  # Static analysis on a recent LTS kernel (6.18). sparse and W=1 are the real
+  # bug-catchers for a wire-protocol + locking module; checkpatch is style-only
+  # and runs informational (its noise is documented in CLAUDE.md).
+  static:
+    name: static analysis
+    runs-on: ubuntu-latest
+    env:
+      KVER: "6.18"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev cpio xz-utils sparse
+
+      - name: Fetch & prepare kernel
+        run: |
+          set -eux
+          MAJOR="${KVER%%.*}"
+          curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KVER}.tar.xz" | tar xJ
+          cd "linux-${KVER}"
+          make defconfig
+          ./scripts/config -e CONFIG_HYPERV -e CONFIG_NETFS_SUPPORT -d CONFIG_DEBUG_INFO_BTF
+          make olddefconfig
+          make modules_prepare -j"$(nproc)"
+
+      - name: Build (LTS kernel)
+        run: |
+          make -C "linux-${KVER}" M="$GITHUB_WORKSPACE" modules \
+            KBUILD_MODPOST_WARN=1 -j"$(nproc)"
+
+      - name: modinfo assertions
+        run: |
+          set -eux
+          modinfo "$GITHUB_WORKSPACE/hv_vmsmb.ko"
+          modinfo "$GITHUB_WORKSPACE/hv_vmsmb.ko" | grep -qE '^license:[[:space:]]+GPL'
+          # Auto-load alias must be the VMBus VSMB device.
+          modinfo "$GITHUB_WORKSPACE/hv_vmsmb.ko" | grep -qiE '^alias:[[:space:]]+vmbus:'
+
+      # The tree is sparse- and W=1-clean, so these gate. Their `make clean`
+      # runs AFTER the modinfo assertions above so those always see a .ko.
+      - name: sparse
+        run: |
+          make -C "linux-${KVER}" M="$GITHUB_WORKSPACE" clean || true
+          # `make C=2` prints sparse warnings but exits 0, so capture output and
+          # fail on any code finding (the "compiler differs" note is benign).
+          out=$(make -C "linux-${KVER}" M="$GITHUB_WORKSPACE" modules \
+                  C=2 CF="-D__CHECK_ENDIAN__" KBUILD_MODPOST_WARN=1 -j"$(nproc)" 2>&1)
+          echo "$out"
+          findings=$(echo "$out" | grep -E ': (warning|error):' | grep -v 'compiler differs' || true)
+          if [ -n "$findings" ]; then echo "::error::sparse findings:"; echo "$findings"; exit 1; fi
+
+      - name: Warnings (W=1)
+        run: |
+          make -C "linux-${KVER}" M="$GITHUB_WORKSPACE" clean || true
+          make -C "linux-${KVER}" M="$GITHUB_WORKSPACE" modules \
+            W=1 KCFLAGS="-Werror" KBUILD_MODPOST_WARN=1 -j"$(nproc)"
+
+      - name: checkpatch (informational)
+        continue-on-error: true
+        run: |
+          curl -sSL https://raw.githubusercontent.com/torvalds/linux/master/scripts/checkpatch.pl -o /tmp/checkpatch.pl
+          curl -sSL https://raw.githubusercontent.com/torvalds/linux/master/scripts/spelling.txt -o /tmp/spelling.txt
+          cp /tmp/spelling.txt .
+          perl /tmp/checkpatch.pl --no-tree --terse --strict -f \
+            --ignore LINUX_VERSION_CODE,CONSTANT_COMPARISON,ALLOC_WITH_SIZEOF,ALLOC_WITH_MULTIPLY,SYMBOLIC_PERMS,EMBEDDED_FILENAME,SPLIT_STRING \
+            vmsmb_main.c vmsmb_transport.c vmsmb_smb2.c vmsmb_vfs.c || true
+          rm -f spelling.txt
