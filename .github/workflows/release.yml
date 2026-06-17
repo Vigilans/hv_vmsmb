@@ -167,12 +167,9 @@ jobs:
           name: modules-vhd
           path: build/wsl/modules-${{ needs.meta.outputs.kver }}.vhd
 
-  # Patched WSL installer. windows-latest can't run WSL2, so this reproduces the
-  # Makefile's msi recipe natively: configure (restores the pinned nuget kernel +
-  # its modules.vhd), overwrite that modules.vhd with ours (the kernel stays the
-  # official pinned one — official mode doesn't touch the kernel), then build the
-  # msipackage target under vcvars with /p:UseEnv=true (so msbuild uses the
-  # dev-shell toolchain — the atls.lib fix).
+  # Patched WSL installer. Hosted Windows runners cannot run WSL2, so this job
+  # builds the MSI through WSL's native Windows CMake/MSBuild path and replaces
+  # the restored modules.vhd with the one produced by the Linux vhd job.
   msi:
     name: WSL MSI
     runs-on: windows-latest
@@ -180,10 +177,8 @@ jobs:
     steps:
       - name: Clone WSL fork ${{ needs.meta.outputs.wsl_sha }}
         run: |
-          git init wslfork
-          git -C wslfork remote add origin "$env:WSL_REPO"
-          git -C wslfork fetch --depth 1 origin "${{ needs.meta.outputs.wsl_sha }}"
-          git -C wslfork checkout --detach FETCH_HEAD
+          git clone "$env:WSL_REPO" wslfork
+          git -C wslfork checkout --detach "${{ needs.meta.outputs.wsl_sha }}"
 
       - name: Install WiX
         run: dotnet tool install --global wix
@@ -194,18 +189,18 @@ jobs:
           name: modules-vhd
           path: vhd
 
-      - name: Configure (restores the pinned kernel package)
+      - name: Configure WSL build
         working-directory: wslfork
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
-      - name: Bundle our modules vhd (kernel stays the official pinned one)
+      - name: Bundle modules vhd
         shell: pwsh
         run: |
           $kver = "${{ needs.meta.outputs.kver }}"
           $ksd  = "wslfork/build/packages/Microsoft.WSL.Kernel.$kver/build/native/bin/x64"
           Copy-Item -Force "vhd/modules-$kver.vhd" "$ksd/modules.vhd"
 
-      - name: Build msipackage (vcvars + UseEnv=true)
+      - name: Build MSI
         shell: cmd
         working-directory: wslfork
         run: |
