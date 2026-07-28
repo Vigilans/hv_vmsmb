@@ -1579,9 +1579,13 @@ int vmsmb_smb2_rename(struct vmsmb_session *sess, u32 tree_id,
 	u32 rename_info_len, buf_len, pdu_len, resp_len;
 	int ret;
 
-	/* Step 1: Open source with DELETE access */
+	/*
+	 * Step 1: Open source with DELETE access.  OPEN_REPARSE_POINT keeps
+	 * the open on the reparse point itself so a symlink is renamed
+	 * rather than followed; it has no effect on other files.
+	 */
 	ret = vmsmb_smb2_create(sess, tree_id, old_path, DELETE,
-				FILE_OPEN, 0, NULL, &fid, NULL);
+				FILE_OPEN, OPEN_REPARSE_POINT, NULL, &fid, NULL);
 	if (ret)
 		return ret;
 
