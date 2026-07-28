@@ -984,8 +984,12 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
  * Rename/move a file or directory.
  *
  * Port of CIFS cifs_rename2() (fs/smb/client/inode.c): delegates to
- * vmsmb_smb2_rename() which issues CREATE(DELETE)+SET_INFO(rename)+CLOSE.
- * RENAME_NOREPLACE flag inverts the ReplaceIfExists field.
+ * vmsmb_smb2_rename() which issues CREATE(DELETE)+SET_INFO(rename)+CLOSE,
+ * with RENAME_NOREPLACE inverting the ReplaceIfExists field, and carries
+ * over its unlink-then-retry fallback -- NT refuses to let a rename
+ * replace a destination that is a directory object, so on EACCES/EEXIST
+ * the destination is removed and the rename reissued, which makes
+ * replacing one non-atomic.
  */
 static int vmsmb_rename(struct mnt_idmap *idmap,
 			struct inode *old_dir, struct dentry *old_dentry,
@@ -1014,6 +1018,37 @@ static int vmsmb_rename(struct mnt_idmap *idmap,
 	replace = !(flags & RENAME_NOREPLACE);
 
 	ret = vmsmb_smb2_rename(sess, sbi->tree_id, old_path, new_path, replace);
+
+	/*
+	 * Skipped for RENAME_NOREPLACE, where refusing an existing
+	 * destination is the requested behaviour.  A directory symlink is
+	 * S_IFLNK here (vmsmb_fill_inode tests FILE_ATTRIBUTE_REPARSE_POINT
+	 * before FILE_ATTRIBUTE_DIRECTORY), so it takes the unlink path and
+	 * only the link is removed.
+	 */
+	if (replace && (ret == -EACCES || ret == -EEXIST) &&
+	    d_really_is_positive(new_dentry)) {
+		int tmpret;
+
+		if (d_is_dir(new_dentry))
+			tmpret = vmsmb_smb2_create_close(sess, sbi->tree_id,
+							 new_path, DELETE,
+							 FILE_OPEN,
+							 CREATE_DELETE_ON_CLOSE |
+							 CREATE_NOT_FILE, NULL);
+		else
+			tmpret = vmsmb_smb2_unlink(sess, sbi->tree_id, new_path);
+
+		/*
+		 * A non-empty directory destination surfaces as EEXIST or
+		 * ENOTEMPTY; report that rather than the rename's EACCES.
+		 */
+		if (tmpret == -EEXIST || tmpret == -ENOTEMPTY)
+			ret = tmpret;
+		else if (!tmpret)
+			ret = vmsmb_smb2_rename(sess, sbi->tree_id, old_path,
+						new_path, replace);
+	}
 
 	kfree(old_path);
 	kfree(new_path);
