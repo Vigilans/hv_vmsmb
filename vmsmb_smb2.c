@@ -716,9 +716,9 @@ out:
  * COMPOUND_FID. MS-SMB2 §3.2.4.1.4 "Sending Compounded Requests".
  *
  * Disposition is caller-controlled (FILE_OPEN for probe; FILE_CREATE for
- * mkdir; FILE_OPEN with CREATE_DELETE_ON_CLOSE for unlink/rmdir).  CLOSE
- * status is surfaced when CREATE succeeded — unlink/rmdir rely on CLOSE
- * to commit DELETE_ON_CLOSE, so a server-side delete-veto must propagate.
+ * mkdir; FILE_OPEN with CREATE_DELETE_ON_CLOSE for unlink).  CLOSE status
+ * is surfaced when CREATE succeeded — unlink relies on CLOSE to commit
+ * DELETE_ON_CLOSE, so a server-side delete-veto must propagate.
  */
 int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 			    const char *path,
@@ -873,8 +873,8 @@ int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 	}
 
 	/* Validate CLOSE response.  When CREATE succeeded, surface the CLOSE
-	 * status: unlink/rmdir use CREATE_DELETE_ON_CLOSE, so the actual
-	 * delete commits at CLOSE and any error there must propagate.  Probe
+	 * status: unlink uses CREATE_DELETE_ON_CLOSE, so the actual delete
+	 * commits at CLOSE and any error there must propagate.  Probe
 	 * paths (lookup/getattr) only call us when they would otherwise have
 	 * issued a separate CLOSE anyway, so seeing CLOSE errors there is
 	 * still correct. */
@@ -2127,6 +2127,7 @@ close:
  */
 static int vmsmb_smb2_create_setinfo(struct vmsmb_session *sess, u32 tree_id,
 				     const char *path, u32 desired_access,
+				     u32 create_options,
 				     u8 info_type, u8 file_info_class,
 				     const void *payload, u32 payload_len,
 				     struct vmsmb_fid *out_fid)
@@ -2180,7 +2181,7 @@ static int vmsmb_smb2_create_setinfo(struct vmsmb_session *sess, u32 tree_id,
 	creq->ShareAccess = FILE_SHARE_READ_LE | FILE_SHARE_WRITE_LE |
 			    FILE_SHARE_DELETE_LE;
 	creq->CreateDisposition = cpu_to_le32(FILE_OPEN);
-	creq->CreateOptions = 0;
+	creq->CreateOptions = cpu_to_le32(create_options);
 	creq->NameOffset = cpu_to_le16(sizeof(struct smb2_create_req));
 	creq->NameLength = cpu_to_le16(name_len);
 	if (name_len > 0)
@@ -2289,7 +2290,7 @@ int vmsmb_smb2_set_basic_info(struct vmsmb_session *sess, u32 tree_id,
 	int ret;
 
 	ret = vmsmb_smb2_create_setinfo(sess, tree_id, path,
-					FILE_WRITE_ATTRIBUTES,
+					FILE_WRITE_ATTRIBUTES, 0,
 					SMB2_O_INFO_FILE,
 					FILE_BASIC_INFORMATION,
 					binfo, sizeof(*binfo), &fid);
@@ -2314,10 +2315,45 @@ int vmsmb_smb2_set_eof(struct vmsmb_session *sess, u32 tree_id,
 	int ret;
 
 	ret = vmsmb_smb2_create_setinfo(sess, tree_id, path,
-					FILE_WRITE_DATA,
+					FILE_WRITE_DATA, 0,
 					SMB2_O_INFO_FILE,
 					FILE_END_OF_FILE_INFORMATION,
 					&eof_le, sizeof(eof_le), &fid);
+	if (fid.persistent || fid.volatile_id)
+		vmsmb_smb2_close(sess, tree_id, &fid);
+	return ret;
+}
+
+/*
+ * SMB2 rmdir — delete a directory.
+ *
+ * Port of CIFS smb2_rmdir() (fs/smb/client/smb2inode.c): open the directory
+ * with DELETE access and CREATE_NOT_FILE, then request the delete with
+ * SET_INFO(FILE_DISPOSITION_INFORMATION) carrying a single byte of 1
+ * (MS-FSCC 2.4.11).  Upstream sends this as one CREATE+SET_INFO+CLOSE chain;
+ * SET_INFO has to terminate a chain here, so the CLOSE is standalone.
+ *
+ * This is deliberately not the CREATE_DELETE_ON_CLOSE shape that
+ * vmsmb_smb2_unlink() uses, and upstream draws the same distinction.
+ * DELETE_ON_CLOSE only marks the handle, leaving the server free to accept
+ * the mark and drop the delete: vmusrv does exactly that for a non-empty
+ * directory, answering STATUS_SUCCESS on both CREATE and CLOSE while keeping
+ * the directory.  SET_INFO makes the server adjudicate before it replies, so
+ * a non-empty directory comes back as STATUS_DIRECTORY_NOT_EMPTY.
+ */
+int vmsmb_smb2_rmdir(struct vmsmb_session *sess, u32 tree_id,
+		     const char *path)
+{
+	struct vmsmb_fid fid;
+	u8 delete_pending = 1;
+	int ret;
+
+	ret = vmsmb_smb2_create_setinfo(sess, tree_id, path,
+					DELETE, CREATE_NOT_FILE,
+					SMB2_O_INFO_FILE,
+					FILE_DISPOSITION_INFORMATION,
+					&delete_pending, sizeof(delete_pending),
+					&fid);
 	if (fid.persistent || fid.volatile_id)
 		vmsmb_smb2_close(sess, tree_id, &fid);
 	return ret;

@@ -958,8 +958,9 @@ static int vmsmb_unlink(struct inode *dir, struct dentry *dentry)
 /*
  * Remove a directory.
  *
- * Port of CIFS cifs_rmdir() (fs/smb/client/inode.c): same DELETE_ON_CLOSE
- * path as unlink; server enforces "directory must be empty".
+ * Port of CIFS cifs_rmdir() (fs/smb/client/inode.c): delegates to
+ * vmsmb_smb2_rmdir(), which asks the server to delete the directory and
+ * reports its refusal if the directory is not empty.
  *
  * On success clear_nlink() the removed directory's own inode (matches
  * CIFS cifs_rmdir which does the same — the inode is dead, nlink=0
@@ -982,10 +983,7 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 
-	ret = vmsmb_smb2_create_close(sess, sbi->tree_id, path, DELETE,
-				      FILE_OPEN,
-				      CREATE_DELETE_ON_CLOSE | CREATE_NOT_FILE,
-				      NULL);
+	ret = vmsmb_smb2_rmdir(sess, sbi->tree_id, path);
 
 	kfree(path);
 
@@ -1047,11 +1045,7 @@ static int vmsmb_rename(struct mnt_idmap *idmap,
 		int tmpret;
 
 		if (d_is_dir(new_dentry))
-			tmpret = vmsmb_smb2_create_close(sess, sbi->tree_id,
-							 new_path, DELETE,
-							 FILE_OPEN,
-							 CREATE_DELETE_ON_CLOSE |
-							 CREATE_NOT_FILE, NULL);
+			tmpret = vmsmb_smb2_rmdir(sess, sbi->tree_id, new_path);
 		else
 			tmpret = vmsmb_smb2_unlink(sess, sbi->tree_id, new_path);
 

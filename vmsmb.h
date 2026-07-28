@@ -570,6 +570,8 @@ int vmsmb_smb2_rename(struct vmsmb_session *sess, u32 tree_id,
 		       bool replace);
 int vmsmb_smb2_unlink(struct vmsmb_session *sess, u32 tree_id,
 		      const char *path);
+int vmsmb_smb2_rmdir(struct vmsmb_session *sess, u32 tree_id,
+		     const char *path);
 int vmsmb_smb2_hardlink(struct vmsmb_session *sess, u32 tree_id,
 			 const char *src_path, const char *link_path);
 int vmsmb_smb2_ioctl(struct vmsmb_session *sess, u32 tree_id,
