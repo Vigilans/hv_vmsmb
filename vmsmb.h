@@ -580,7 +580,8 @@ int vmsmb_smb2_get_reparse(struct vmsmb_session *sess, u32 tree_id,
 			    const char *path,
 			    void *buf, u32 buf_size, u32 *data_len);
 int vmsmb_smb2_create_symlink(struct vmsmb_session *sess, u32 tree_id,
-			       const char *path, const char *target);
+			       const char *path, const char *target,
+			       bool directory);
 struct smb2_fs_full_size_info;
 int vmsmb_smb2_queryfs(struct vmsmb_session *sess, u32 tree_id,
 		       struct smb2_fs_full_size_info *out);

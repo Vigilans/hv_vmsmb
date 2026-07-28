@@ -221,7 +221,13 @@ static int vmsmb_check_status(const struct smb2_hdr *hdr, const char *cmd_name)
 	if (hdr->Status != STATUS_SUCCESS) {
 		int err = vmsmb_status_to_errno(hdr->Status);
 
-		if (err != -ENOENT && err != -ENODATA)
+		/*
+		 * ENOTDIR / EISDIR are how a CREATE constrained to one object
+		 * type reports the other one, which the symlink type probe in
+		 * vmsmb_detect_directory_target() asks for deliberately.
+		 */
+		if (err != -ENOENT && err != -ENODATA &&
+		    err != -ENOTDIR && err != -EISDIR)
 			pr_err("%s failed: NTSTATUS 0x%08x\n", cmd_name,
 			       le32_to_cpu(hdr->Status));
 		return err;
@@ -1894,11 +1900,20 @@ int vmsmb_smb2_get_reparse(struct vmsmb_session *sess, u32 tree_id,
  * CIFS handles symlinkroot mapping, compound requests, and xattr
  * contexts. We do: CREATE → IOCTL(SET_REPARSE_POINT) → CLOSE.
  *
+ * The directory/file selection follows CIFS smb2_create_reparse_inode()
+ * (fs/smb/client/smb2inode.c): a symlink to a directory and one to a file
+ * are distinct SMB objects that cannot be exchanged, and the distinction
+ * is not carried in the reparse buffer — it is the object the tag is
+ * stamped on.  CREATE_NOT_FILE therefore makes a directory reparse point
+ * (Windows <SYMLINKD>, FILE_ATTRIBUTE_DIRECTORY set), CREATE_NOT_DIR a
+ * file one (<SYMLINK>).
+ *
  * Note: VSMB host currently denies FSCTL_SET_REPARSE_POINT with
  * STATUS_ACCESS_DENIED (0xC0000022) for both Linux and Windows guests.
  */
 int vmsmb_smb2_create_symlink(struct vmsmb_session *sess, u32 tree_id,
-			       const char *path, const char *target)
+			       const char *path, const char *target,
+			       bool directory)
 {
 	struct vmsmb_fid fid;
 	struct reparse_symlink_data_buffer *sym;
@@ -1952,10 +1967,11 @@ int vmsmb_smb2_create_symlink(struct vmsmb_session *sess, u32 tree_id,
 	}
 	target_utf16_len *= sizeof(__le16);
 
-	/* CREATE new file */
+	/* CREATE new file or directory to carry the reparse point */
 	ret = vmsmb_smb2_create(sess, tree_id, path,
 				GENERIC_WRITE | DELETE,
 				FILE_CREATE,
+				(directory ? CREATE_NOT_FILE : CREATE_NOT_DIR) |
 				OPEN_REPARSE_POINT,
 				NULL, &fid, NULL);
 	if (ret) {

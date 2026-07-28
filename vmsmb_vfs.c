@@ -22,6 +22,7 @@
 #include <linux/delay.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/pagemap.h>
 #include <linux/statfs.h>
 #include <linux/uio.h>
@@ -53,6 +54,7 @@ static const char *vmsmb_get_link(struct dentry *dentry, struct inode *inode,
 				   struct delayed_call *done);
 static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 			  struct dentry *dentry, const char *target);
+static int vmsmb_fix_symlink_target_type(char **target, bool directory);
 static void vmsmb_file_ctx_put(struct vmsmb_file_ctx *ctx);
 static void vmsmb_register_open_ctx(struct inode *inode,
 					    struct vmsmb_file_ctx *ctx);
@@ -629,6 +631,20 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 			return ERR_CAST(target);
 		}
 
+		/*
+		 * As in CIFS cifs_get_fattr() (fs/smb/client/inode.c), the
+		 * link's object type comes from the DIRECTORY attribute
+		 * rather than from the reparse buffer.
+		 */
+		ret = vmsmb_fix_symlink_target_type(&target,
+						    info.attributes &
+						    FILE_ATTRIBUTE_DIRECTORY);
+		if (ret) {
+			kfree(target);
+			iput(inode);
+			return ERR_PTR(ret);
+		}
+
 		VMSMB_I(inode)->symlink_target = target;
 	}
 
@@ -1135,6 +1151,131 @@ static const char *vmsmb_get_link(struct dentry *dentry, struct inode *inode,
 }
 
 /*
+ * Reconcile a symlink target string with the link's SMB object type.
+ *
+ * Port of CIFS smb2_fix_symlink_target_type() (fs/smb/client/smb2file.c):
+ * the object type is user-visible, so a directory symlink reads back with
+ * a trailing slash, which is also what lets the target round-trip through
+ * vmsmb_detect_directory_target() if the link is recreated.  A file
+ * symlink whose target carries a trailing slash is unresolvable on either
+ * system and is reported as corrupt.  As upstream, the caller passes the
+ * type the server reported, not the one it asked for.
+ *
+ * Takes ownership of *target and may reallocate it.
+ */
+static int vmsmb_fix_symlink_target_type(char **target, bool directory)
+{
+	char *buf;
+	int len;
+
+	len = strlen(*target);
+	if (!len)
+		return -EIO;
+
+	if (directory && (*target)[len - 1] != '/') {
+		buf = krealloc(*target, len + 2, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
+		buf[len] = '/';
+		buf[len + 1] = '\0';
+		*target = buf;
+		len++;
+	}
+
+	if (!directory && (*target)[len - 1] == '/')
+		return -EIO;
+
+	return 0;
+}
+
+/*
+ * Decide whether a symlink target names a directory.
+ *
+ * Port of CIFS detect_directory_symlink_target() (fs/smb/client/reparse.c):
+ * the type has to be chosen when the link is created, but Linux symlink(2)
+ * only supplies a target string.  Three stages, in cost order:
+ *
+ *   1. the target's last component is empty (trailing slash), "." or ".."
+ *      → certainly a directory, no server round-trip;
+ *   2. the target is absolute → undeterminable here, treat as file;
+ *   3. otherwise resolve it against the link's parent and probe the server
+ *      with CREATE(CREATE_NOT_FILE); ENOTDIR settles it as a file, ENOENT
+ *      leaves a dangling link as a file, and anything else falls back to a
+ *      second CREATE(CREATE_NOT_DIR) probe whose EISDIR settles it as a
+ *      directory.
+ *
+ * An undeterminable target is not an error: it leaves *directory false,
+ * matching upstream.
+ */
+static int vmsmb_detect_directory_target(struct vmsmb_sb_info *sbi,
+					 const char *full_path,
+					 const char *target, bool *directory)
+{
+	struct vmsmb_session *sess = sbi->sess;
+	const char *basename;
+	char *resolved_path, *path_sep;
+	int full_path_len, target_len, basename_len;
+	int ret;
+
+	/*
+	 * A target ending in a slash, "." or ".." can only name a directory.
+	 */
+	basename = kbasename(target);
+	basename_len = strlen(basename);
+	if (basename_len == 0 ||
+	    (basename_len == 1 && basename[0] == '.') ||
+	    (basename_len == 2 && basename[0] == '.' && basename[1] == '.')) {
+		*directory = true;
+		return 0;
+	}
+
+	/* Absolute targets leave the share, so the server cannot resolve them. */
+	if (target[0] == '/')
+		return 0;
+
+	full_path_len = strlen(full_path);
+	target_len = strlen(target);
+
+	resolved_path = kzalloc(full_path_len + target_len + 1, GFP_KERNEL);
+	if (!resolved_path)
+		return -ENOMEM;
+
+	/* Splice the relative target onto the link's parent directory. */
+	memcpy(resolved_path, full_path, full_path_len + 1);
+	path_sep = strrchr(resolved_path, '/');
+	if (path_sep)
+		path_sep++;
+	else
+		path_sep = resolved_path;
+	memcpy(path_sep, target, target_len + 1);
+
+	/* Probe as a directory. */
+	ret = vmsmb_smb2_create_close(sess, sbi->tree_id, resolved_path,
+				      FILE_READ_ATTRIBUTES, FILE_OPEN,
+				      CREATE_NOT_FILE | OPEN_REPARSE_POINT,
+				      NULL);
+	if (ret == 0) {
+		*directory = true;
+	} else if (ret == -ENOTDIR || ret == -ENOENT) {
+		/*
+		 * ENOTDIR: certainly a file.  ENOENT: dangling target, so
+		 * nothing to inspect — leave it a file symlink.
+		 */
+	} else {
+		/* Probe as a file: the open may have been denied instead. */
+		ret = vmsmb_smb2_create_close(sess, sbi->tree_id, resolved_path,
+					      FILE_READ_ATTRIBUTES, FILE_OPEN,
+					      CREATE_NOT_DIR | OPEN_REPARSE_POINT,
+					      NULL);
+		if (ret == -EISDIR)
+			*directory = true;
+	}
+
+	kfree(resolved_path);
+	return 0;
+}
+
+/*
  * Create a symlink.
  *
  * Port of CIFS cifs_symlink() (fs/smb/client/cifsfs.c) reparse-point path:
@@ -1153,13 +1294,22 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	struct vmsmb_file_info info;
 	struct inode *inode;
 	char *path;
+	char *cached_target;
+	bool directory = false;
 	int ret;
 
 	path = vmsmb_build_path(dentry);
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 
-	ret = vmsmb_smb2_create_symlink(sess, sbi->tree_id, path, target);
+	ret = vmsmb_detect_directory_target(sbi, path, target, &directory);
+	if (ret) {
+		kfree(path);
+		return ret;
+	}
+
+	ret = vmsmb_smb2_create_symlink(sess, sbi->tree_id, path, target,
+					directory);
 
 	if (ret) {
 		kfree(path);
@@ -1183,7 +1333,20 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	inode = vmsmb_iget(dir->i_sb, &info);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
-	VMSMB_I(inode)->symlink_target = kstrdup(target, GFP_KERNEL);
+
+	/*
+	 * Cache the target the way lookup would, from the re-stat above, so
+	 * the string does not depend on which path populated it.
+	 */
+	cached_target = kstrdup(target, GFP_KERNEL);
+	if (cached_target &&
+	    vmsmb_fix_symlink_target_type(&cached_target,
+					  info.attributes &
+					  FILE_ATTRIBUTE_DIRECTORY)) {
+		kfree(cached_target);
+		cached_target = NULL;
+	}
+	VMSMB_I(inode)->symlink_target = cached_target;
 
 	vmsmb_invalidate_dir(dir);
 	d_instantiate(dentry, inode);
