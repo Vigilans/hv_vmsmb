@@ -117,11 +117,14 @@ static inline void vmsmb_invalidate_dir(struct inode *dir)
  * bytes writeback has already pushed, so it trails what the page cache holds.
  * Growth is safe to adopt; a shrink is refused until the writers are gone, so
  * that truncate_pagecache() stays clear of folios still waiting to be sent.
- * Upstream also exempts direct-I/O mounts and gates readdir-sourced sizes on
- * the oplock, neither of which applies here: there is no cache= mount option,
- * and vmsmb_readdir() never touches an inode.
+ * A directory listing is refused outright once any writer is open, matching
+ * upstream's from_readdir arm: NT reports a size in QUERY_DIRECTORY that lags
+ * the file's real state, so it must never win over what a writer knows.
+ * Upstream also exempts direct-I/O mounts, which does not apply here: there is
+ * no cache= mount option.
  */
-static bool vmsmb_size_safe_to_change(struct inode *inode, loff_t end_of_file)
+static bool vmsmb_size_safe_to_change(struct inode *inode, loff_t end_of_file,
+				      bool from_readdir)
 {
 	struct vmsmb_inode_info *vi = VMSMB_I(inode);
 	struct vmsmb_file_ctx *ctx;
@@ -138,6 +141,9 @@ static bool vmsmb_size_safe_to_change(struct inode *inode, loff_t end_of_file)
 
 	if (!writable)
 		return true;
+
+	if (from_readdir)
+		return false;
 
 	return i_size_read(inode) < end_of_file;
 }
@@ -228,7 +234,8 @@ static void vmsmb_fill_inode(struct inode *inode,
  * Port of CIFS cifs_fattr_to_inode() update-path (fs/smb/client/inode.c).
  */
 static void vmsmb_refresh_inode(struct inode *inode,
-				struct vmsmb_file_info *info)
+				struct vmsmb_file_info *info,
+				bool from_readdir)
 {
 	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
 	struct vmsmb_inode_info *vi = VMSMB_I(inode);
@@ -237,7 +244,7 @@ static void vmsmb_refresh_inode(struct inode *inode,
 	struct timespec64 old_mtime = inode_get_mtime(inode);
 	struct timespec64 new_mtime = vmsmb_time_to_ts(info->last_write_time);
 
-	if (vmsmb_size_safe_to_change(inode, new_size)) {
+	if (vmsmb_size_safe_to_change(inode, new_size, from_readdir)) {
 		if (old_size != new_size) {
 			/* Truncate page cache beyond new EOF to avoid serving stale data */
 			i_size_write(inode, new_size);
@@ -245,6 +252,18 @@ static void vmsmb_refresh_inode(struct inode *inode,
 				truncate_pagecache(inode, new_size);
 		}
 		inode->i_blocks = (info->alloc_size + 511) / 512;
+	} else if (from_readdir && old_size != new_size) {
+		/*
+		 * A listing that disagrees with the size we publish lost the
+		 * arbitration above, so nothing it carries is trustworthy.
+		 * Expire the inode and return before the bottom of this
+		 * function stamps meta_expires forward, which would otherwise
+		 * mark the size we just refused to change as freshly checked.
+		 * Port of the from_readdir arm CIFS added in e8a8d54c2d50
+		 * (fs/smb/client/inode.c).
+		 */
+		vi->meta_expires = jiffies - 1;
+		return;
 	}
 	inode_set_atime_to_ts(inode, vmsmb_time_to_ts(info->last_access_time));
 	inode_set_mtime_to_ts(inode, new_mtime);
@@ -303,7 +322,8 @@ static int vmsmb_iget_set(struct inode *inode, void *opaque)
  * Port of CIFS cifs_iget() (fs/smb/client/inode.c) using iget5_locked.
  */
 static struct inode *vmsmb_iget(struct super_block *sb,
-				struct vmsmb_file_info *info)
+				struct vmsmb_file_info *info,
+				bool from_readdir)
 {
 	struct vmsmb_iget_args args = {
 		.index_number = info->index_number,
@@ -333,7 +353,7 @@ static struct inode *vmsmb_iget(struct super_block *sb,
 		vmsmb_fill_inode(inode, info);
 		unlock_new_inode(inode);
 	} else {
-		vmsmb_refresh_inode(inode, info);
+		vmsmb_refresh_inode(inode, info, from_readdir);
 	}
 	return inode;
 }
@@ -648,7 +668,7 @@ static int vmsmb_revalidate_dentry_attr(struct inode *inode,
 	kfree(path);
 
 	if (ret == 0) {
-		vmsmb_refresh_inode(inode, &info);
+		vmsmb_refresh_inode(inode, &info, false);
 		kfree(info.symlink_target);
 	}
 	return ret;
@@ -753,7 +773,7 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 	if (ret)
 		return ERR_PTR(ret);
 
-	inode = vmsmb_iget(dir->i_sb, &info);
+	inode = vmsmb_iget(dir->i_sb, &info, false);
 	kfree(info.symlink_target);
 	if (IS_ERR(inode))
 		return ERR_CAST(inode);
@@ -836,7 +856,7 @@ static int vmsmb_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		return ret;
 
-	inode = vmsmb_iget(dir->i_sb, &info);
+	inode = vmsmb_iget(dir->i_sb, &info, false);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
 
@@ -914,7 +934,7 @@ static int vmsmb_atomic_open(struct inode *dir, struct dentry *dentry,
 		return ret;
 	}
 
-	inode = vmsmb_iget(dir->i_sb, &info);
+	inode = vmsmb_iget(dir->i_sb, &info, false);
 	if (IS_ERR(inode)) {
 		vmsmb_smb2_close(sess, sbi->tree_id, &ctx->fid);
 		kfree(ctx);
@@ -941,7 +961,7 @@ static int vmsmb_atomic_open(struct inode *dir, struct dentry *dentry,
 	 * on it: we report the truncation as handled, so the VFS never calls
 	 * handle_truncate() and this is the only place the new size lands.
 	 */
-	if (vmsmb_size_safe_to_change(inode, info.size))
+	if (vmsmb_size_safe_to_change(inode, info.size, false))
 		i_size_write(inode, info.size);
 
 	refcount_set(&ctx->ref, 1);
@@ -1014,7 +1034,7 @@ static int vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 #endif
 	}
 
-	inode = vmsmb_iget(dir->i_sb, &info);
+	inode = vmsmb_iget(dir->i_sb, &info, false);
 	if (IS_ERR(inode)) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
 		return ERR_CAST(inode);
@@ -1455,7 +1475,7 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret)
 		return ret;
 
-	inode = vmsmb_iget(dir->i_sb, &info);
+	inode = vmsmb_iget(dir->i_sb, &info, false);
 	kfree(info.symlink_target);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
@@ -2213,7 +2233,7 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 	 * Take the server's size before this handle joins open_ctxs, so the
 	 * guard weighs the other writers rather than this one.
 	 */
-	if (vmsmb_size_safe_to_change(inode, info.size))
+	if (vmsmb_size_safe_to_change(inode, info.size, false))
 		i_size_write(inode, info.size);
 
 	refcount_set(&ctx->ref, 1);
@@ -2935,6 +2955,83 @@ static int vmsmb_utf16_name_to_utf8(char *dst, size_t dst_size,
 }
 
 /*
+ * Instantiate a directory entry into the dentry cache while the listing that
+ * produced it is still in hand, so a stat() that follows costs no round trip.
+ *
+ * Port of CIFS cifs_prime_dcache() (fs/smb/client/readdir.c).  Ours is the
+ * shape upstream reaches when the entry needs no revalidation: a reparse point
+ * is left alone, because a listing reports only its tag while the size we must
+ * publish for a symlink is the length of its target, which only the separate
+ * IOCTL in vmsmb_lookup() can supply.
+ *
+ * d_hash_and_lookup() is open-coded: it stopped being exported in 6.16
+ * (06c567403ae5), and the replacement try_lookup_noperm() warns unless the
+ * parent's i_rwsem is held, which readdir does not hold.  The hash must be
+ * computed here because d_alloc_parallel() reads name->hash without deriving
+ * it.  vmsmb_dentry_ops has no ->d_hash, so the DCACHE_OP_HASH dispatch
+ * upstream performs between the two has nothing to do.
+ */
+static void vmsmb_prime_dcache(struct dentry *parent, struct qstr *name,
+			       struct vmsmb_file_info *info)
+{
+	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wq);
+	struct super_block *sb = parent->d_sb;
+	struct dentry *dentry, *alias;
+	struct inode *inode;
+
+	if (info->attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+		return;
+
+	name->hash = full_name_hash(parent, name->name, name->len);
+	dentry = d_lookup(parent, name);
+	if (dentry) {
+		inode = d_inode(dentry);
+		/*
+		 * Never touch a dentry something is mounted on: d_invalidate()
+		 * below would detach the covering mount.  Nested vsmb shares
+		 * are mounted inside their parent share exactly this way.
+		 */
+		if (inode && d_mountpoint(dentry)) {
+			dput(dentry);
+			return;
+		}
+		if (inode &&
+		    VMSMB_I(inode)->index_number == info->index_number) {
+			vmsmb_refresh_inode(inode, info, true);
+			dput(dentry);
+			return;
+		}
+		/*
+		 * Negative, or the name now resolves to a different file.  Drop
+		 * it and let the next lookup rebuild it; do not allocate a
+		 * replacement here, since that lookup will go to the server
+		 * anyway.
+		 */
+		d_invalidate(dentry);
+		dput(dentry);
+		return;
+	}
+
+	dentry = d_alloc_parallel(parent, name, &wq);
+	if (IS_ERR(dentry))
+		return;
+	if (!d_in_lookup(dentry)) {
+		/* A parallel lookup instantiated it first; leave it to them. */
+		dput(dentry);
+		return;
+	}
+
+	inode = vmsmb_iget(sb, info, true);
+	if (IS_ERR(inode))
+		inode = NULL;
+	alias = d_splice_alias(inode, dentry);
+	d_lookup_done(dentry);
+	if (!IS_ERR_OR_NULL(alias))
+		dput(alias);
+	dput(dentry);
+}
+
+/*
  * Enumerate a directory — SMB2 QUERY_DIRECTORY with
  * FileIdFullDirectoryInformation.
  *
@@ -3039,8 +3136,25 @@ static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 				 DT_DIR : DT_REG;
 
 			ino = le64_to_cpu(entry->UniqueId);
-			if (!ino)
+			if (ino) {
+				struct vmsmb_file_info info = {
+					.size = le64_to_cpu(entry->EndOfFile),
+					.alloc_size = le64_to_cpu(entry->AllocationSize),
+					.creation_time = le64_to_cpu(entry->CreationTime),
+					.last_access_time = le64_to_cpu(entry->LastAccessTime),
+					.last_write_time = le64_to_cpu(entry->LastWriteTime),
+					.change_time = le64_to_cpu(entry->ChangeTime),
+					.attributes = attrs,
+					.index_number = ino,
+				};
+				struct qstr qname = QSTR_INIT(name_utf8, utf8_len);
+
+				vmsmb_prime_dcache(file_dentry(file), &qname,
+						   &info);
+			} else {
+				/* No file ID: nothing to key an inode on. */
 				ino = atomic64_inc_return(&vmsmb_ino_counter);
+			}
 
 			if (!dir_emit(ctx, name_utf8, utf8_len, ino, d_type))
 				goto out;
@@ -3260,7 +3374,7 @@ static int vmsmb_fill_super(struct super_block *sb, struct fs_context *fc)
 		return ret;
 	}
 
-	root_inode = vmsmb_iget(sb, &root_info);
+	root_inode = vmsmb_iget(sb, &root_info, false);
 	if (IS_ERR(root_inode))
 		return PTR_ERR(root_inode);
 

@@ -204,6 +204,31 @@ explanation. Measured:
 | VM cold read (ra=4MB) | 1.5-2.5 GB/s |
 | VM hot read (host cached) | 2.9-3.8 GB/s |
 
+## Stage 7: Directory-Listing dcache Priming
+
+`vmsmb_readdir` instantiates each entry into the dcache as it parses the
+listing, so a `stat` that follows costs no round trip. Measured on a
+5,632-file `node_modules` tree, median of 3 runs:
+
+| Phase | Before | After |
+|-------|--------|-------|
+| `du -sh` (traverse + stat every entry) | 2.88s | 1.12s |
+| `rm -rf` | 6.61s | 4.57s |
+| `find -type f` (traverse only) | 1.40s | 1.27s |
+
+The gain tracks how closely a `stat` follows the listing that named the
+file. `du` and `rm` stat each entry as they walk and take the full
+benefit; `find` only reads directories, so it gains just the entries it
+revisits. A walk that finishes the whole tree before stat'ing anything
+gains least, because `actimeo` can lapse on the earliest entries before
+they are used — upstream answers that with a directory lease, which needs
+a real SMB2 lease that vmusrv does not implement.
+
+Priming is what makes the file ID worth carrying: without an identity
+key every primed entry would allocate a fresh inode that no later lookup
+could match, so the same idea measured as a pure loss while `readdir`
+still requested `FileDirectoryInformation`.
+
 ## Dead Ends
 
 ### DirectMap (FSCTL 0x1403cc)
@@ -235,20 +260,6 @@ may obtain WB EPT mappings through a different `vid.sys` code path —
 but we have not directly measured Windows DirectMap performance.
 
 DirectMap read path is reverted; probe code retained for future use.
-
-### Readdirplus (dcache priming during readdir)
-
-CIFS primes the dcache during `readdir` to avoid per-file `lookup`
-calls on subsequent `stat`. This makes sense when each lookup is a
-network round-trip (1-10 ms). For VSMB over VMBus (~170 us RTT),
-the priming cost exceeds the lookup cost:
-
-| Operation | Cost |
-|-----------|------|
-| 5,084 lookups (stat after ls) | 0.86s |
-| 5,084 `iget5_locked` + `d_alloc` + `d_splice_alias` | 1.5s |
-
-**Net effect**: readdirplus made `ls -la` ~0.64s slower. Discarded.
 
 ### GPA-direct packet bypass (VMBus type 9)
 

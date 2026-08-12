@@ -8,7 +8,7 @@ projects use GPL-2.0-compatible licenses.
 
 | Project | Files / API | License | What we use |
 |---------|-------------|---------|-------------|
-| **Linux CIFS client** (`fs/smb/client/`) | `smb2pdu.c`, `smb2ops.c`, `smb2maperror.c`, `smb2inode.c`, `cifsfs.c`, `inode.c`, `file.c`, `dir.c`, `reparse.c`, `link.c` | GPL-2.0 / LGPL-2.1 depending on file | Inode lifecycle patterns, NTSTATUS mapping, VFS integration, reparse/symlink parsing, hardlink, oplock, byte-range locks, fallocate, SEEK_HOLE/DATA, getattr STATX |
+| **Linux CIFS client** (`fs/smb/client/`) | `smb2pdu.c`, `smb2ops.c`, `smb2maperror.c`, `smb2inode.c`, `cifsfs.c`, `inode.c`, `file.c`, `dir.c`, `readdir.c`, `reparse.c`, `link.c` | GPL-2.0 / LGPL-2.1 depending on file | Inode lifecycle patterns, NTSTATUS mapping, VFS integration, reparse/symlink parsing, hardlink, oplock, byte-range locks, fallocate, SEEK_HOLE/DATA, getattr STATX, readdir dcache priming |
 | **Linux CIFS common headers** (`fs/smb/common/`) | `smb2pdu.h`, `smb2status.h`, `fscc.h` | LGPL-2.1 | SMB2 struct definitions, NTSTATUS values, FSCC structures (copied, SPDX headers preserved) |
 | **Linux CIFS common headers** (`fs/smb/common/`) | `smbfsctl.h` | LGPL-2.1+ | FSCTL codes and reparse tags (copied, SPDX header preserved) |
 | **Linux CIFS client headers** (`fs/smb/client/`) | `smb1pdu.h` | GPL-2.0 | CreateDisposition / CreateOptions host-endian constants (subset extracted) |
@@ -83,7 +83,8 @@ projects use GPL-2.0-compatible licenses.
 | `super_setup_bdi` | **Ported** from CIFS | Required for netfs writeback |
 | `fs_context` / mount options | **Standard** VFS `fs_context` API | `fs_parameter_spec` + `parse_param` |
 | `vmsmb_fill_inode` | **Ported** from CIFS `cifs_fattr_to_inode` | SMB2 attrs to inode; simplified (no SFU/SFM, no reparse tags beyond symlink) |
-| `vmsmb_refresh_inode` | **Ported** from CIFS `cifs_fattr_to_inode` update-path | Truncates pagecache on shrink, invalidates on mtime change |
+| `vmsmb_refresh_inode` | **Ported** from CIFS `cifs_fattr_to_inode` update-path | Truncates pagecache on shrink, invalidates on mtime change; expires the inode when a readdir-sourced size is refused (`e8a8d54c2d50`) |
+| `vmsmb_prime_dcache` | **Ported** from CIFS `cifs_prime_dcache` (`readdir.c`) | Instantiates listing entries into the dcache; same `d_mountpoint` guard and `d_alloc_parallel`/`d_splice_alias`/`d_lookup_done` sequence. Skips reparse points, and open-codes `d_hash_and_lookup` (unexported since 6.16) |
 | `vmsmb_build_path` | **Simplified** from CIFS `build_path_from_dentry` | Same dentry-walk logic, simpler (no UNC prefix) |
 | `vmsmb_lookup` | **Ported** from CIFS `cifs_lookup` | Compound CREATE+CLOSE probe; reparse handling at lookup time |
 | `vmsmb_create` / `vmsmb_mkdir` | **Ported** from CIFS `cifs_create` / `cifs_mkdir` | |
