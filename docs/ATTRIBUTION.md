@@ -89,6 +89,7 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_lookup` | **Ported** from CIFS `cifs_lookup` | Compound CREATE+CLOSE probe; reparse handling at lookup time |
 | `vmsmb_create` / `vmsmb_mkdir` | **Ported** from CIFS `cifs_create` / `cifs_mkdir` | |
 | `vmsmb_unlink` | **Ported** from CIFS `cifs_unlink` | Uses `vmsmb_smb2_unlink()`; same `DELETE_ON_CLOSE \| OPEN_REPARSE_POINT` flags |
+| `vmsmb_drop_nlink` | **Ported** from CIFS `cifs_drop_nlink()` | Identical: drops one link under `i_lock`, saturating at zero |
 | `vmsmb_rmdir` | **Ported** from CIFS `cifs_rmdir` | Uses `DELETE_ON_CLOSE`; CIFS uses `SET_INFO FileDispositionInfo` |
 | `vmsmb_rename` | **Ported** from CIFS `cifs_rename2` | Calls `vmsmb_smb2_rename()`, supports `RENAME_NOREPLACE` |
 | `vmsmb_link` | **Ported** from CIFS `cifs_hardlink()` | `d_drop()` + `inc_nlink()` under `i_lock` |

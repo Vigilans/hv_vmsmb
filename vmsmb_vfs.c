@@ -1053,6 +1053,23 @@ static int vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 }
 
 /*
+ * Drop one link, stopping at zero.
+ *
+ * Port of CIFS cifs_drop_nlink() (fs/smb/client/inode.c).  A link count is
+ * only ever an estimate here: a CREATE response carries no link count, so an
+ * inode rebuilt after eviction starts at 1 however many names the file has on
+ * disk.  Removing a second name would then take the count below zero, which
+ * drop_nlink() warns about, so the count saturates instead.
+ */
+static void vmsmb_drop_nlink(struct inode *inode)
+{
+	spin_lock(&inode->i_lock);
+	if (inode->i_nlink > 0)
+		drop_nlink(inode);
+	spin_unlock(&inode->i_lock);
+}
+
+/*
  * Remove a file.
  *
  * Port of CIFS cifs_unlink() (fs/smb/client/inode.c), delegates to
@@ -1073,7 +1090,7 @@ static int vmsmb_unlink(struct inode *dir, struct dentry *dentry)
 	kfree(path);
 
 	if (ret == 0) {
-		drop_nlink(d_inode(dentry));
+		vmsmb_drop_nlink(d_inode(dentry));
 		vmsmb_invalidate_dir(dir);
 	}
 	return ret;
