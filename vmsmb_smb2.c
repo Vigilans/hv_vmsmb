@@ -1470,11 +1470,13 @@ int vmsmb_smb2_write_async(struct vmsmb_session *sess, u32 tree_id,
 
 /*
  * SMB2 QUERY_DIRECTORY — enumerate directory entries.
- * Returns the raw output buffer; caller parses FILE_DIRECTORY_INFO entries.
+ * Returns the raw output buffer; caller parses FILE_ID_FULL_DIR_INFO entries.
  *
  * Simplified: CIFS SMB2_query_directory() (fs/smb/client/smb2pdu.c)
- * supports resumption via FileIndex and multiple info classes.
- * We always restart scans and use FileDirectoryInformation only.
+ * supports resumption via FileIndex and falls back to info classes without
+ * a file ID when mounted -o noserverino.  We always restart scans and always
+ * ask for FileIdFullDirectoryInformation, whose UniqueId is the same NTFS
+ * file reference number CREATE's QFid context reports as IndexNumber.
  */
 int vmsmb_smb2_query_dir(struct vmsmb_session *sess, u32 tree_id,
 			 struct vmsmb_fid *fid,
@@ -1515,7 +1517,7 @@ int vmsmb_smb2_query_dir(struct vmsmb_session *sess, u32 tree_id,
 	req = (struct smb2_query_directory_req *)pdu_buf;
 	vmsmb_fill_hdr(&req->hdr, SMB2_QUERY_DIRECTORY_HE, sess, tree_id);
 	req->StructureSize = cpu_to_le16(33);
-	req->FileInformationClass = 1; /* FileDirectoryInformation */
+	req->FileInformationClass = FILEID_FULL_DIRECTORY_INFORMATION;
 	req->Flags = flags;
 	req->FileIndex = 0;
 	req->PersistentFileId = fid->persistent;

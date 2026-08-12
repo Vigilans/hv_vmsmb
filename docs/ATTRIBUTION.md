@@ -50,7 +50,7 @@ projects use GPL-2.0-compatible licenses.
 | CREATE | **Simplified** from CIFS `SMB2_open()` | No create contexts or lease; oplock requested via an in/out argument (see oplock rows below) |
 | CLOSE | **Ported** from CIFS `SMB2_close_flags()` | Skips optional `POSTQUERY_ATTRIB` flag |
 | READ / WRITE | **Simplified** from CIFS `smb2_async_readv()` / `smb2_async_writev()` | Synchronous, single credit charge |
-| QUERY_DIR | **Simplified** from CIFS `SMB2_query_directory()` | No resumption, single info class |
+| QUERY_DIR | **Simplified** from CIFS `SMB2_query_directory()` | No resumption; always `FileIdFullDirectoryInformation` |
 | SET_INFO (rename) | **Simplified** from CIFS `smb2_rename_path()` | Three round-trips instead of compound |
 | SET_INFO (hardlink) | **Ported** from CIFS `smb2_create_hardlink()` | Same access mask + wire format |
 | `vmsmb_smb2_unlink` | **Ported** from CIFS `smb2_unlink()` | Same flags: `DELETE_ON_CLOSE \| OPEN_REPARSE_POINT` |
@@ -98,7 +98,7 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_lookup` (reparse) | **Ported** from CIFS pattern | `OPEN_REPARSE_POINT` + cache symlink target at lookup time |
 | `vmsmb_readdir` (reparse) | **Ported** from CIFS pattern | `FILE_ATTRIBUTE_REPARSE_POINT` → `DT_LNK` |
 | `vmsmb_file_open` / `release` | **Ported** from CIFS `cifs_open` / `cifs_close` | Open flags to SMB2 disposition mapping |
-| `vmsmb_readdir` | **Ported** from CIFS `cifs_readdir` | Parses `FILE_DIRECTORY_INFO` chain |
+| `vmsmb_readdir` | **Ported** from CIFS `cifs_readdir` | Parses `FILE_ID_FULL_DIR_INFO` chain; `UniqueId` is the `d_ino` reported to getdents |
 | `vmsmb_utf16_name_to_utf8` | **Ported** from kernel `utf16s_to_utf8s()` | Corresponds to CIFS `cifs_from_utf16()`, without NLS/SFU/SFM |
 | `vmsmb_issue_read` / `issue_write` | **Ported** from CIFS `smb2_async_readv` / `smb2_async_writev`; read completion (EOF zero-fill) from CIFS `smb2_readv_callback()` | Async submit + completion callback into netfs |
 | `vmsmb_prepare_write` | **Ported** from CIFS `cifs_prepare_write` | Sets `sreq_max_len` for unbuffered write path |

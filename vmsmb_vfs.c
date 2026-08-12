@@ -2935,11 +2935,12 @@ static int vmsmb_utf16_name_to_utf8(char *dst, size_t dst_size,
 }
 
 /*
- * Enumerate a directory — SMB2 QUERY_DIRECTORY with FileDirectoryInformation.
+ * Enumerate a directory — SMB2 QUERY_DIRECTORY with
+ * FileIdFullDirectoryInformation.
  *
  * Port of CIFS cifs_readdir() (fs/smb/client/readdir.c): open the dir with
  * FILE_LIST_DIRECTORY, loop QUERY_DIRECTORY until STATUS_NO_MORE_FILES,
- * feed each FILE_DIRECTORY_INFO into dir_emit().
+ * feed each FILE_ID_FULL_DIR_INFO into dir_emit().
  *
  * Stateless: each VFS call re-opens the directory and re-scans from the
  * beginning, skipping entries until ctx->pos is reached.  This is simple
@@ -3000,21 +3001,28 @@ static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 		if (data_len == 0)
 			break;
 
-		u32 offset = 0;
+		size_t offset = 0;
 
-		while (offset < data_len) {
-			const FILE_DIRECTORY_INFO *entry =
-				(const FILE_DIRECTORY_INFO *)((u8 *)buf + offset);
+		while (offset + sizeof(FILE_ID_FULL_DIR_INFO) <= data_len) {
+			const FILE_ID_FULL_DIR_INFO *entry =
+				(const FILE_ID_FULL_DIR_INFO *)((u8 *)buf + offset);
 			u32 name_len = le32_to_cpu(entry->FileNameLength);
 			u32 attrs = le32_to_cpu(entry->ExtFileAttributes);
+			u32 next = le32_to_cpu(entry->NextEntryOffset);
 			unsigned char d_type;
 			char name_utf8[256];
 			int utf8_len;
+			u64 ino;
+
+			if (name_len > data_len - offset - sizeof(*entry))
+				break;
 
 			utf8_len = vmsmb_utf16_name_to_utf8(name_utf8,
 						      sizeof(name_utf8),
 						      entry->FileName,
 						      name_len);
+			if (utf8_len < 0)
+				goto next_entry;
 
 			if ((utf8_len == 1 && name_utf8[0] == '.') ||
 			    (utf8_len == 2 && name_utf8[0] == '.' &&
@@ -3030,17 +3038,19 @@ static int vmsmb_readdir(struct file *file, struct dir_context *ctx)
 				 (attrs & FILE_ATTRIBUTE_DIRECTORY) ?
 				 DT_DIR : DT_REG;
 
-			if (!dir_emit(ctx, name_utf8, utf8_len,
-				      atomic64_inc_return(&vmsmb_ino_counter),
-				      d_type))
+			ino = le64_to_cpu(entry->UniqueId);
+			if (!ino)
+				ino = atomic64_inc_return(&vmsmb_ino_counter);
+
+			if (!dir_emit(ctx, name_utf8, utf8_len, ino, d_type))
 				goto out;
 
 			ctx->pos++;
 
 next_entry:
-			if (entry->NextEntryOffset == 0)
+			if (next == 0)
 				break;
-			offset += le32_to_cpu(entry->NextEntryOffset);
+			offset += next;
 		}
 	}
 
