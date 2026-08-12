@@ -110,14 +110,40 @@ static inline void vmsmb_invalidate_dir(struct inode *dir)
 }
 
 /*
+ * Move a resolved link target from @info into the inode.
+ *
+ * Port of the S_ISLNK block in CIFS cifs_fattr_to_inode()
+ * (fs/smb/client/inode.c).  Upstream reaches both a new and an existing inode
+ * through that one function, ours are separate, so the block is shared rather
+ * than inlined.  The inode takes the string and @info is cleared, so the
+ * caller's unconditional kfree() reclaims only what was not taken.  The i_lock
+ * pairs with vmsmb_get_link(), which can read the pointer while a refresh
+ * replaces it.
+ */
+static void vmsmb_take_symlink_target(struct inode *inode,
+				      struct vmsmb_file_info *info)
+{
+	if (!S_ISLNK(inode->i_mode) || !info->symlink_target)
+		return;
+
+	spin_lock(&inode->i_lock);
+	kfree(VMSMB_I(inode)->symlink_target);
+	VMSMB_I(inode)->symlink_target = info->symlink_target;
+	spin_unlock(&inode->i_lock);
+	info->symlink_target = NULL;
+}
+
+/*
  * Fill an inode with SMB2 file attributes.
  *
  * Port of CIFS cifs_fattr_to_inode() (fs/smb/client/inode.c) initial-fill
  * path: set mode/ops by attribute bits, size, times, then attach the netfs
- * context (cifs_set_netfs_context() → netfs_inode_init() equivalent).
+ * context (cifs_set_netfs_context() → netfs_inode_init() equivalent).  Size is
+ * taken from @info as-is, so a link's @info must describe the link and not the
+ * reparse point behind it; vmsmb_reparse_info_to_inode() makes it do so.
  */
 static void vmsmb_fill_inode(struct inode *inode,
-			     const struct vmsmb_file_info *info)
+			     struct vmsmb_file_info *info)
 {
 	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
 
@@ -148,6 +174,7 @@ static void vmsmb_fill_inode(struct inode *inode,
 	inode_set_ctime_to_ts(inode, vmsmb_time_to_ts(info->change_time));
 	VMSMB_I(inode)->btime = vmsmb_time_to_ts(info->creation_time);
 	VMSMB_I(inode)->attributes = info->attributes;
+	vmsmb_take_symlink_target(inode, info);
 
 	/*
 	 * Initialize netfs context after VFS inode_init_always() has run
@@ -168,7 +195,7 @@ static void vmsmb_fill_inode(struct inode *inode,
  * Port of CIFS cifs_fattr_to_inode() update-path (fs/smb/client/inode.c).
  */
 static void vmsmb_refresh_inode(struct inode *inode,
-				const struct vmsmb_file_info *info)
+				struct vmsmb_file_info *info)
 {
 	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
 	struct vmsmb_inode_info *vi = VMSMB_I(inode);
@@ -180,7 +207,7 @@ static void vmsmb_refresh_inode(struct inode *inode,
 	if (old_size != new_size) {
 		/* Truncate page cache beyond new EOF to avoid serving stale data */
 		i_size_write(inode, new_size);
-		if (new_size < old_size)
+		if (new_size < old_size && S_ISREG(inode->i_mode))
 			truncate_pagecache(inode, new_size);
 	}
 	inode->i_blocks = (info->alloc_size + 511) / 512;
@@ -188,6 +215,7 @@ static void vmsmb_refresh_inode(struct inode *inode,
 	inode_set_mtime_to_ts(inode, new_mtime);
 	inode_set_ctime_to_ts(inode, vmsmb_time_to_ts(info->change_time));
 	vi->attributes = info->attributes;
+	vmsmb_take_symlink_target(inode, info);
 
 	/*
 	 * If mtime advanced on the server, the file content has changed;
@@ -240,7 +268,7 @@ static int vmsmb_iget_set(struct inode *inode, void *opaque)
  * Port of CIFS cifs_iget() (fs/smb/client/inode.c) using iget5_locked.
  */
 static struct inode *vmsmb_iget(struct super_block *sb,
-				const struct vmsmb_file_info *info)
+				struct vmsmb_file_info *info)
 {
 	struct vmsmb_iget_args args = {
 		.index_number = info->index_number,
@@ -478,6 +506,119 @@ out_no_translate:
 	return smb_target;
 }
 
+/*
+ * Make @info describe a link rather than the reparse point behind it.
+ *
+ * Port of CIFS reparse_info_to_fattr() (fs/smb/client/inode.c): read the
+ * reparse buffer, translate it, reconcile the string with the object type the
+ * server reported, and hand both the target and its length to the struct an
+ * inode is filled from.  A link's size is the length of its target, so it is
+ * set here rather than left at the reparse point's EndOfFile, as upstream's
+ * out_reparse block sets cf_eof.  Upstream appends its FSCTL to the compound
+ * that queried the attributes; ours is a separate round trip, so callers only
+ * reach here for a reparse point.
+ *
+ * A caller that already knows the target seeds @info->symlink_target and no
+ * read back happens, as upstream skips its own read for reparse data it was
+ * handed.  Either way the type comes from @info->attributes rather than the
+ * reparse buffer, as at every upstream call site: the buffer does not record
+ * it.  On failure @info->symlink_target is left NULL and the caller reports
+ * the error.
+ */
+static int vmsmb_reparse_info_to_inode(struct vmsmb_sb_info *sbi,
+				       const char *path,
+				       struct vmsmb_file_info *info)
+{
+	int ret;
+
+	if (!info->symlink_target) {
+		void *reparse_buf;
+		u32 reparse_len;
+		char *target;
+
+		reparse_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
+		if (!reparse_buf)
+			return -ENOMEM;
+
+		ret = vmsmb_smb2_get_reparse(sbi->sess, sbi->tree_id, path,
+					     reparse_buf, VMSMB_MAX_RESPONSE,
+					     &reparse_len);
+		if (ret) {
+			kfree(reparse_buf);
+			return ret;
+		}
+
+		target = vmsmb_parse_reparse(reparse_buf, reparse_len,
+					     sbi->symlinkroot);
+		kfree(reparse_buf);
+		if (IS_ERR(target))
+			return PTR_ERR(target);
+
+		info->symlink_target = target;
+	}
+
+	ret = vmsmb_fix_symlink_target_type(&info->symlink_target,
+					    info->attributes &
+					    FILE_ATTRIBUTE_DIRECTORY);
+	if (ret) {
+		kfree(info->symlink_target);
+		info->symlink_target = NULL;
+		return ret;
+	}
+
+	info->size = strnlen(info->symlink_target, PATH_MAX);
+	return 0;
+}
+
+/*
+ * Re-read an existing inode's metadata from the server.
+ *
+ * Port of CIFS cifs_revalidate_dentry_attr() (fs/smb/client/inode.c), which
+ * re-reads a link's reparse point along with its attributes: a CREATE response
+ * describes the reparse point, so only the target says anything about the link.
+ *
+ * Doing that on every refresh would cost a round trip per revalidation, so this
+ * follows CIFS reparse_inode_match() (fs/smb/client/reparse.h) and keeps what
+ * the inode has while the change time is unchanged -- the server stamps it when
+ * reparse data changes.  Keeping it means carrying the size forward in @info,
+ * as CIFS cifs_prime_dcache() (fs/smb/client/readdir.c) carries cf_eof forward
+ * for the same reason.  Upstream also compares the reparse tag, which a CREATE
+ * response does not carry; its comment there notes the tag check is what can be
+ * skipped.
+ */
+static int vmsmb_revalidate_dentry_attr(struct inode *inode,
+					struct dentry *dentry)
+{
+	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
+	struct vmsmb_file_info info;
+	char *path;
+	int ret;
+
+	path = vmsmb_build_path(dentry);
+	if (IS_ERR(path))
+		return PTR_ERR(path);
+
+	ret = vmsmb_smb2_create_close(sbi->sess, sbi->tree_id, path,
+				      FILE_READ_ATTRIBUTES, FILE_OPEN,
+				      OPEN_REPARSE_POINT, &info);
+	if (ret == 0 && S_ISLNK(inode->i_mode)) {
+		struct timespec64 old_ctime = inode_get_ctime(inode);
+		struct timespec64 ctime = vmsmb_time_to_ts(info.change_time);
+
+		if (timespec64_equal(&ctime, &old_ctime))
+			info.size = i_size_read(inode);
+		else
+			ret = vmsmb_reparse_info_to_inode(sbi, path, &info);
+	}
+	kfree(path);
+
+	if (ret == 0) {
+		vmsmb_refresh_inode(inode, &info);
+		kfree(info.symlink_target);
+	}
+	return ret;
+}
+
 /* ---- Dentry operations ---- */
 
 /*
@@ -522,25 +663,10 @@ static int vmsmb_d_revalidate(struct dentry *dentry, unsigned int flags)
 
 	vi = VMSMB_I(inode);
 	if (time_after(jiffies, vi->meta_expires)) {
-		struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
-		struct vmsmb_session *sess = sbi->sess;
-		struct vmsmb_file_info info;
-		char *path;
-		int ret;
-
-		path = vmsmb_build_path(dentry);
-		if (IS_ERR(path))
-			return 1;
-
-		ret = vmsmb_smb2_create_close(sess, sbi->tree_id, path,
-					      FILE_READ_ATTRIBUTES, FILE_OPEN,
-					      OPEN_REPARSE_POINT, &info);
-		kfree(path);
+		int ret = vmsmb_revalidate_dentry_attr(inode, dentry);
 
 		if (ret == -ENOENT || ret == -ESTALE)
 			return 0;
-		if (ret == 0)
-			vmsmb_refresh_inode(inode, &info);
 	}
 
 	return 1;
@@ -558,8 +684,9 @@ static const struct dentry_operations vmsmb_dentry_ops = {
  * Port of CIFS cifs_lookup() (fs/smb/client/dir.c): issues a compound
  * CREATE+CLOSE probe to test existence and fetch metadata; on ENOENT
  * returns a negative dentry (so VFS caches the miss under actimeo TTL).
- * Reparse points trigger a follow-up FSCTL_GET_REPARSE_POINT to resolve
- * and cache the symlink target.
+ * A reparse point's target is resolved before the inode is instantiated,
+ * as in CIFS cifs_get_fattr() (fs/smb/client/inode.c), because the size to
+ * publish for a link is the length of that target.
  */
 static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 				   unsigned int flags)
@@ -579,6 +706,8 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 				      FILE_READ_ATTRIBUTES, FILE_OPEN,
 				      OPEN_REPARSE_POINT,
 				      &info);
+	if (ret == 0 && (info.attributes & FILE_ATTRIBUTE_REPARSE_POINT))
+		ret = vmsmb_reparse_info_to_inode(sbi, path, &info);
 	kfree(path);
 
 	if (ret == -ENOENT) {
@@ -590,63 +719,9 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 		return ERR_PTR(ret);
 
 	inode = vmsmb_iget(dir->i_sb, &info);
+	kfree(info.symlink_target);
 	if (IS_ERR(inode))
 		return ERR_CAST(inode);
-
-	/* Resolve symlink target for reparse points (CIFS caches at lookup) */
-	if (S_ISLNK(inode->i_mode)) {
-		void *reparse_buf;
-		u32 reparse_len;
-		char *target;
-
-		path = vmsmb_build_path(dentry);
-		if (IS_ERR(path)) {
-			iput(inode);
-			return ERR_CAST(path);
-		}
-
-		reparse_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
-		if (!reparse_buf) {
-			kfree(path);
-			iput(inode);
-			return ERR_PTR(-ENOMEM);
-		}
-
-		ret = vmsmb_smb2_get_reparse(sess, sbi->tree_id, path, reparse_buf,
-					      VMSMB_MAX_RESPONSE, &reparse_len);
-		kfree(path);
-
-		if (ret) {
-			kfree(reparse_buf);
-			iput(inode);
-			return ERR_PTR(ret);
-		}
-
-		target = vmsmb_parse_reparse(reparse_buf, reparse_len,
-					     sbi->symlinkroot);
-		kfree(reparse_buf);
-
-		if (IS_ERR(target)) {
-			iput(inode);
-			return ERR_CAST(target);
-		}
-
-		/*
-		 * As in CIFS cifs_get_fattr() (fs/smb/client/inode.c), the
-		 * link's object type comes from the DIRECTORY attribute
-		 * rather than from the reparse buffer.
-		 */
-		ret = vmsmb_fix_symlink_target_type(&target,
-						    info.attributes &
-						    FILE_ATTRIBUTE_DIRECTORY);
-		if (ret) {
-			kfree(target);
-			iput(inode);
-			return ERR_PTR(ret);
-		}
-
-		VMSMB_I(inode)->symlink_target = target;
-	}
 
 	d_add(dentry, inode);
 	return NULL;
@@ -666,28 +741,14 @@ static int vmsmb_getattr(struct mnt_idmap *idmap,
 {
 	struct inode *inode = d_inode(path->dentry);
 	struct vmsmb_inode_info *vi = VMSMB_I(inode);
-	struct vmsmb_sb_info *sbi = VMSMB_SB(inode->i_sb);
 
 	/*
 	 * Refresh metadata from the server if the TTL has expired.
 	 * Port of CIFS cifs_getattr (fs/smb/client/inode.c) without
 	 * the oplock-held fast path.
 	 */
-	if (time_after(jiffies, vi->meta_expires)) {
-		struct vmsmb_file_info info;
-		char *spath;
-		int ret;
-
-		spath = vmsmb_build_path(path->dentry);
-		if (!IS_ERR(spath)) {
-			ret = vmsmb_smb2_create_close(sbi->sess, sbi->tree_id, spath,
-						      FILE_READ_ATTRIBUTES, FILE_OPEN,
-						      OPEN_REPARSE_POINT, &info);
-			if (ret == 0)
-				vmsmb_refresh_inode(inode, &info);
-			kfree(spath);
-		}
-	}
+	if (time_after(jiffies, vi->meta_expires))
+		vmsmb_revalidate_dentry_attr(inode, path->dentry);
 
 	generic_fillattr(idmap, request_mask, inode, stat);
 
@@ -1121,9 +1182,11 @@ static int vmsmb_link(struct dentry *old_dentry, struct inode *dir,
 /*
  * Read cached symlink target.
  *
- * Port of CIFS cifs_get_link() (fs/smb/client/cifsfs.c): the target
- * is resolved and cached at lookup time; get_link returns a duplicate
- * that VFS frees through delayed_call.
+ * Port of CIFS cifs_get_link() (fs/smb/client/cifsfs.c): the target is
+ * resolved when the inode is filled; get_link returns a duplicate that VFS
+ * frees through delayed_call.  As upstream, the buffer is allocated before
+ * taking i_lock and the string copied under it, since a refresh can replace
+ * the pointer.
  */
 static const char *vmsmb_get_link(struct dentry *dentry, struct inode *inode,
 				   struct delayed_call *done)
@@ -1133,14 +1196,22 @@ static const char *vmsmb_get_link(struct dentry *dentry, struct inode *inode,
 	if (!dentry)
 		return ERR_PTR(-ECHILD);
 
-	if (!VMSMB_I(inode)->symlink_target)
-		return ERR_PTR(-EOPNOTSUPP);
-
-	target = kstrdup(VMSMB_I(inode)->symlink_target, GFP_KERNEL);
+	target = kmalloc(PATH_MAX, GFP_KERNEL);
 	if (!target)
 		return ERR_PTR(-ENOMEM);
 
-	set_delayed_call(done, kfree_link, target);
+	spin_lock(&inode->i_lock);
+	if (likely(VMSMB_I(inode)->symlink_target)) {
+		strscpy(target, VMSMB_I(inode)->symlink_target, PATH_MAX);
+	} else {
+		kfree(target);
+		target = ERR_PTR(-EOPNOTSUPP);
+	}
+	spin_unlock(&inode->i_lock);
+
+	if (!IS_ERR(target))
+		set_delayed_call(done, kfree_link, target);
+
 	return target;
 }
 
@@ -1288,7 +1359,6 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	struct vmsmb_file_info info;
 	struct inode *inode;
 	char *path;
-	char *cached_target;
 	bool directory = false;
 	int ret;
 
@@ -1319,28 +1389,33 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (ret == 0)
 		vmsmb_smb2_close(sess, sbi->tree_id, &fid);
 
+	if (ret == 0) {
+		/*
+		 * Hand on the target we were asked to create, as CIFS
+		 * create_native_symlink() (fs/smb/client/reparse.c) seeds it
+		 * into the open info it passes to cifs_get_inode_info(): the
+		 * string is already known, so reading the reparse point back
+		 * would only confirm it.  Everything downstream of that --
+		 * reconciling the string against the type the server reported,
+		 * and sizing the link by it -- is then the same code lookup
+		 * runs, and the two paths agree by construction.
+		 */
+		info.symlink_target = kstrdup(target, GFP_KERNEL);
+		if (info.symlink_target)
+			ret = vmsmb_reparse_info_to_inode(sbi, path, &info);
+		else
+			ret = -ENOMEM;
+	}
+
 	kfree(path);
 
 	if (ret)
 		return ret;
 
 	inode = vmsmb_iget(dir->i_sb, &info);
+	kfree(info.symlink_target);
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
-
-	/*
-	 * Cache the target the way lookup would, from the re-stat above, so
-	 * the string does not depend on which path populated it.
-	 */
-	cached_target = kstrdup(target, GFP_KERNEL);
-	if (cached_target &&
-	    vmsmb_fix_symlink_target_type(&cached_target,
-					  info.attributes &
-					  FILE_ATTRIBUTE_DIRECTORY)) {
-		kfree(cached_target);
-		cached_target = NULL;
-	}
-	VMSMB_I(inode)->symlink_target = cached_target;
 
 	vmsmb_invalidate_dir(dir);
 	d_instantiate(dentry, inode);

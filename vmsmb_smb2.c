@@ -621,6 +621,7 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, u32 tree_id,
 		info->change_time = le64_to_cpu(rsp->ChangeTime);
 		info->attributes = le32_to_cpu(rsp->FileAttributes);
 		info->index_number = 0;
+		info->symlink_target = NULL;
 
 		/* Walk create contexts looking for QFid response */
 		if (rsp_ctx_off && rsp_ctx_len &&
@@ -836,6 +837,7 @@ int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 		info->change_time = le64_to_cpu(crsp->ChangeTime);
 		info->attributes = le32_to_cpu(crsp->FileAttributes);
 		info->index_number = 0;
+		info->symlink_target = NULL;
 
 		if (rsp_ctx_off && rsp_ctx_len &&
 		    rsp_ctx_off + rsp_ctx_len <= resp_len) {

@@ -236,6 +236,10 @@ struct vmsmb_fid {
 
 /*
  * Basic file info extracted from SMB2 responses.
+ *
+ * symlink_target is owned by whoever filled the struct.  Filling an inode
+ * takes it and clears the field; the owner frees whatever is left.  Mirrors
+ * struct cifs_open_info_data (fs/smb/client/cifsglob.h).
  */
 struct vmsmb_file_info {
 	u64 size;
@@ -246,6 +250,7 @@ struct vmsmb_file_info {
 	u64 change_time;
 	u32 attributes;		/* FILE_ATTRIBUTE_* */
 	u64 index_number;	/* NTFS file reference number (from QFid create context), 0 if unavailable */
+	char *symlink_target;	/* Resolved link target, or NULL */
 };
 
 /*
