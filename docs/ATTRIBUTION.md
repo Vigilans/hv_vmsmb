@@ -96,7 +96,7 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_symlink` | **Simplified** from CIFS `cifs_symlink()` | Calls `vmsmb_smb2_create_symlink()`; host denies in practice |
 | `vmsmb_get_link` | **Ported** from CIFS `cifs_get_link()` | Returns cached symlink target via `set_delayed_call` |
 | `vmsmb_fill_inode` (reparse) | **Ported** from CIFS `cifs_reparse_point_to_fattr()` | `FILE_ATTRIBUTE_REPARSE_POINT` → `S_IFLNK` |
-| `vmsmb_parse_reparse` | **Ported** from CIFS `smb2_parse_native_symlink()` | Same NT prefix stripping (`\??\`, `\DosDevices\`, `\GLOBAL??\`), `GLOBALROOT` chaining, `Global\` prefix, drive-letter translation under `symlinkroot`; skips NFS/WSL/AF_UNIX tags |
+| `vmsmb_parse_reparse` | **Ported** from CIFS `smb2_parse_native_symlink()` + `parse_reparse_wsl_symlink()` | Same NT prefix stripping (`\??\`, `\DosDevices\`, `\GLOBAL??\`), `GLOBALROOT` chaining, `Global\` prefix, drive-letter translation under `symlinkroot`. `IO_REPARSE_TAG_LX_SYMLINK` reads the version-2 UTF-8 target directly, without upstream's UTF-16 round trip; skips NFS/AF_UNIX tags |
 | `vmsmb_lookup` (reparse) | **Ported** from CIFS pattern | `OPEN_REPARSE_POINT` + cache symlink target at lookup time |
 | `vmsmb_readdir` (reparse) | **Ported** from CIFS pattern | `FILE_ATTRIBUTE_REPARSE_POINT` → `DT_LNK` |
 | `vmsmb_file_open` / `release` | **Ported** from CIFS `cifs_open` / `cifs_close` | Open flags to SMB2 disposition mapping |

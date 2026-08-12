@@ -403,8 +403,10 @@ static char *vmsmb_build_path(struct dentry *dentry)
 /*
  * Parse reparse point buffer and return symlink target as UTF-8 string.
  *
- * Handles IO_REPARSE_TAG_SYMLINK and IO_REPARSE_TAG_MOUNT_POINT.
- * Simplified from CIFS smb2_parse_native_symlink() (fs/smb/client/reparse.c).
+ * Handles IO_REPARSE_TAG_SYMLINK, IO_REPARSE_TAG_MOUNT_POINT and
+ * IO_REPARSE_TAG_LX_SYMLINK.  Simplified from CIFS
+ * smb2_parse_native_symlink() and parse_reparse_wsl_symlink()
+ * (fs/smb/client/reparse.c).
  *
  * When symlinkroot is set and the target is an absolute NT path with a
  * drive letter (e.g. \??\C:\foo), translate it to {symlinkroot}/c/foo.
@@ -430,6 +432,37 @@ static char *vmsmb_parse_reparse(const void *buf, u32 buf_len,
 	buf_len = valid_len;
 
 	tag = le32_to_cpu(hdr->ReparseTag);
+
+	/*
+	 * A WSL link holds a bare POSIX path in UTF-8, so it needs none of the
+	 * UTF-16 decode and NT-prefix translation the NT forms below do.
+	 *
+	 * Port of CIFS parse_reparse_wsl_symlink() (fs/smb/client/reparse.c),
+	 * minus its UTF-8 -> UTF-16 -> UTF-8 round trip, which upstream only
+	 * makes because its callee takes UTF-16.  Its two rejections are kept:
+	 * MS-FSCC 2.1.2.7 only defines the Target layout for version 2, and an
+	 * embedded NUL cannot be expressed as a Linux symlink target.
+	 */
+	if (tag == IO_REPARSE_TAG_LX_SYMLINK) {
+		const struct reparse_wsl_symlink_data_buffer *wsl = buf;
+		u32 target_len;
+
+		if (buf_len < sizeof(*wsl))
+			return ERR_PTR(-EINVAL);
+		if (le32_to_cpu(wsl->Version) != 2)
+			return ERR_PTR(-EOPNOTSUPP);
+
+		target_len = buf_len - sizeof(*wsl);
+		if (!target_len)
+			return ERR_PTR(-EINVAL);
+		if (strnlen(wsl->Target, target_len) != target_len)
+			return ERR_PTR(-EINVAL);
+
+		smb_target = kmemdup_nul(wsl->Target, target_len, GFP_KERNEL);
+		if (!smb_target)
+			return ERR_PTR(-ENOMEM);
+		return smb_target;
+	}
 
 	if (tag == IO_REPARSE_TAG_SYMLINK) {
 		const struct reparse_symlink_data_buffer *sym = buf;
