@@ -110,6 +110,39 @@ static inline void vmsmb_invalidate_dir(struct inode *dir)
 }
 
 /*
+ * Whether a size reported by the server may replace the one we publish.
+ *
+ * Port of CIFS is_size_safe_to_change() (fs/smb/client/file.c): while this
+ * client holds the file open for write, the server's EndOfFile covers only the
+ * bytes writeback has already pushed, so it trails what the page cache holds.
+ * Growth is safe to adopt; a shrink is refused until the writers are gone, so
+ * that truncate_pagecache() stays clear of folios still waiting to be sent.
+ * Upstream also exempts direct-I/O mounts and gates readdir-sourced sizes on
+ * the oplock, neither of which applies here: there is no cache= mount option,
+ * and vmsmb_readdir() never touches an inode.
+ */
+static bool vmsmb_size_safe_to_change(struct inode *inode, loff_t end_of_file)
+{
+	struct vmsmb_inode_info *vi = VMSMB_I(inode);
+	struct vmsmb_file_ctx *ctx;
+	bool writable = false;
+
+	spin_lock(&vi->open_ctx_lock);
+	list_for_each_entry(ctx, &vi->open_ctxs, inode_node) {
+		if (ctx->f_mode & FMODE_WRITE) {
+			writable = true;
+			break;
+		}
+	}
+	spin_unlock(&vi->open_ctx_lock);
+
+	if (!writable)
+		return true;
+
+	return i_size_read(inode) < end_of_file;
+}
+
+/*
  * Move a resolved link target from @info into the inode.
  *
  * Port of the S_ISLNK block in CIFS cifs_fattr_to_inode()
@@ -204,13 +237,15 @@ static void vmsmb_refresh_inode(struct inode *inode,
 	struct timespec64 old_mtime = inode_get_mtime(inode);
 	struct timespec64 new_mtime = vmsmb_time_to_ts(info->last_write_time);
 
-	if (old_size != new_size) {
-		/* Truncate page cache beyond new EOF to avoid serving stale data */
-		i_size_write(inode, new_size);
-		if (new_size < old_size && S_ISREG(inode->i_mode))
-			truncate_pagecache(inode, new_size);
+	if (vmsmb_size_safe_to_change(inode, new_size)) {
+		if (old_size != new_size) {
+			/* Truncate page cache beyond new EOF to avoid serving stale data */
+			i_size_write(inode, new_size);
+			if (new_size < old_size && S_ISREG(inode->i_mode))
+				truncate_pagecache(inode, new_size);
+		}
+		inode->i_blocks = (info->alloc_size + 511) / 512;
 	}
-	inode->i_blocks = (info->alloc_size + 511) / 512;
 	inode_set_atime_to_ts(inode, vmsmb_time_to_ts(info->last_access_time));
 	inode_set_mtime_to_ts(inode, new_mtime);
 	inode_set_ctime_to_ts(inode, vmsmb_time_to_ts(info->change_time));
@@ -900,6 +935,15 @@ static int vmsmb_atomic_open(struct inode *dir, struct dentry *dentry,
 		d_instantiate(dentry, inode);
 	}
 
+	/*
+	 * Take the server's size before this handle joins open_ctxs, so the
+	 * guard weighs the other writers rather than this one.  O_TRUNC relies
+	 * on it: we report the truncation as handled, so the VFS never calls
+	 * handle_truncate() and this is the only place the new size lands.
+	 */
+	if (vmsmb_size_safe_to_change(inode, info.size))
+		i_size_write(inode, info.size);
+
 	refcount_set(&ctx->ref, 1);
 	ctx->sess = sess;
 	ctx->tree_id = sbi->tree_id;
@@ -912,7 +956,6 @@ static int vmsmb_atomic_open(struct inode *dir, struct dentry *dentry,
 	INIT_WORK(&ctx->oplock_break, vmsmb_oplock_break_work);
 	file->private_data = ctx;
 	vmsmb_register_open_ctx(inode, ctx);
-	i_size_write(inode, info.size);
 
 	/* CIFS dir.c:590-591 — only when we know the file was just created */
 	if ((open_flag & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL))
@@ -2166,8 +2209,12 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 		return ret;
 	}
 
-	/* Update inode size from server */
-	i_size_write(inode, info.size);
+	/*
+	 * Take the server's size before this handle joins open_ctxs, so the
+	 * guard weighs the other writers rather than this one.
+	 */
+	if (vmsmb_size_safe_to_change(inode, info.size))
+		i_size_write(inode, info.size);
 
 	refcount_set(&ctx->ref, 1);
 	ctx->sess = sess;
