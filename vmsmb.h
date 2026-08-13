@@ -250,6 +250,7 @@ struct vmsmb_file_info {
 	u64 change_time;
 	u32 attributes;		/* FILE_ATTRIBUTE_* */
 	u64 index_number;	/* NTFS file reference number (from QFid create context), 0 if unavailable */
+	u32 nlink;		/* Hard link count, 0 if the server did not report one */
 	char *symlink_target;	/* Resolved link target, or NULL */
 };
 
@@ -540,7 +541,7 @@ int vmsmb_smb2_close(struct vmsmb_session *sess, u32 tree_id,
 int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 			    const char *path,
 			    u32 desired_access, u32 disposition, u32 create_options,
-			    struct vmsmb_file_info *info);
+			    bool query_links, struct vmsmb_file_info *info);
 int vmsmb_smb2_create_ioctl_close(struct vmsmb_session *sess, u32 tree_id,
 				  const char *path,
 				  u32 desired_access, u32 create_options,
