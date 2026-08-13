@@ -129,6 +129,8 @@ Real-world workloads:
 | dd write 1GB (fdatasync) | 6.3s | **1.75s** | 1.83s |
 | dd read 1GB (host cache warm) | 4.9s | 1.31s | **0.28s** |
 | create 10K small files | 23.9s | **12.2s** | 15.8s |
+| `lstat` node_modules (5,632 files), cold cache | 22.9s | 12.0s | **1.65s** |
+| SQLite 20K inserts + fsync | 839ms | 421ms | **94ms** |
 
 VSMB leads in sequential throughput, high-queue-depth 4K random writes, and tar extraction.
 

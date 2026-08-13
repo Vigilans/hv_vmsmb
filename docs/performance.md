@@ -391,6 +391,37 @@ VM cold reads sometimes exceed host NVMe raw speed, possibly due to
 the guest readahead pipeline achieving higher effective NVMe queue
 depth than a single-threaded host `dd`.
 
+### Metadata-heavy tree, three backends
+
+A 5,632-file `node_modules` tree (705 directories, 5 symlinks) on one
+host, kernel 6.18.16-locietta-WSL2-xanmod1, with only the WSL
+drive-share backend varying. Tree phases are medians of 5 runs after a
+discarded warmup; SQLite is a median of 15 standalone runs. Caches are
+dropped before every timed phase.
+
+| Phase | 9p | virtiofs | VSMB |
+|-------|-----|----------|------|
+| `cp -a` whole tree | 132.02s | 86.47s | **18.90s** |
+| `find -type f` (enumerate only) | 2.00s | 1.43s | **1.08s** |
+| `du -sh` (enumerate + stat) | 5.79s | 3.06s | **1.05s** |
+| `lstat` every file, cold | 22.93s | 12.00s | **1.65s** |
+| `rm -rf` whole tree | 8.46s | 7.64s | **4.51s** |
+| SQLite 20K inserts + fsync | 838.8ms | 421.1ms | **93.6ms** |
+
+The spread tracks how much per-file metadata a phase asks for. Pure
+enumeration is nearly a tie at 1.3x over virtiofs; a stat per entry
+opens it to 7.3x. Deletion is the narrowest metadata gap at 1.7x, and
+the one phase where 9p and virtiofs are within 1.1x of each other.
+
+A warm `lstat` pass is not listed. With `actimeo=1` the cold pass
+alone outlives the attribute timeout, so the second pass re-fetches
+most entries and measures the timeout rather than the cache; one VSMB
+run out of five did land entirely in cache, at 18ms against a 1.53s
+median.
+
+The Stage 7 table above measures something else: this driver before
+and after dcache priming, on one backend.
+
 ## Filesystem Correctness
 
 [pjdfstest](https://github.com/pjd/pjdfstest) results: **8,787 / 8,789
