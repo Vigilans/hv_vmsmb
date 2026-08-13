@@ -1176,7 +1176,7 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
  * with RENAME_NOREPLACE inverting the ReplaceIfExists field, and carries
  * over its unlink-then-retry fallback -- NT refuses to let a rename
  * replace a destination that is a directory object, so on EACCES/EEXIST
- * the destination is removed and the rename reissued, which makes
+ * a directory destination is removed and the rename reissued, which makes
  * replacing one non-atomic.
  */
 static int vmsmb_rename(struct mnt_idmap *idmap,
@@ -1213,6 +1213,10 @@ static int vmsmb_rename(struct mnt_idmap *idmap,
 	 * S_IFLNK here (vmsmb_fill_inode tests FILE_ATTRIBUTE_REPARSE_POINT
 	 * before FILE_ATTRIBUTE_DIRECTORY), so it takes the unlink path and
 	 * only the link is removed.
+	 *
+	 * A plain file destination is never removed: NT refuses one only when
+	 * it is still open, and removing it would destroy the very data the
+	 * rename was asked to overwrite, so that becomes -EBUSY.
 	 */
 	if (replace && (ret == -EACCES || ret == -EEXIST) &&
 	    d_really_is_positive(new_dentry)) {
@@ -1220,14 +1224,18 @@ static int vmsmb_rename(struct mnt_idmap *idmap,
 
 		if (d_is_dir(new_dentry))
 			tmpret = vmsmb_smb2_rmdir(sess, sbi->tree_id, new_path);
-		else
+		else if (d_is_symlink(new_dentry))
 			tmpret = vmsmb_smb2_unlink(sess, sbi->tree_id, new_path);
+		else
+			tmpret = -EBUSY;
 
 		/*
-		 * A non-empty directory destination surfaces as EEXIST or
-		 * ENOTEMPTY; report that rather than the rename's EACCES.
+		 * Both the refusal above and a non-empty directory
+		 * destination, which surfaces as EEXIST or ENOTEMPTY, are
+		 * reported in place of the rename's own EACCES.
 		 */
-		if (tmpret == -EEXIST || tmpret == -ENOTEMPTY)
+		if (tmpret == -EBUSY || tmpret == -EEXIST ||
+		    tmpret == -ENOTEMPTY)
 			ret = tmpret;
 		else if (!tmpret)
 			ret = vmsmb_smb2_rename(sess, sbi->tree_id, old_path,
