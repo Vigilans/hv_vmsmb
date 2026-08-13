@@ -1367,6 +1367,55 @@ static int vmsmb_fix_symlink_target_type(char **target, bool directory)
 }
 
 /*
+ * Collapse "." and ".." in a share-relative path, in place.
+ *
+ * Returns false when the path walks above the share root, which is a name this
+ * client cannot express to the server.
+ *
+ * The collapse is lexical, so an intermediate component that is itself a
+ * symlink resolves differently here than the server would resolve it.  The
+ * only caller is the type probe below, whose worst case is choosing the wrong
+ * reparse type for the new link.
+ */
+static bool vmsmb_collapse_path(char *path)
+{
+	const char *in = path;
+	char *out = path;
+
+	while (*in) {
+		const char *seg = in;
+		size_t len;
+
+		while (*in && *in != '/')
+			in++;
+		len = in - seg;
+		while (*in == '/')
+			in++;
+
+		if (!len || (len == 1 && seg[0] == '.'))
+			continue;
+
+		if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+			if (out == path)
+				return false;
+			while (out != path && out[-1] != '/')
+				out--;
+			if (out != path)
+				out--;
+			continue;
+		}
+
+		if (out != path)
+			*out++ = '/';
+		memmove(out, seg, len);
+		out += len;
+	}
+
+	*out = '\0';
+	return true;
+}
+
+/*
  * Decide whether a symlink target names a directory.
  *
  * Port of CIFS detect_directory_symlink_target() (fs/smb/client/reparse.c):
@@ -1376,11 +1425,12 @@ static int vmsmb_fix_symlink_target_type(char **target, bool directory)
  *   1. the target's last component is empty (trailing slash), "." or ".."
  *      → certainly a directory, no server round-trip;
  *   2. the target is absolute → undeterminable here, treat as file;
- *   3. otherwise resolve it against the link's parent and probe the server
- *      with CREATE(CREATE_NOT_FILE); ENOTDIR settles it as a file, ENOENT
- *      leaves a dangling link as a file, and anything else falls back to a
- *      second CREATE(CREATE_NOT_DIR) probe whose EISDIR settles it as a
- *      directory.
+ *   3. otherwise resolve it against the link's parent, collapse the result,
+ *      and probe the server with CREATE(CREATE_NOT_FILE); ENOTDIR settles it
+ *      as a file, ENOENT leaves a dangling link as a file, and anything else
+ *      falls back to a second CREATE(CREATE_NOT_DIR) probe whose EISDIR
+ *      settles it as a directory.  A target that resolves outside the share
+ *      is undeterminable, like an absolute one.
  *
  * An undeterminable target is not an error: it leaves *directory false,
  * matching upstream.
@@ -1426,6 +1476,16 @@ static int vmsmb_detect_directory_target(struct vmsmb_sb_info *sbi,
 	else
 		path_sep = resolved_path;
 	memcpy(path_sep, target, target_len + 1);
+
+	/*
+	 * The server resolves a CREATE path literally, so the spliced-in "."
+	 * and ".." have to be gone before it is sent.  A target that walks
+	 * above the share root is as undeterminable here as an absolute one.
+	 */
+	if (!vmsmb_collapse_path(resolved_path)) {
+		kfree(resolved_path);
+		return 0;
+	}
 
 	/* Probe as a directory. */
 	ret = vmsmb_smb2_create_close(sess, sbi->tree_id, resolved_path,
