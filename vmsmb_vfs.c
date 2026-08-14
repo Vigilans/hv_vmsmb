@@ -200,7 +200,7 @@ static void vmsmb_fill_inode(struct inode *inode,
 		inode->i_op = &vmsmb_file_inode_ops;
 		inode->i_fop = &vmsmb_file_ops;
 		inode->i_mapping->a_ops = &vmsmb_aops;
-		set_nlink(inode, info->nlink ? info->nlink : 1);
+		set_nlink(inode, 1);
 	}
 
 	inode->i_uid = sbi->uid;
@@ -269,8 +269,6 @@ static void vmsmb_refresh_inode(struct inode *inode,
 	inode_set_mtime_to_ts(inode, new_mtime);
 	inode_set_ctime_to_ts(inode, vmsmb_time_to_ts(info->change_time));
 	vi->attributes = info->attributes;
-	if (info->nlink && S_ISREG(inode->i_mode))
-		set_nlink(inode, info->nlink);
 	vmsmb_take_symlink_target(inode, info);
 
 	/*
@@ -690,7 +688,7 @@ static int vmsmb_revalidate_dentry_attr(struct inode *inode,
 
 	ret = vmsmb_smb2_create_close(sbi->sess, sbi->tree_id, path,
 				      FILE_READ_ATTRIBUTES, FILE_OPEN,
-				      OPEN_REPARSE_POINT, true, &info);
+				      OPEN_REPARSE_POINT, &info);
 	if (ret == 0 && S_ISLNK(inode->i_mode)) {
 		struct timespec64 old_ctime = inode_get_ctime(inode);
 		struct timespec64 ctime = vmsmb_time_to_ts(info.change_time);
@@ -795,7 +793,7 @@ static struct dentry *vmsmb_lookup(struct inode *dir, struct dentry *dentry,
 	ret = vmsmb_smb2_create_close(sess, sbi->tree_id, path,
 				      FILE_READ_ATTRIBUTES, FILE_OPEN,
 				      OPEN_REPARSE_POINT,
-				      true, &info);
+				      &info);
 	if (ret == 0 && (info.attributes & FILE_ATTRIBUTE_REPARSE_POINT))
 		ret = vmsmb_reparse_info_to_inode(sbi, path, &info);
 	kfree(path);
@@ -884,7 +882,7 @@ static int vmsmb_create(struct mnt_idmap *idmap, struct inode *dir,
 	ret = vmsmb_smb2_create_close(sess, sbi->tree_id, path,
 				      VMSMB_RW_ACCESS,
 				      excl ? FILE_CREATE : FILE_OPEN_IF,
-				      CREATE_NOT_DIR, false, &info);
+				      CREATE_NOT_DIR, &info);
 
 	kfree(path);
 
@@ -1057,7 +1055,7 @@ static int vmsmb_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 
 	ret = vmsmb_smb2_create_close(sess, sbi->tree_id, path,
 				      VMSMB_DIR_ACCESS, FILE_CREATE,
-				      CREATE_NOT_FILE, false, &info);
+				      CREATE_NOT_FILE, &info);
 
 	kfree(path);
 
@@ -1501,7 +1499,7 @@ static int vmsmb_detect_directory_target(struct vmsmb_sb_info *sbi,
 	ret = vmsmb_smb2_create_close(sess, sbi->tree_id, resolved_path,
 				      FILE_READ_ATTRIBUTES, FILE_OPEN,
 				      CREATE_NOT_FILE | OPEN_REPARSE_POINT,
-				      false, NULL);
+				      NULL);
 	if (ret == 0) {
 		*directory = true;
 	} else if (ret == -ENOTDIR || ret == -ENOENT) {
@@ -1514,7 +1512,7 @@ static int vmsmb_detect_directory_target(struct vmsmb_sb_info *sbi,
 		ret = vmsmb_smb2_create_close(sess, sbi->tree_id, resolved_path,
 					      FILE_READ_ATTRIBUTES, FILE_OPEN,
 					      CREATE_NOT_DIR | OPEN_REPARSE_POINT,
-					      false, NULL);
+					      NULL);
 		if (ret == -EISDIR)
 			*directory = true;
 	}

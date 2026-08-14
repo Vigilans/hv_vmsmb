@@ -621,7 +621,6 @@ int vmsmb_smb2_create(struct vmsmb_session *sess, u32 tree_id,
 		info->change_time = le64_to_cpu(rsp->ChangeTime);
 		info->attributes = le32_to_cpu(rsp->FileAttributes);
 		info->index_number = 0;
-		info->nlink = 0;
 		info->symlink_target = NULL;
 
 		/* Walk create contexts looking for QFid response */
@@ -709,61 +708,13 @@ out:
 }
 
 /*
- * Take the hard link count out of a QUERY_INFO response and return the offset
- * of the PDU chained after it, or 0 when the chain cannot be followed.
- *
- * A CREATE response has no link count field, so this is the only place one can
- * come from.  Leaving info->nlink at 0 keeps the caller on its own default.
- */
-static u32 vmsmb_take_link_count(const u8 *resp_buf, u32 resp_len, u32 off,
-				 struct vmsmb_file_info *info)
-{
-	const struct smb2_query_info_rsp *qrsp;
-	const struct smb2_hdr *qhdr;
-	u32 remaining, out_off, out_len, next;
-
-	if (!off || off >= resp_len ||
-	    resp_len - off < sizeof(struct smb2_query_info_rsp)) {
-		pr_debug("compound: missing/short QUERY_INFO response\n");
-		return 0;
-	}
-
-	qhdr = (const struct smb2_hdr *)(resp_buf + off);
-	qrsp = (const struct smb2_query_info_rsp *)(resp_buf + off);
-	if (qhdr->ProtocolId != SMB2_PROTO_NUMBER)
-		return 0;
-	if (vmsmb_check_status(qhdr, "QUERY_INFO"))
-		return 0;
-
-	remaining = resp_len - off;
-	out_off = le16_to_cpu(qrsp->OutputBufferOffset);
-	out_len = le32_to_cpu(qrsp->OutputBufferLength);
-
-	if (info && out_off <= remaining && out_len <= remaining - out_off &&
-	    out_len >= offsetofend(struct smb2_file_all_info, NumberOfLinks)) {
-		const struct smb2_file_all_info *ai =
-			(const struct smb2_file_all_info *)(resp_buf + off + out_off);
-
-		info->nlink = le32_to_cpu(ai->NumberOfLinks);
-	}
-
-	next = le32_to_cpu(qhdr->NextCommand);
-	return next ? off + next : 0;
-}
-
-/*
  * SMB2 CREATE+CLOSE compound — halves round-trips for metadata operations
  * (lookup, getattr probe; also mkdir / unlink / rmdir via DELETE_ON_CLOSE).
  *
- * Ported from CIFS smb2_compound_op() (fs/smb/client/smb2inode.c): PDUs
- * chained via NextCommand (8-byte aligned offset to the next one); every PDU
- * after the first sets SMB2_FLAGS_RELATED_OPERATIONS and inherits the
- * CREATE'd fid by passing COMPOUND_FID. MS-SMB2 §3.2.4.1.4 "Sending
- * Compounded Requests".
- *
- * @query_links adds a QUERY_INFO PDU between the two, for callers that fill
- * an inode: the CREATE response has no link count, and folding the query into
- * the same compound keeps the round-trip count at one.
+ * Ported from CIFS smb2_compound_op() (fs/smb/client/smb2inode.c): two PDUs
+ * chained via hdr1->NextCommand (8-byte aligned offset to PDU2); PDU2 sets
+ * SMB2_FLAGS_RELATED_OPERATIONS and inherits the CREATE'd fid by passing
+ * COMPOUND_FID. MS-SMB2 §3.2.4.1.4 "Sending Compounded Requests".
  *
  * Disposition is caller-controlled (FILE_OPEN for probe; FILE_CREATE for
  * mkdir; FILE_OPEN with CREATE_DELETE_ON_CLOSE for unlink).  CLOSE status
@@ -773,12 +724,11 @@ static u32 vmsmb_take_link_count(const u8 *resp_buf, u32 resp_len, u32 off,
 int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 			    const char *path,
 			    u32 desired_access, u32 disposition, u32 create_options,
-			    bool query_links, struct vmsmb_file_info *info)
+			    struct vmsmb_file_info *info)
 {
 	u8 *pdu_buf, *resp_buf;
 	struct smb2_create_req *creq;
 	struct smb2_close_req *clreq;
-	struct smb2_query_info_req *qreq;
 	const struct smb2_create_rsp *crsp;
 	const struct smb2_hdr *hdr1;
 	const struct smb2_hdr *hdr2;
@@ -786,7 +736,6 @@ int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 	int name_len;
 	u32 resp_len;
 	u32 name_end, ctx_offset, create_pdu_len, close_pdu_off, total_len;
-	u32 qi_pdu_off;
 	u32 next_off;
 	struct create_context *qfid_ctx;
 	int ret;
@@ -804,10 +753,7 @@ int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 	name_end = sizeof(struct smb2_create_req) + max_t(int, name_len, 1);
 	ctx_offset = ALIGN(name_end, 8);
 	create_pdu_len = ctx_offset + 24;		/* QFid ctx = 24 bytes */
-	qi_pdu_off = query_links ? ALIGN(create_pdu_len, 8) : 0;
-	close_pdu_off = query_links ?
-		qi_pdu_off + ALIGN(sizeof(struct smb2_query_info_req), 8) :
-		ALIGN(create_pdu_len, 8);
+	close_pdu_off = ALIGN(create_pdu_len, 8);
 	total_len = close_pdu_off + sizeof(struct smb2_close_req);
 
 	pdu_buf = kzalloc(total_len, GFP_KERNEL);
@@ -820,7 +766,7 @@ int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 	/* PDU #1: CREATE with NextCommand = close_pdu_off */
 	creq = (struct smb2_create_req *)pdu_buf;
 	vmsmb_fill_hdr(&creq->hdr, SMB2_CREATE_HE, sess, tree_id);
-	creq->hdr.NextCommand = cpu_to_le32(query_links ? qi_pdu_off : close_pdu_off);
+	creq->hdr.NextCommand = cpu_to_le32(close_pdu_off);
 	creq->StructureSize = cpu_to_le16(57);
 	creq->ImpersonationLevel = cpu_to_le32(0x02);
 	creq->DesiredAccess = cpu_to_le32(desired_access);
@@ -845,25 +791,7 @@ int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 	creq->CreateContextsOffset = cpu_to_le32(ctx_offset);
 	creq->CreateContextsLength = cpu_to_le32(24);
 
-	/*
-	 * Optional PDU: QUERY_INFO, RELATED, COMPOUND_FID, at the information
-	 * level that carries the hard link count.
-	 */
-	if (query_links) {
-		qreq = (struct smb2_query_info_req *)(pdu_buf + qi_pdu_off);
-		vmsmb_fill_hdr(&qreq->hdr, SMB2_QUERY_INFO_HE, sess, tree_id);
-		qreq->hdr.NextCommand = cpu_to_le32(close_pdu_off - qi_pdu_off);
-		qreq->hdr.Flags |= SMB2_FLAGS_RELATED_OPERATIONS;
-		qreq->StructureSize = cpu_to_le16(41);
-		qreq->InfoType = SMB2_O_INFO_FILE;
-		qreq->FileInfoClass = FILE_ALL_INFORMATION;
-		qreq->OutputBufferLength =
-			cpu_to_le32(sizeof(struct smb2_file_all_info) + 512);
-		qreq->PersistentFileId = COMPOUND_FID;
-		qreq->VolatileFileId = COMPOUND_FID;
-	}
-
-	/* Final PDU: CLOSE, RELATED, using COMPOUND_FID */
+	/* PDU #2: CLOSE, RELATED, using COMPOUND_FID */
 	clreq = (struct smb2_close_req *)(pdu_buf + close_pdu_off);
 	vmsmb_fill_hdr(&clreq->hdr, SMB2_CLOSE_HE, sess, tree_id);
 	clreq->hdr.Flags |= SMB2_FLAGS_RELATED_OPERATIONS;
@@ -909,7 +837,6 @@ int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 		info->change_time = le64_to_cpu(crsp->ChangeTime);
 		info->attributes = le32_to_cpu(crsp->FileAttributes);
 		info->index_number = 0;
-		info->nlink = 0;
 		info->symlink_target = NULL;
 
 		if (rsp_ctx_off && rsp_ctx_len &&
@@ -954,9 +881,6 @@ int vmsmb_smb2_create_close(struct vmsmb_session *sess, u32 tree_id,
 	 * issued a separate CLOSE anyway, so seeing CLOSE errors there is
 	 * still correct. */
 	next_off = le32_to_cpu(hdr1->NextCommand);
-	if (query_links)
-		next_off = vmsmb_take_link_count(resp_buf, resp_len, next_off,
-						 info);
 	if (next_off == 0 || next_off >= resp_len ||
 	    resp_len - next_off < sizeof(struct smb2_hdr)) {
 		pr_debug("compound: missing/short CLOSE response (next=%u resp=%u)\n",
@@ -1854,7 +1778,7 @@ int vmsmb_smb2_unlink(struct vmsmb_session *sess, u32 tree_id,
 	return vmsmb_smb2_create_close(sess, tree_id, path, DELETE,
 				       FILE_OPEN,
 				       CREATE_DELETE_ON_CLOSE | OPEN_REPARSE_POINT,
-				       false, NULL);
+				       NULL);
 }
 
 /*
