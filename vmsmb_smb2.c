@@ -1563,114 +1563,6 @@ out:
 }
 
 /*
- * SMB2 SET_INFO (FileRenameInformation) — rename a file or directory.
- *
- * Simplified: CIFS smb2_rename_path() (fs/smb/client/smb2inode.c)
- * uses compound requests (CREATE+SET_INFO+CLOSE in one round-trip)
- * and opens the source with a cached writable handle when available.
- * We do three separate requests: CREATE (with DELETE access) →
- * SET_INFO → CLOSE.
- *
- * @old_path: current path relative to share root
- * @new_path: target path relative to share root
- * @replace:  if true, replace existing target (RENAME_NOREPLACE inverts this)
- */
-int vmsmb_smb2_rename(struct vmsmb_session *sess, u32 tree_id,
-		       const char *old_path, const char *new_path,
-		       bool replace)
-{
-	struct vmsmb_fid fid;
-	u8 *pdu_buf, *resp_buf;
-	struct smb2_set_info_req *req;
-	struct smb2_file_rename_info *rename_info;
-	const struct smb2_hdr *hdr;
-	__le16 *new_name_utf16;
-	int new_name_len;
-	u32 rename_info_len, buf_len, pdu_len, resp_len;
-	int ret;
-
-	/*
-	 * Step 1: Open source with DELETE access.  OPEN_REPARSE_POINT keeps
-	 * the open on the reparse point itself so a symlink is renamed
-	 * rather than followed; it has no effect on other files.
-	 */
-	ret = vmsmb_smb2_create(sess, tree_id, old_path, DELETE,
-				FILE_OPEN, OPEN_REPARSE_POINT, NULL, &fid, NULL);
-	if (ret)
-		return ret;
-
-	/* Convert new path to UTF-16LE */
-	new_name_utf16 = vmsmb_path_to_utf16(new_path, &new_name_len);
-	if (!new_name_utf16) {
-		ret = -ENOMEM;
-		goto close;
-	}
-
-	/* Build SET_INFO request */
-	rename_info_len = sizeof(struct smb2_file_rename_info) + new_name_len;
-	buf_len = sizeof(struct smb2_set_info_req) + rename_info_len;
-	pdu_buf = kzalloc(buf_len, GFP_KERNEL);
-	if (!pdu_buf) {
-		kfree(new_name_utf16);
-		ret = -ENOMEM;
-		goto close;
-	}
-
-	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
-	if (!resp_buf) {
-		kfree(pdu_buf);
-		kfree(new_name_utf16);
-		ret = -ENOMEM;
-		goto close;
-	}
-
-	req = (struct smb2_set_info_req *)pdu_buf;
-	vmsmb_fill_hdr(&req->hdr, SMB2_SET_INFO_HE, sess, tree_id);
-	req->StructureSize = cpu_to_le16(33);
-	req->InfoType = SMB2_O_INFO_FILE;
-	req->FileInfoClass = FILE_RENAME_INFORMATION;
-	req->BufferLength = cpu_to_le32(rename_info_len);
-	req->BufferOffset = cpu_to_le16(sizeof(struct smb2_set_info_req));
-	req->AdditionalInformation = 0;
-	req->PersistentFileId = fid.persistent;
-	req->VolatileFileId = fid.volatile_id;
-
-	/* Fill rename info in the Buffer[] area */
-	rename_info = (struct smb2_file_rename_info *)req->Buffer;
-	rename_info->ReplaceIfExists = replace ? 1 : 0;
-	memset(rename_info->Reserved, 0, sizeof(rename_info->Reserved));
-	rename_info->RootDirectory = 0;
-	rename_info->FileNameLength = cpu_to_le32(new_name_len);
-	memcpy(rename_info->FileName, new_name_utf16, new_name_len);
-
-	kfree(new_name_utf16);
-
-	pdu_len = sizeof(struct smb2_set_info_req) + rename_info_len;
-
-	/* Step 2: Send SET_INFO */
-	ret = vmsmb_smb2_transact(sess, pdu_buf, pdu_len,
-				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
-	kfree(pdu_buf);
-	if (ret)
-		goto free_resp;
-
-	hdr = vmsmb_check_resp(resp_buf, resp_len);
-	if (!hdr) {
-		ret = -EPROTO;
-		goto free_resp;
-	}
-
-	ret = vmsmb_check_status(hdr, "SET_INFO(rename)");
-
-free_resp:
-	kfree(resp_buf);
-close:
-	/* Step 3: Close handle */
-	vmsmb_smb2_close(sess, tree_id, &fid);
-	return ret;
-}
-
-/*
  * SMB2 SET_INFO (FileLinkInformation) — create a hard link.
  *
  * Port of CIFS smb2_create_hardlink() (fs/smb/client/smb2inode.c:1254):
@@ -2128,13 +2020,15 @@ close:
  * - If CREATE succeeds: out_fid is set immediately, before SET_INFO is
  *   inspected; caller must close regardless of whether SET_INFO parsing
  *   returned 0 or an error.
+ *
+ * @op: what to call the SET_INFO in a failure message
  */
 static int vmsmb_smb2_create_setinfo(struct vmsmb_session *sess, u32 tree_id,
 				     const char *path, u32 desired_access,
 				     u32 create_options,
 				     u8 info_type, u8 file_info_class,
 				     const void *payload, u32 payload_len,
-				     struct vmsmb_fid *out_fid)
+				     const char *op, struct vmsmb_fid *out_fid)
 {
 	u8 *pdu_buf, *resp_buf;
 	struct smb2_create_req *creq;
@@ -2263,10 +2157,65 @@ static int vmsmb_smb2_create_setinfo(struct vmsmb_session *sess, u32 tree_id,
 		ret = -EPROTO;
 		goto out;
 	}
-	ret = vmsmb_check_status(hdr2, "SET_INFO");
+	ret = vmsmb_check_status(hdr2, op);
 
 out:
 	kfree(resp_buf);
+	return ret;
+}
+
+/*
+ * SMB2 SET_INFO (FileRenameInformation) — rename a file or directory.
+ *
+ * Port of CIFS smb2_rename_path() (fs/smb/client/smb2inode.c), which folds
+ * CREATE+SET_INFO+CLOSE into one round-trip and opens the source with a
+ * cached writable handle when it has one.  The CLOSE is a request of its
+ * own here for the reason vmsmb_smb2_create_setinfo() documents.
+ *
+ * The source is opened with DELETE access, which a rename needs, and with
+ * OPEN_REPARSE_POINT so a symlink is renamed rather than followed; that
+ * flag has no effect on other files.
+ *
+ * @old_path: current path relative to share root
+ * @new_path: target path relative to share root
+ * @replace:  if true, replace existing target (RENAME_NOREPLACE inverts this)
+ */
+int vmsmb_smb2_rename(struct vmsmb_session *sess, u32 tree_id,
+		       const char *old_path, const char *new_path,
+		       bool replace)
+{
+	struct smb2_file_rename_info *rename_info;
+	struct vmsmb_fid fid;
+	__le16 *new_name_utf16;
+	int new_name_len;
+	u32 rename_info_len;
+	int ret;
+
+	new_name_utf16 = vmsmb_path_to_utf16(new_path, &new_name_len);
+	if (!new_name_utf16)
+		return -ENOMEM;
+
+	rename_info_len = sizeof(*rename_info) + new_name_len;
+	rename_info = kzalloc(rename_info_len, GFP_KERNEL);
+	if (!rename_info) {
+		kfree(new_name_utf16);
+		return -ENOMEM;
+	}
+
+	rename_info->ReplaceIfExists = replace ? 1 : 0;
+	rename_info->FileNameLength = cpu_to_le32(new_name_len);
+	memcpy(rename_info->FileName, new_name_utf16, new_name_len);
+	kfree(new_name_utf16);
+
+	ret = vmsmb_smb2_create_setinfo(sess, tree_id, old_path, DELETE,
+					OPEN_REPARSE_POINT, SMB2_O_INFO_FILE,
+					FILE_RENAME_INFORMATION, rename_info,
+					rename_info_len, "SET_INFO(rename)",
+					&fid);
+	kfree(rename_info);
+
+	if (fid.persistent || fid.volatile_id)
+		vmsmb_smb2_close(sess, tree_id, &fid);
 	return ret;
 }
 
@@ -2297,7 +2246,8 @@ int vmsmb_smb2_set_basic_info(struct vmsmb_session *sess, u32 tree_id,
 					FILE_WRITE_ATTRIBUTES, 0,
 					SMB2_O_INFO_FILE,
 					FILE_BASIC_INFORMATION,
-					binfo, sizeof(*binfo), &fid);
+					binfo, sizeof(*binfo), "SET_INFO",
+					&fid);
 	if (fid.persistent || fid.volatile_id)
 		vmsmb_smb2_close(sess, tree_id, &fid);
 	return ret;
@@ -2322,7 +2272,8 @@ int vmsmb_smb2_set_eof(struct vmsmb_session *sess, u32 tree_id,
 					FILE_WRITE_DATA, 0,
 					SMB2_O_INFO_FILE,
 					FILE_END_OF_FILE_INFORMATION,
-					&eof_le, sizeof(eof_le), &fid);
+					&eof_le, sizeof(eof_le), "SET_INFO",
+					&fid);
 	if (fid.persistent || fid.volatile_id)
 		vmsmb_smb2_close(sess, tree_id, &fid);
 	return ret;
@@ -2357,7 +2308,7 @@ int vmsmb_smb2_rmdir(struct vmsmb_session *sess, u32 tree_id,
 					SMB2_O_INFO_FILE,
 					FILE_DISPOSITION_INFORMATION,
 					&delete_pending, sizeof(delete_pending),
-					&fid);
+					"SET_INFO", &fid);
 	if (fid.persistent || fid.volatile_id)
 		vmsmb_smb2_close(sess, tree_id, &fid);
 	return ret;
