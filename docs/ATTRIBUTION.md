@@ -51,8 +51,8 @@ projects use GPL-2.0-compatible licenses.
 | CLOSE | **Ported** from CIFS `SMB2_close_flags()` | Skips optional `POSTQUERY_ATTRIB` flag |
 | READ / WRITE | **Simplified** from CIFS `smb2_async_readv()` / `smb2_async_writev()` | Synchronous, single credit charge |
 | QUERY_DIR | **Simplified** from CIFS `SMB2_query_directory()` | No resumption; always `FileIdFullDirectoryInformation` |
-| SET_INFO (rename) | **Simplified** from CIFS `smb2_rename_path()` | Three round-trips instead of compound |
-| SET_INFO (hardlink) | **Ported** from CIFS `smb2_create_hardlink()` | Same access mask + wire format |
+| SET_INFO (rename) | **Simplified** from CIFS `smb2_rename_path()` | 2-PDU `CREATE+SET_INFO(final)` compound plus standalone CLOSE because vmusrv requires SET_INFO to be terminal |
+| SET_INFO (hardlink) | **Simplified** from CIFS `smb2_create_hardlink()` | Same access mask + wire format; same terminal SET_INFO compound plus standalone CLOSE |
 | `vmsmb_smb2_unlink` | **Ported** from CIFS `smb2_unlink()` | Same flags: `DELETE_ON_CLOSE \| OPEN_REPARSE_POINT` |
 | IOCTL | **Simplified** from CIFS `SMB2_ioctl()` | Single synchronous round-trip, no compound/async/credit |
 | `vmsmb_smb2_get_reparse` | **Ported** from CIFS `smb2_query_reparse_point()` | Same flags, separate CREATE+IOCTL+CLOSE |

@@ -308,11 +308,12 @@ following CLOSE and no response is sent.
 
 The implemented form is `CREATE+SET_INFO(final)` plus a standalone
 `CLOSE`. SET_INFO is the last PDU in the compound, which avoids the
-broken continuation path. This changes `set_basic_info` / `set_eof`
-from 3 round-trips to 2 round-trips.
+broken continuation path. `set_basic_info`, `set_eof`, `rename` and
+`hardlink` all use it, each at 2 round-trips instead of 3.
 
-Paths that need another operation after SET_INFO, such as hardlink and
-rename setattr handling, still use separate requests.
+A sequence that needs another operation after the SET_INFO, such as
+moving a busy rename destination aside and then deleting it, is issued
+as separate requests.
 
 Wall-time impact on `tar xf` is in the [Small-File / Metadata
 Workload](#small-file--metadata-workload) section.
