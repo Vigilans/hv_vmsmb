@@ -2143,8 +2143,12 @@ static void vmsmb_issue_read_complete(void *priv, int status,
 				false);
 #endif
 
+	/*
+	 * Terminating the subrequest can free the request, which leaves this
+	 * put holding the last ctx reference.
+	 */
 	if (ctx)
-		vmsmb_file_ctx_put(ctx);
+		__vmsmb_file_ctx_put(ctx, true);
 }
 
 /*
@@ -2303,8 +2307,12 @@ static void vmsmb_issue_write_complete(void *priv, int status,
 					  status ? status : (ssize_t)bytes_written, true);
 #endif
 
+	/*
+	 * Terminating the subrequest can free the request, which leaves this
+	 * put holding the last ctx reference.
+	 */
 	if (ctx)
-		vmsmb_file_ctx_put(ctx);
+		__vmsmb_file_ctx_put(ctx, true);
 }
 
 /*
