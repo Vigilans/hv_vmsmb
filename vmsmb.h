@@ -475,6 +475,7 @@ struct vmsmb_file_ctx {
 	struct inode *inode;		/* back-pointer for break lookup; pinned by the open file */
 	struct list_head sess_node;	/* membership in sess->open_ctx_list */
 	struct work_struct oplock_break;
+	struct work_struct put_work;	/* runs the last put off vmsmb_put_wq */
 };
 
 /*
@@ -503,6 +504,9 @@ extern struct vmsmb_session *vmsmb_global_session;
 /* Inode cache */
 extern struct kmem_cache *vmsmb_inode_cachep;
 void vmsmb_init_once(void *data);
+
+/* Deferred tail of the last vmsmb_file_ctx_put() */
+extern struct workqueue_struct *vmsmb_put_wq;
 
 /* netfs integration */
 extern const struct netfs_request_ops vmsmb_netfs_ops;

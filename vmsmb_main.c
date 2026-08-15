@@ -18,6 +18,15 @@
 /* Global session (one VSMB channel per VM) */
 struct vmsmb_session *vmsmb_global_session;
 
+/*
+ * Runs the tail of a vmsmb_file_ctx_put() that its caller cannot run inline.
+ *
+ * Port of CIFS fileinfo_put_wq (fs/smb/client/cifsfs.c), same flags: unbound
+ * because the tail sleeps on an SMB2 CLOSE, and WQ_MEM_RECLAIM because it is
+ * reached from writeback.
+ */
+struct workqueue_struct *vmsmb_put_wq;
+
 /* VMBus device table */
 static const struct hv_vmbus_device_id vmsmb_id_table[] = {
 	{ .guid = HV_VSMB_GUID },
@@ -139,21 +148,31 @@ static int __init vmsmb_init(void)
 	if (!vmsmb_inode_cachep)
 		return -ENOMEM;
 
+	vmsmb_put_wq = alloc_workqueue("vmsmbfilectxput",
+				       WQ_UNBOUND | WQ_FREEZABLE | WQ_MEM_RECLAIM,
+				       0);
+	if (!vmsmb_put_wq) {
+		ret = -ENOMEM;
+		goto err_cache;
+	}
+
 	ret = vmbus_driver_register(&vmsmb_drv);
 	if (ret) {
 		pr_err("vmbus driver register failed: %d\n", ret);
-		goto err_cache;
+		goto err_wq;
 	}
 
 	ret = register_filesystem(&vmsmb_fs_type);
 	if (ret) {
 		pr_err("register_filesystem failed: %d\n", ret);
 		vmbus_driver_unregister(&vmsmb_drv);
-		goto err_cache;
+		goto err_wq;
 	}
 
 	return 0;
 
+err_wq:
+	destroy_workqueue(vmsmb_put_wq);
 err_cache:
 	kmem_cache_destroy(vmsmb_inode_cachep);
 	return ret;
@@ -162,6 +181,8 @@ err_cache:
 static void __exit vmsmb_exit(void)
 {
 	unregister_filesystem(&vmsmb_fs_type);
+	/* A deferred tail sends an SMB2 CLOSE, so drain before the session goes. */
+	destroy_workqueue(vmsmb_put_wq);
 	vmbus_driver_unregister(&vmsmb_drv);
 	kmem_cache_destroy(vmsmb_inode_cachep);
 	pr_info("unloaded\n");

@@ -62,6 +62,7 @@ static void vmsmb_unregister_open_ctx(struct inode *inode,
 					      struct vmsmb_file_ctx *ctx);
 static int vmsmb_flush(struct file *file, fl_owner_t id);
 static void vmsmb_oplock_break_work(struct work_struct *work);
+static void vmsmb_file_ctx_put_work(struct work_struct *work);
 
 /* Inode cache */
 struct kmem_cache *vmsmb_inode_cachep;
@@ -1007,6 +1008,7 @@ static int vmsmb_atomic_open(struct inode *dir, struct dentry *dentry,
 	ihold(inode);		/* pinned for the ctx lifetime (break work) */
 	INIT_LIST_HEAD(&ctx->sess_node);
 	INIT_WORK(&ctx->oplock_break, vmsmb_oplock_break_work);
+	INIT_WORK(&ctx->put_work, vmsmb_file_ctx_put_work);
 	file->private_data = ctx;
 	vmsmb_register_open_ctx(inode, ctx);
 
@@ -1871,6 +1873,50 @@ static char *vmsmb_inode_path(struct inode *inode)
 }
 
 /*
+ * What the last put has to do: close the handle on the server, release the
+ * inode, free the ctx.
+ *
+ * Port of CIFS cifsFileInfo_put_final() (fs/smb/client/file.c).
+ */
+static void vmsmb_file_ctx_put_final(struct vmsmb_file_ctx *ctx)
+{
+	vmsmb_smb2_close(ctx->sess, ctx->tree_id, &ctx->fid);
+	iput(ctx->inode);
+	kfree(ctx);
+}
+
+/*
+ * Port of CIFS cifsFileInfo_put_work() (fs/smb/client/file.c).
+ */
+static void vmsmb_file_ctx_put_work(struct work_struct *work)
+{
+	struct vmsmb_file_ctx *ctx =
+		container_of(work, struct vmsmb_file_ctx, put_work);
+
+	vmsmb_file_ctx_put_final(ctx);
+}
+
+/*
+ * @offload: hand the tail to vmsmb_put_wq rather than running it here.  The
+ * tail sleeps on an SMB2 CLOSE and can drop the last reference to the inode,
+ * so a caller that must not sleep, or that is itself unwinding the I/O an
+ * eviction would wait for, has to defer it.
+ *
+ * Port of the offload argument of CIFS _cifsFileInfo_put()
+ * (fs/smb/client/file.c).
+ */
+static void __vmsmb_file_ctx_put(struct vmsmb_file_ctx *ctx, bool offload)
+{
+	if (!refcount_dec_and_test(&ctx->ref))
+		return;
+
+	if (offload)
+		queue_work(vmsmb_put_wq, &ctx->put_work);
+	else
+		vmsmb_file_ctx_put_final(ctx);
+}
+
+/*
  * Drop a reference on a file ctx.  When the last reference goes away,
  * send the deferred SMB2 CLOSE and free the ctx.
  *
@@ -1889,11 +1935,7 @@ static char *vmsmb_inode_path(struct inode *inode)
  */
 static void vmsmb_file_ctx_put(struct vmsmb_file_ctx *ctx)
 {
-	if (refcount_dec_and_test(&ctx->ref)) {
-		vmsmb_smb2_close(ctx->sess, ctx->tree_id, &ctx->fid);
-		iput(ctx->inode);
-		kfree(ctx);
-	}
+	__vmsmb_file_ctx_put(ctx, false);
 }
 
 static void vmsmb_register_open_ctx(struct inode *inode,
@@ -2482,6 +2524,7 @@ static int vmsmb_file_open(struct inode *inode, struct file *file)
 	ihold(inode);		/* pinned for the ctx lifetime (break work) */
 	INIT_LIST_HEAD(&ctx->sess_node);
 	INIT_WORK(&ctx->oplock_break, vmsmb_oplock_break_work);
+	INIT_WORK(&ctx->put_work, vmsmb_file_ctx_put_work);
 
 	file->private_data = ctx;
 	vmsmb_register_open_ctx(inode, ctx);
