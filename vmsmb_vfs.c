@@ -2082,15 +2082,18 @@ static int vmsmb_init_request(struct netfs_io_request *rreq, struct file *file)
  * netfs free_request hook — drop the request-level ctx ref taken either in
  * init_request (file-backed I/O) or begin_writeback (handle-less writeback).
  *
- * Port of CIFS cifs_free_request() (fs/smb/client/file.c).  Last ref
- * drop sends the deferred SMB2 CLOSE and frees the ctx.
+ * The tail goes to vmsmb_put_wq because netfs still counts this request
+ * against the inode: an inline iput() that evicted the inode would wait in
+ * netfs_wait_for_outstanding_io() for the very request being torn down here.
+ *
+ * Port of CIFS cifs_free_request() (fs/smb/client/file.c).
  */
 static void vmsmb_free_request(struct netfs_io_request *rreq)
 {
 	struct vmsmb_file_ctx *ctx = rreq->netfs_priv;
 
 	if (ctx)
-		vmsmb_file_ctx_put(ctx);
+		__vmsmb_file_ctx_put(ctx, true);
 }
 
 /*
@@ -3942,6 +3945,13 @@ static int vmsmb_init_fs_context(struct fs_context *fc)
 static void vmsmb_kill_sb(struct super_block *sb)
 {
 	struct vmsmb_sb_info *sbi = sb->s_fs_info;
+
+	/*
+	 * An offloaded tail still holds an inode reference and still has a
+	 * CLOSE to send, so it has to finish before this superblock evicts
+	 * its inodes and before the tree connect goes away.
+	 */
+	flush_workqueue(vmsmb_put_wq);
 
 	kill_anon_super(sb);
 
