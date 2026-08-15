@@ -92,6 +92,8 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_drop_nlink` | **Ported** from CIFS `cifs_drop_nlink()` | Identical: drops one link under `i_lock`, saturating at zero |
 | `vmsmb_rmdir` | **Ported** from CIFS `cifs_rmdir` | Uses `DELETE_ON_CLOSE`; CIFS uses `SET_INFO FileDispositionInfo` |
 | `vmsmb_rename` | **Ported** from CIFS `cifs_rename2` | Calls `vmsmb_smb2_rename()`, supports `RENAME_NOREPLACE` |
+| `vmsmb_silly_rename` | **Ported** from CIFS `cifs_rename2()` busy-destination path / `smb2_rename_pending_delete()` | Same move-aside-then-delete-pending shape; separate requests because vmusrv ends a compound at its first SET_INFO |
+| `vmsmb_silly_path` | **Simplified** from CIFS `cifs_silly_fullpath()` | Counter only; no dentry walk, the caller retries on collision |
 | `vmsmb_link` | **Ported** from CIFS `cifs_hardlink()` | `d_drop()` + `inc_nlink()` under `i_lock` |
 | `vmsmb_symlink` | **Simplified** from CIFS `cifs_symlink()` | Calls `vmsmb_smb2_create_symlink()`; host denies in practice |
 | `vmsmb_get_link` | **Ported** from CIFS `cifs_get_link()` | Returns cached symlink target via `set_delayed_call` |

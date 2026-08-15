@@ -1169,15 +1169,127 @@ static int vmsmb_rmdir(struct inode *dir, struct dentry *dentry)
 }
 
 /*
+ * Prefix for the name a destination is given while it waits for its last
+ * handle to close.
+ *
+ * Port of CIFS_SILLYNAME_PREFIX (fs/smb/client/cifsfs.h).
+ */
+#define VMSMB_SILLY_PREFIX	".__vsmb_silly_"
+
+static atomic_t vmsmb_silly_counter = ATOMIC_INIT(0);
+
+/*
+ * Build a sibling of @path under a silly name.
+ *
+ * Port of CIFS cifs_silly_fullpath() (fs/smb/client/dir.c), which walks the
+ * parent dentry and looks each candidate up until one is free; the paths
+ * here are plain strings and the caller retries, so the counter is all that
+ * is left of it.  It only has to keep apart the names that exist at one
+ * time, and each is removed as soon as the file under it is closed.
+ *
+ * Paths here are share-relative with forward slashes and no leading one, so
+ * everything before the last separator is the parent, and a name directly
+ * under the share root has no separator at all.
+ */
+static char *vmsmb_silly_path(const char *path)
+{
+	const char *sep = strrchr(path, '/');
+	unsigned int seq = atomic_inc_return(&vmsmb_silly_counter);
+
+	if (sep)
+		return kasprintf(GFP_KERNEL, "%.*s/" VMSMB_SILLY_PREFIX "%08x",
+				 (int)(sep - path), path, seq);
+
+	return kasprintf(GFP_KERNEL, VMSMB_SILLY_PREFIX "%08x", seq);
+}
+
+/*
+ * Replace @new_path while something still holds it open, by moving the
+ * destination out of the way first -- the manoeuvre upstream calls a silly
+ * rename.
+ *
+ * NT refuses to let a rename replace an open file, but not to rename one, so
+ * the destination is moved to a name of ours, the caller's rename reissued
+ * against the freed name, and the moved-aside name marked for deletion.  The
+ * server drops that name once its last handle closes; until then whoever
+ * holds the file goes on reading the bytes it had, which is what POSIX
+ * promises.  A holder that did not grant share-delete blocks the first
+ * rename, and nothing has moved by then.
+ *
+ * Port of CIFS cifs_rename2()'s busy-destination path (fs/smb/client/
+ * inode.c), which performs the same manoeuvre through
+ * __cifs_unlink(sillyrename) -> smb2_rename_pending_delete()
+ * (fs/smb/client/smb2inode.c); those are one function here because only the
+ * rename site needs them.
+ *
+ * Upstream renames and marks for deletion inside one compound; vmusrv stops
+ * continuing a chain at its first SET_INFO, so the two are separate requests
+ * here and the deletion waits until the reissued rename has succeeded, which
+ * is what keeps @new_path recoverable when it has not.
+ *
+ * @old_target: the inode losing its name, for the link count
+ */
+static int vmsmb_silly_rename(struct vmsmb_session *sess, u32 tree_id,
+			      const char *old_path, const char *new_path,
+			      struct inode *old_target)
+{
+	char *silly = NULL;
+	int tries, ret = -EEXIST;
+
+	/* A silly name is only ever taken by one left behind by a crash. */
+	for (tries = 0; tries < 3 && ret == -EEXIST; tries++) {
+		kfree(silly);
+		silly = vmsmb_silly_path(new_path);
+		if (!silly)
+			return -ENOMEM;
+
+		ret = vmsmb_smb2_rename(sess, tree_id, new_path, silly, false);
+	}
+	if (ret) {
+		kfree(silly);
+		return -EBUSY;
+	}
+
+	ret = vmsmb_smb2_rename(sess, tree_id, old_path, new_path, true);
+	if (ret) {
+		if (vmsmb_smb2_rename(sess, tree_id, silly, new_path, false))
+			pr_warn_ratelimited("rename %s -> %s failed; the old destination is left as %s\n",
+					    old_path, new_path, silly);
+		kfree(silly);
+		return ret;
+	}
+
+	vmsmb_drop_nlink(old_target);
+
+	if (vmsmb_smb2_unlink(sess, tree_id, silly) == -EACCES) {
+		FILE_BASIC_INFO binfo = {
+			.Attributes = cpu_to_le32(FILE_ATTRIBUTE_NORMAL),
+		};
+
+		/*
+		 * A read-only file cannot be marked for deletion.  Nothing
+		 * reads these attributes again, so clearing all of them is
+		 * enough to let the delete through.
+		 */
+		vmsmb_smb2_set_basic_info(sess, tree_id, silly, &binfo);
+		if (vmsmb_smb2_unlink(sess, tree_id, silly))
+			pr_warn_ratelimited("replaced %s but left %s behind\n",
+					    new_path, silly);
+	}
+
+	kfree(silly);
+	return 0;
+}
+
+/*
  * Rename/move a file or directory.
  *
  * Port of CIFS cifs_rename2() (fs/smb/client/inode.c): delegates to
  * vmsmb_smb2_rename() which issues CREATE(DELETE)+SET_INFO(rename)+CLOSE,
  * with RENAME_NOREPLACE inverting the ReplaceIfExists field, and carries
- * over its unlink-then-retry fallback -- NT refuses to let a rename
- * replace a destination that is a directory object, so on EACCES/EEXIST
- * a directory destination is removed and the rename reissued, which makes
- * replacing one non-atomic.
+ * over its fallback for the destinations NT will not let a rename replace:
+ * a directory object is removed first and one that is merely open is moved
+ * aside, either of which makes replacing it non-atomic.
  */
 static int vmsmb_rename(struct mnt_idmap *idmap,
 			struct inode *old_dir, struct dentry *old_dentry,
@@ -1214,32 +1326,38 @@ static int vmsmb_rename(struct mnt_idmap *idmap,
 	 * before FILE_ATTRIBUTE_DIRECTORY), so it takes the unlink path and
 	 * only the link is removed.
 	 *
-	 * A plain file destination is never removed: NT refuses one only when
-	 * it is still open, and removing it would destroy the very data the
-	 * rename was asked to overwrite, so that becomes -EBUSY.
+	 * A plain file destination is refused only while it is still open, so
+	 * it is moved aside rather than removed, which leaves its data intact
+	 * for whoever still holds it.
 	 */
 	if (replace && (ret == -EACCES || ret == -EEXIST) &&
 	    d_really_is_positive(new_dentry)) {
-		int tmpret;
+		if (d_is_dir(new_dentry) || d_is_symlink(new_dentry)) {
+			int tmpret;
 
-		if (d_is_dir(new_dentry))
-			tmpret = vmsmb_smb2_rmdir(sess, sbi->tree_id, new_path);
-		else if (d_is_symlink(new_dentry))
-			tmpret = vmsmb_smb2_unlink(sess, sbi->tree_id, new_path);
-		else
-			tmpret = -EBUSY;
+			if (d_is_dir(new_dentry))
+				tmpret = vmsmb_smb2_rmdir(sess, sbi->tree_id,
+							  new_path);
+			else
+				tmpret = vmsmb_smb2_unlink(sess, sbi->tree_id,
+							   new_path);
 
-		/*
-		 * Both the refusal above and a non-empty directory
-		 * destination, which surfaces as EEXIST or ENOTEMPTY, are
-		 * reported in place of the rename's own EACCES.
-		 */
-		if (tmpret == -EBUSY || tmpret == -EEXIST ||
-		    tmpret == -ENOTEMPTY)
-			ret = tmpret;
-		else if (!tmpret)
-			ret = vmsmb_smb2_rename(sess, sbi->tree_id, old_path,
-						new_path, replace);
+			/*
+			 * A non-empty directory destination surfaces as
+			 * EEXIST or ENOTEMPTY, and is reported in place of
+			 * the rename's own EACCES.
+			 */
+			if (tmpret == -EEXIST || tmpret == -ENOTEMPTY)
+				ret = tmpret;
+			else if (!tmpret)
+				ret = vmsmb_smb2_rename(sess, sbi->tree_id,
+							old_path, new_path,
+							replace);
+		} else {
+			ret = vmsmb_silly_rename(sess, sbi->tree_id,
+						 old_path, new_path,
+						 d_inode(new_dentry));
+		}
 	}
 
 	kfree(old_path);
