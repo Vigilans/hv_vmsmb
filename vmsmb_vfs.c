@@ -46,6 +46,12 @@
 #define VMSMB_DIR_ACCESS	(FILE_READ_DATA | FILE_READ_ATTRIBUTES | \
 				 GENERIC_READ)
 
+/*
+ * Longest symlink target that still fits one reparse point once it is stored
+ * twice as UTF-16 (CIFS REPARSE_SYM_PATH_MAX, fs/smb/client/reparse.h).
+ */
+#define VMSMB_REPARSE_SYM_PATH_MAX	4060
+
 /* Inode number counter */
 static atomic64_t vmsmb_ino_counter = ATOMIC64_INIT(2);
 
@@ -1642,14 +1648,91 @@ static int vmsmb_detect_directory_target(struct vmsmb_sb_info *sbi,
 }
 
 /*
+ * Spell a symlink target the way the server stores it.
+ *
+ * Port of the target conversion in CIFS create_native_symlink()
+ * (fs/smb/client/reparse.c).  Upstream converts and builds the payload in one
+ * function; the conversion needs symlinkroot off the superblock, which the
+ * SMB2 layer never sees, so it stays here and vmsmb_smb2_create_symlink()
+ * takes the result.
+ *
+ * A relative target is already in the stored form.  An absolute one has a
+ * stored form only if it names something the server can reach: symlinkroot
+ * declares where the local drives are mounted, so {symlinkroot}/x/... is the
+ * one absolute shape that maps onto drive X:.  Any other absolute target is
+ * refused.  Without symlinkroot no mapping is declared and an absolute target
+ * keeps its own spelling under the NT object prefix.
+ *
+ * Returns the NT-form target and sets @relative for the reparse flag.
+ */
+static char *vmsmb_symlink_target_to_nt(struct vmsmb_sb_info *sbi,
+					const char *target, bool *relative)
+{
+	const char *symroot = sbi->symlinkroot;
+	const char *rest;
+	size_t symroot_len;
+	char drive_letter, *nt_target, *p;
+
+	if (strlen(target) > VMSMB_REPARSE_SYM_PATH_MAX)
+		return ERR_PTR(-ENAMETOOLONG);
+
+	*relative = target[0] != '/';
+
+	if (*relative) {
+		nt_target = kstrdup(target, GFP_KERNEL);
+		if (!nt_target)
+			return ERR_PTR(-ENOMEM);
+	} else if (!symroot) {
+		nt_target = kmalloc(4 + strlen(target), GFP_KERNEL);
+		if (!nt_target)
+			return ERR_PTR(-ENOMEM);
+		memcpy(nt_target, "\\??\\", 4);
+		strcpy(nt_target + 4, target + 1);
+	} else {
+		if (!strstarts(target, symroot))
+			return ERR_PTR(-EINVAL);
+
+		symroot_len = strlen(symroot);
+		if (symroot[symroot_len - 1] == '/')
+			symroot_len--;
+
+		/* The component after symlinkroot is the lowercase drive. */
+		if (target[symroot_len] != '/')
+			return ERR_PTR(-EINVAL);
+		drive_letter = target[symroot_len + 1];
+		if (drive_letter < 'a' || drive_letter > 'z' ||
+		    (target[symroot_len + 2] != '/' &&
+		     target[symroot_len + 2] != '\0'))
+			return ERR_PTR(-EINVAL);
+
+		rest = target + symroot_len + 2;
+
+		nt_target = kmalloc(sizeof("\\??\\X:") + strlen(rest),
+				    GFP_KERNEL);
+		if (!nt_target)
+			return ERR_PTR(-ENOMEM);
+		memcpy(nt_target, "\\??\\", 4);
+		nt_target[4] = drive_letter - ('a' - 'A');
+		nt_target[5] = ':';
+		strcpy(nt_target + 6, rest);
+	}
+
+	for (p = nt_target; *p; p++)
+		if (*p == '/')
+			*p = '\\';
+
+	return nt_target;
+}
+
+/*
  * Create a symlink.
  *
  * Port of CIFS cifs_symlink() (fs/smb/client/cifsfs.c) reparse-point path:
  * create the file then IOCTL(SET_REPARSE_POINT) to install the symlink
  * target. See vmsmb_smb2_create_symlink() for the wire format.
  *
- * Note: VSMB host currently denies FSCTL_SET_REPARSE_POINT with
- * STATUS_ACCESS_DENIED (0xC0000022), so this will fail in practice.
+ * The host denies FSCTL_SET_REPARSE_POINT while its IsAdmin gate is closed
+ * (see README.md).
  */
 static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 			  struct dentry *dentry, const char *target)
@@ -1659,22 +1742,31 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	struct vmsmb_fid fid;
 	struct vmsmb_file_info info;
 	struct inode *inode;
-	char *path;
+	char *path, *nt_target;
 	bool directory = false;
+	bool relative;
 	int ret;
 
 	path = vmsmb_build_path(dentry);
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 
+	nt_target = vmsmb_symlink_target_to_nt(sbi, target, &relative);
+	if (IS_ERR(nt_target)) {
+		kfree(path);
+		return PTR_ERR(nt_target);
+	}
+
 	ret = vmsmb_detect_directory_target(sbi, path, target, &directory);
 	if (ret) {
+		kfree(nt_target);
 		kfree(path);
 		return ret;
 	}
 
-	ret = vmsmb_smb2_create_symlink(sess, sbi->tree_id, path, target,
-					directory);
+	ret = vmsmb_smb2_create_symlink(sess, sbi->tree_id, path, nt_target,
+					relative, directory);
+	kfree(nt_target);
 
 	if (ret) {
 		kfree(path);

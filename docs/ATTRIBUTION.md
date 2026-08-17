@@ -56,7 +56,7 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_smb2_unlink` | **Ported** from CIFS `smb2_unlink()` | Same flags: `DELETE_ON_CLOSE \| OPEN_REPARSE_POINT` |
 | IOCTL | **Simplified** from CIFS `SMB2_ioctl()` | Single synchronous round-trip, no compound/async/credit |
 | `vmsmb_smb2_get_reparse` | **Ported** from CIFS `smb2_query_reparse_point()` | Same flags, separate CREATE+IOCTL+CLOSE |
-| `vmsmb_smb2_create_symlink` | **Simplified** from CIFS `create_native_symlink()` | No symlinkroot, directory detection, or xattr contexts |
+| `vmsmb_smb2_create_symlink` | **Ported** from CIFS `create_native_symlink()` payload build | Same PrintName/SubstituteName layout, with the `\??\` NT prefix kept only in SubstituteName; no compound requests or xattr contexts |
 | `vmsmb_smb2_queryfs` | **Simplified** from CIFS `smb2_queryfs()` | QUERY_INFO InfoType=FILESYSTEM, FileInfoClass=FS_FULL_SIZE_INFORMATION on share root; CIFS uses compound CREATE+QUERY+CLOSE, we use three round-trips |
 | `vmsmb_smb2_set_basic_info` | **Simplified** from CIFS `smb2_set_file_info_compound()` | SET_INFO InfoType=FILE, FileInfoClass=FILE_BASIC_INFORMATION; 2-PDU `CREATE+SET_INFO(final)` compound plus standalone CLOSE because vmusrv requires SET_INFO to be terminal |
 | `vmsmb_smb2_set_eof` | **Simplified** from CIFS `smb2_set_file_size()` | SET_INFO InfoType=FILE, FileInfoClass=FILE_END_OF_FILE_INFORMATION; same 2-PDU terminal SET_INFO compound plus standalone CLOSE shape |
@@ -95,7 +95,8 @@ projects use GPL-2.0-compatible licenses.
 | `vmsmb_silly_rename` | **Ported** from CIFS `cifs_rename2()` busy-destination path / `smb2_rename_pending_delete()` | Same move-aside-then-delete-pending shape; separate requests because vmusrv ends a compound at its first SET_INFO |
 | `vmsmb_silly_path` | **Simplified** from CIFS `cifs_silly_fullpath()` | Counter only; no dentry walk, the caller retries on collision |
 | `vmsmb_link` | **Ported** from CIFS `cifs_hardlink()` | `d_drop()` + `inc_nlink()` under `i_lock` |
-| `vmsmb_symlink` | **Simplified** from CIFS `cifs_symlink()` | Calls `vmsmb_smb2_create_symlink()`; host denies in practice |
+| `vmsmb_symlink` | **Simplified** from CIFS `cifs_symlink()` | Calls `vmsmb_symlink_target_to_nt()` then `vmsmb_smb2_create_symlink()` |
+| `vmsmb_symlink_target_to_nt` | **Ported** from CIFS `create_native_symlink()` target conversion | Same `{symlinkroot}/x/...` to `\??\X:\...` mapping, and `-EINVAL` for any other absolute target; upstream's masking of the NT prefix across the UTF-16 conversion is not needed here |
 | `vmsmb_get_link` | **Ported** from CIFS `cifs_get_link()` | Returns cached symlink target via `set_delayed_call` |
 | `vmsmb_fill_inode` (reparse) | **Ported** from CIFS `cifs_reparse_point_to_fattr()` | `FILE_ATTRIBUTE_REPARSE_POINT` → `S_IFLNK` |
 | `vmsmb_parse_reparse` | **Ported** from CIFS `smb2_parse_native_symlink()` + `parse_reparse_wsl_symlink()` | Same NT prefix stripping (`\??\`, `\DosDevices\`, `\GLOBAL??\`), `GLOBALROOT` chaining, `Global\` prefix, drive-letter translation under `symlinkroot`. `IO_REPARSE_TAG_LX_SYMLINK` reads the version-2 UTF-8 target directly, without upstream's UTF-16 round trip; skips NFS/AF_UNIX tags |

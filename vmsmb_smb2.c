@@ -1701,8 +1701,9 @@ int vmsmb_smb2_get_reparse(struct vmsmb_session *sess, u32 tree_id,
  * Create a symlink via NTFS reparse point.
  *
  * Simplified from CIFS create_native_symlink() (fs/smb/client/reparse.c).
- * CIFS handles symlinkroot mapping, compound requests, and xattr
- * contexts. We do: CREATE → IOCTL(SET_REPARSE_POINT) → CLOSE.
+ * CIFS handles compound requests and xattr contexts; the target reaches
+ * here already in NT form from vmsmb_symlink_target_to_nt().  We do:
+ * CREATE → IOCTL(SET_REPARSE_POINT) → CLOSE.
  *
  * The directory/file selection follows CIFS smb2_create_reparse_inode()
  * (fs/smb/client/smb2inode.c): a symlink to a directory and one to a file
@@ -1712,64 +1713,50 @@ int vmsmb_smb2_get_reparse(struct vmsmb_session *sess, u32 tree_id,
  * (Windows <SYMLINKD>, FILE_ATTRIBUTE_DIRECTORY set), CREATE_NOT_DIR a
  * file one (<SYMLINK>).
  *
- * Note: VSMB host currently denies FSCTL_SET_REPARSE_POINT with
- * STATUS_ACCESS_DENIED (0xC0000022) for both Linux and Windows guests.
+ * The host denies FSCTL_SET_REPARSE_POINT while its IsAdmin gate is closed
+ * (see README.md).
  */
 int vmsmb_smb2_create_symlink(struct vmsmb_session *sess, u32 tree_id,
-			       const char *path, const char *target,
-			       bool directory)
+			       const char *path, const char *nt_target,
+			       bool relative, bool directory)
 {
 	struct vmsmb_fid fid;
 	struct reparse_symlink_data_buffer *sym;
 	__le16 *target_utf16;
 	int target_utf16_len;
+	u16 slen, plen, poff;
 	u32 sym_len;
-	bool relative;
+	int tlen;
 	int ret;
-	char *nt_target;
-	int i, tlen;
-
-	/* Determine relative vs absolute */
-	relative = (target[0] != '/');
-
-	/* Build NT-style target path */
-	tlen = strlen(target);
-	if (!relative) {
-		/* Absolute: prepend \??\ */
-		nt_target = kmalloc(4 + tlen + 1, GFP_KERNEL);
-		if (!nt_target)
-			return -ENOMEM;
-		memcpy(nt_target, "\\??\\", 4);
-		memcpy(nt_target + 4, target + 1, tlen); /* skip leading / */
-		tlen = 4 + tlen - 1;
-		nt_target[tlen] = '\0';
-	} else {
-		nt_target = kmalloc(tlen + 1, GFP_KERNEL);
-		if (!nt_target)
-			return -ENOMEM;
-		memcpy(nt_target, target, tlen + 1);
-	}
-
-	/* Convert / to \ */
-	for (i = 0; i < tlen; i++)
-		if (nt_target[i] == '/')
-			nt_target[i] = '\\';
 
 	/* UTF-8 → UTF-16LE */
+	tlen = strlen(nt_target);
 	target_utf16 = kmalloc((tlen + 1) * sizeof(__le16), GFP_KERNEL);
-	if (!target_utf16) {
-		kfree(nt_target);
+	if (!target_utf16)
 		return -ENOMEM;
-	}
 
 	target_utf16_len = utf8s_to_utf16s(nt_target, tlen, UTF16_LITTLE_ENDIAN,
 					    (wchar_t *)target_utf16, tlen + 1);
-	kfree(nt_target);
 	if (target_utf16_len < 0) {
 		kfree(target_utf16);
 		return -EINVAL;
 	}
-	target_utf16_len *= sizeof(__le16);
+
+	/*
+	 * SubstituteName is the name the object manager resolves and PrintName
+	 * the one shown to users, so an absolute target keeps the "\??\" NT
+	 * object prefix in the first and drops it from the second.  poff counts
+	 * that prefix in UTF-16 units, while plen and slen are byte lengths.
+	 *
+	 * Port of the layout in CIFS create_native_symlink()
+	 * (fs/smb/client/reparse.c).  Upstream masks that prefix across its
+	 * UTF-16 conversion because cifs_convert_path_to_utf16() drops a
+	 * leading backslash and rewrites '?' and ':'; utf8s_to_utf16s() does
+	 * neither, so the string converts as-is.
+	 */
+	slen = target_utf16_len * sizeof(__le16);
+	poff = relative ? 0 : 4;
+	plen = slen - 2 * poff;
 
 	/* CREATE new file or directory to carry the reparse point */
 	ret = vmsmb_smb2_create(sess, tree_id, path,
@@ -1783,12 +1770,7 @@ int vmsmb_smb2_create_symlink(struct vmsmb_session *sess, u32 tree_id,
 		return ret;
 	}
 
-	/*
-	 * Build reparse_symlink_data_buffer.
-	 * SubstituteName and PrintName are identical, placed sequentially
-	 * in PathBuffer.
-	 */
-	sym_len = sizeof(*sym) + 2 * target_utf16_len;
+	sym_len = sizeof(*sym) + plen + slen;
 	sym = kzalloc(sym_len, GFP_KERNEL);
 	if (!sym) {
 		kfree(target_utf16);
@@ -1797,15 +1779,18 @@ int vmsmb_smb2_create_symlink(struct vmsmb_session *sess, u32 tree_id,
 	}
 
 	sym->ReparseTag = cpu_to_le32(IO_REPARSE_TAG_SYMLINK);
-	sym->ReparseDataLength = cpu_to_le16(12 + 2 * target_utf16_len);
-	sym->SubstituteNameOffset = cpu_to_le16(0);
-	sym->SubstituteNameLength = cpu_to_le16(target_utf16_len);
-	sym->PrintNameOffset = cpu_to_le16(target_utf16_len);
-	sym->PrintNameLength = cpu_to_le16(target_utf16_len);
-	sym->Flags = cpu_to_le32(relative ? SYMLINK_FLAG_RELATIVE : 0);
+	sym->ReparseDataLength =
+		cpu_to_le16(sym_len - sizeof(struct reparse_data_buffer));
 
-	memcpy(sym->PathBuffer, target_utf16, target_utf16_len);
-	memcpy(sym->PathBuffer + target_utf16_len, target_utf16, target_utf16_len);
+	sym->SubstituteNameOffset = cpu_to_le16(plen);
+	sym->SubstituteNameLength = cpu_to_le16(slen);
+	memcpy(sym->PathBuffer + plen, target_utf16, slen);
+
+	sym->PrintNameOffset = 0;
+	sym->PrintNameLength = cpu_to_le16(plen);
+	memcpy(sym->PathBuffer, target_utf16 + poff, plen);
+
+	sym->Flags = cpu_to_le32(relative ? SYMLINK_FLAG_RELATIVE : 0);
 	kfree(target_utf16);
 
 	ret = vmsmb_smb2_ioctl(sess, tree_id, &fid, FSCTL_SET_REPARSE_POINT,
