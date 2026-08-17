@@ -12,6 +12,7 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
+#include <linux/rwsem.h>
 #include <linux/wait.h>
 #include <linux/atomic.h>
 #include <linux/refcount.h>
@@ -431,6 +432,18 @@ struct vmsmb_session {
 };
 
 /*
+ * One drive under symlinkroot, and the canonical path it resolves to.
+ *
+ * A drive entry is commonly a symlink to the drive's mount point, so a program
+ * that resolves a path before writing it as a link target names the canonical
+ * path instead of the symlinkroot spelling.  Both have to reach the drive.
+ */
+struct vmsmb_drive_alias {
+	char *path;	/* canonical directory, no trailing slash */
+	char letter;	/* lowercase drive letter */
+};
+
+/*
  * Superblock private data.
  */
 struct vmsmb_sb_info {
@@ -443,6 +456,9 @@ struct vmsmb_sb_info {
 	umode_t dir_mode;	/* permission bits for directories */
 	bool noperm;		/* skip VFS permission checks */
 	char *symlinkroot;	/* mount option: translate Windows abs symlinks to {symlinkroot}/x/... */
+	struct vmsmb_drive_alias *drive_aliases;	/* canonical form of each {symlinkroot}/x */
+	unsigned int drive_alias_count;
+	struct rw_semaphore symlinkroot_lock;	/* guards symlinkroot and drive_aliases together */
 	unsigned long actimeo;	/* metadata cache TTL in jiffies (mount option, default 1s) */
 	bool oplocks;		/* request LEVEL_II oplocks for coherence (default on; nooplock disables) */
 	bool brl;		/* mount option: send fcntl byte-range locks to the server (default off = guest-local advisory) */

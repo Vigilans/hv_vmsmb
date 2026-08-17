@@ -643,8 +643,10 @@ static int vmsmb_reparse_info_to_inode(struct vmsmb_sb_info *sbi,
 			return ret;
 		}
 
+		down_read(&sbi->symlinkroot_lock);
 		target = vmsmb_parse_reparse(reparse_buf, reparse_len,
 					     sbi->symlinkroot);
+		up_read(&sbi->symlinkroot_lock);
 		kfree(reparse_buf);
 		if (IS_ERR(target))
 			return PTR_ERR(target);
@@ -1663,15 +1665,27 @@ static int vmsmb_detect_directory_target(struct vmsmb_sb_info *sbi,
  * refused.  Without symlinkroot no mapping is declared and an absolute target
  * keeps its own spelling under the NT object prefix.
  *
- * Returns the NT-form target and sets @relative for the reparse flag.
+ * A drive alias names the same drive by its canonical path, so it maps the
+ * same way; @linux_target then carries the {symlinkroot}/x spelling, which is
+ * what the inode has to hold for readlink to keep agreeing with the target
+ * re-read from the server after the inode is evicted.
+ *
+ * Runs under sbi->symlinkroot_lock.  Returns the NT-form target, sets
+ * @relative for the reparse flag, and hands out @linux_target for the caller
+ * to own.
  */
 static char *vmsmb_symlink_target_to_nt(struct vmsmb_sb_info *sbi,
-					const char *target, bool *relative)
+					const char *target, bool *relative,
+					char **linux_target)
 {
 	const char *symroot = sbi->symlinkroot;
+	const struct vmsmb_drive_alias *alias = NULL;
+	size_t symroot_len = 0, alias_len = 0;
 	const char *rest;
-	size_t symroot_len;
 	char drive_letter, *nt_target, *p;
+	unsigned int i;
+
+	*linux_target = NULL;
 
 	if (strlen(target) > VMSMB_REPARSE_SYM_PATH_MAX)
 		return ERR_PTR(-ENAMETOOLONG);
@@ -1682,19 +1696,41 @@ static char *vmsmb_symlink_target_to_nt(struct vmsmb_sb_info *sbi,
 		nt_target = kstrdup(target, GFP_KERNEL);
 		if (!nt_target)
 			return ERR_PTR(-ENOMEM);
-	} else if (!symroot) {
+		goto out;
+	}
+
+	if (!symroot) {
 		nt_target = kmalloc(4 + strlen(target), GFP_KERNEL);
 		if (!nt_target)
 			return ERR_PTR(-ENOMEM);
 		memcpy(nt_target, "\\??\\", 4);
 		strcpy(nt_target + 4, target + 1);
+		goto out;
+	}
+
+	/* The longest alias wins, and it has to end on a component boundary. */
+	for (i = 0; i < sbi->drive_alias_count; i++) {
+		size_t len = strlen(sbi->drive_aliases[i].path);
+
+		if (len <= alias_len ||
+		    strncmp(target, sbi->drive_aliases[i].path, len))
+			continue;
+		if (target[len] != '/' && target[len] != '\0')
+			continue;
+		alias = &sbi->drive_aliases[i];
+		alias_len = len;
+	}
+
+	symroot_len = strlen(symroot);
+	if (symroot[symroot_len - 1] == '/')
+		symroot_len--;
+
+	if (alias) {
+		drive_letter = alias->letter;
+		rest = target + alias_len;
 	} else {
 		if (!strstarts(target, symroot))
 			return ERR_PTR(-EINVAL);
-
-		symroot_len = strlen(symroot);
-		if (symroot[symroot_len - 1] == '/')
-			symroot_len--;
 
 		/* The component after symlinkroot is the lowercase drive. */
 		if (target[symroot_len] != '/')
@@ -1706,20 +1742,41 @@ static char *vmsmb_symlink_target_to_nt(struct vmsmb_sb_info *sbi,
 			return ERR_PTR(-EINVAL);
 
 		rest = target + symroot_len + 2;
-
-		nt_target = kmalloc(sizeof("\\??\\X:") + strlen(rest),
-				    GFP_KERNEL);
-		if (!nt_target)
-			return ERR_PTR(-ENOMEM);
-		memcpy(nt_target, "\\??\\", 4);
-		nt_target[4] = drive_letter - ('a' - 'A');
-		nt_target[5] = ':';
-		strcpy(nt_target + 6, rest);
 	}
 
+	nt_target = kmalloc(sizeof("\\??\\X:") + strlen(rest), GFP_KERNEL);
+	if (!nt_target)
+		return ERR_PTR(-ENOMEM);
+	memcpy(nt_target, "\\??\\", 4);
+	nt_target[4] = drive_letter - ('a' - 'A');
+	nt_target[5] = ':';
+	strcpy(nt_target + 6, rest);
+
+	if (alias) {
+		*linux_target = kmalloc(symroot_len + 3 + strlen(rest),
+					GFP_KERNEL);
+		if (!*linux_target) {
+			kfree(nt_target);
+			return ERR_PTR(-ENOMEM);
+		}
+		memcpy(*linux_target, symroot, symroot_len);
+		(*linux_target)[symroot_len] = '/';
+		(*linux_target)[symroot_len + 1] = drive_letter;
+		strcpy(*linux_target + symroot_len + 2, rest);
+	}
+
+out:
 	for (p = nt_target; *p; p++)
 		if (*p == '/')
 			*p = '\\';
+
+	if (!*linux_target) {
+		*linux_target = kstrdup(target, GFP_KERNEL);
+		if (!*linux_target) {
+			kfree(nt_target);
+			return ERR_PTR(-ENOMEM);
+		}
+	}
 
 	return nt_target;
 }
@@ -1742,7 +1799,7 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	struct vmsmb_fid fid;
 	struct vmsmb_file_info info;
 	struct inode *inode;
-	char *path, *nt_target;
+	char *path, *nt_target, *linux_target;
 	bool directory = false;
 	bool relative;
 	int ret;
@@ -1751,7 +1808,10 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 
-	nt_target = vmsmb_symlink_target_to_nt(sbi, target, &relative);
+	down_read(&sbi->symlinkroot_lock);
+	nt_target = vmsmb_symlink_target_to_nt(sbi, target, &relative,
+					       &linux_target);
+	up_read(&sbi->symlinkroot_lock);
 	if (IS_ERR(nt_target)) {
 		kfree(path);
 		return PTR_ERR(nt_target);
@@ -1759,6 +1819,7 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 
 	ret = vmsmb_detect_directory_target(sbi, path, target, &directory);
 	if (ret) {
+		kfree(linux_target);
 		kfree(nt_target);
 		kfree(path);
 		return ret;
@@ -1769,6 +1830,7 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	kfree(nt_target);
 
 	if (ret) {
+		kfree(linux_target);
 		kfree(path);
 		return ret;
 	}
@@ -1784,22 +1846,22 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 
 	if (ret == 0) {
 		/*
-		 * Hand on the target we were asked to create, as CIFS
-		 * create_native_symlink() (fs/smb/client/reparse.c) seeds it
-		 * into the open info it passes to cifs_get_inode_info(): the
-		 * string is already known, so reading the reparse point back
-		 * would only confirm it.  Everything downstream of that --
-		 * reconciling the string against the type the server reported,
-		 * and sizing the link by it -- is then the same code lookup
-		 * runs, and the two paths agree by construction.
+		 * Hand on the target in the form a later read back produces,
+		 * as CIFS create_native_symlink() (fs/smb/client/reparse.c)
+		 * seeds the created target into the open info it passes to
+		 * cifs_get_inode_info(): the string is already known, so
+		 * reading the reparse point back would only confirm it.
+		 * Everything downstream of that -- reconciling the string
+		 * against the type the server reported, and sizing the link by
+		 * it -- is then the same code lookup runs, and the two paths
+		 * agree by construction.
 		 */
-		info.symlink_target = kstrdup(target, GFP_KERNEL);
-		if (info.symlink_target)
-			ret = vmsmb_reparse_info_to_inode(sbi, path, &info);
-		else
-			ret = -ENOMEM;
+		info.symlink_target = linux_target;
+		linux_target = NULL;
+		ret = vmsmb_reparse_info_to_inode(sbi, path, &info);
 	}
 
+	kfree(linux_target);
 	kfree(path);
 
 	if (ret)
@@ -3680,8 +3742,10 @@ static int vmsmb_show_options(struct seq_file *s, struct dentry *root)
 	seq_printf(s, ",dir_mode=0%o", sbi->dir_mode);
 	if (sbi->noperm)
 		seq_puts(s, ",noperm");
+	down_read(&sbi->symlinkroot_lock);
 	if (sbi->symlinkroot)
 		seq_show_option(s, "symlinkroot", sbi->symlinkroot);
+	up_read(&sbi->symlinkroot_lock);
 	seq_printf(s, ",actimeo=%lu", sbi->actimeo / HZ);
 	seq_puts(s, sbi->oplocks ? ",oplock" : ",nooplock");
 	seq_puts(s, sbi->brl ? ",brl" : ",nobrl");
@@ -3882,6 +3946,109 @@ static int vmsmb_parse_param(struct fs_context *fc,
 }
 
 /*
+ * Release a canonical drive alias table.
+ */
+static void vmsmb_free_drive_aliases(struct vmsmb_drive_alias *aliases,
+				     unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++)
+		kfree(aliases[i].path);
+	kfree(aliases);
+}
+
+/*
+ * Record the canonical path of each drive under symlinkroot.
+ *
+ * A drive entry under symlinkroot is commonly a symlink to the drive's mount
+ * point, so a program that resolves a path before writing it as a link target
+ * names the mount point, which no longer starts with symlinkroot.  Resolving
+ * each letter here records that other spelling.  Only a letter that resolves
+ * elsewhere earns a slot, and a directory reached by two letters is ambiguous,
+ * so the later letter is dropped.
+ *
+ * This runs in ->get_tree(), while the mounting process's namespace is current
+ * and before the new mount is attached; ->symlink() is entered with the parent
+ * directory locked and cannot do the lookups.  Only the strings are kept, so
+ * the table holds no mount reference and still serves a target whose own tail
+ * does not exist yet.
+ */
+static int vmsmb_build_drive_aliases(const char *symroot,
+				     struct vmsmb_drive_alias **out,
+				     unsigned int *out_count)
+{
+	struct vmsmb_drive_alias *aliases;
+	unsigned int count = 0, i;
+	char *probe = NULL, *buf = NULL;
+	size_t symroot_len;
+	char letter;
+	int ret = 0;
+
+	*out = NULL;
+	*out_count = 0;
+
+	if (!symroot)
+		return 0;
+
+	symroot_len = strlen(symroot);
+	if (symroot[symroot_len - 1] == '/')
+		symroot_len--;
+
+	aliases = kcalloc(26, sizeof(*aliases), GFP_KERNEL);
+	probe = kmalloc(symroot_len + 3, GFP_KERNEL);
+	buf = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!aliases || !probe || !buf) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	memcpy(probe, symroot, symroot_len);
+	probe[symroot_len] = '/';
+	probe[symroot_len + 2] = '\0';
+
+	for (letter = 'a'; letter <= 'z'; letter++) {
+		const char *canon;
+		struct path path;
+
+		probe[symroot_len + 1] = letter;
+		if (kern_path(probe, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &path))
+			continue;
+
+		canon = d_path(&path, buf, PATH_MAX);
+		path_put(&path);
+		if (IS_ERR(canon) || canon[0] != '/' || !strcmp(canon, probe))
+			continue;
+
+		for (i = 0; i < count; i++)
+			if (!strcmp(aliases[i].path, canon))
+				break;
+		if (i < count)
+			continue;
+
+		aliases[count].path = kstrdup(canon, GFP_KERNEL);
+		if (!aliases[count].path) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		aliases[count].letter = letter;
+		count++;
+	}
+
+	if (count) {
+		*out = aliases;
+		*out_count = count;
+		aliases = NULL;
+		count = 0;
+	}
+out:
+	vmsmb_free_drive_aliases(aliases, count);
+	kfree(probe);
+	kfree(buf);
+	return ret;
+}
+
+/*
  * fs_context get_tree: validate state, materialize sbi from the parsed
  * context, then hand off to get_tree_nodev + vmsmb_fill_super.
  *
@@ -3911,6 +4078,7 @@ static int vmsmb_get_tree(struct fs_context *fc)
 		return -ENOMEM;
 
 	sbi->sess = sess;
+	init_rwsem(&sbi->symlinkroot_lock);
 
 	/* Apply parsed mount options, with defaults */
 	sbi->uid = ctx->uid_set ? ctx->uid : current_fsuid();
@@ -3937,8 +4105,18 @@ static int vmsmb_get_tree(struct fs_context *fc)
 	sbi->symlinkroot = ctx->symlinkroot;
 	ctx->symlinkroot = NULL;
 
+	ret = vmsmb_build_drive_aliases(sbi->symlinkroot, &sbi->drive_aliases,
+					&sbi->drive_alias_count);
+	if (ret) {
+		kfree(sbi->symlinkroot);
+		kfree(sbi);
+		return ret;
+	}
+
 	sbi->share_name = kstrdup(dev_name, GFP_KERNEL);
 	if (!sbi->share_name) {
+		vmsmb_free_drive_aliases(sbi->drive_aliases,
+					 sbi->drive_alias_count);
 		kfree(sbi->symlinkroot);
 		kfree(sbi);
 		return -ENOMEM;
@@ -3951,6 +4129,8 @@ static int vmsmb_get_tree(struct fs_context *fc)
 	if (ret) {
 		pr_err("TREE_CONNECT '%s' failed: %d\n", dev_name, ret);
 		kfree(sbi->share_name);
+		vmsmb_free_drive_aliases(sbi->drive_aliases,
+					 sbi->drive_alias_count);
 		kfree(sbi->symlinkroot);
 		kfree(sbi);
 		return ret;
@@ -3983,6 +4163,21 @@ static int vmsmb_reconfigure(struct fs_context *fc)
 {
 	struct vmsmb_fs_context *ctx = fc->fs_private;
 	struct vmsmb_sb_info *sbi = VMSMB_SB(fc->root->d_sb);
+	struct vmsmb_drive_alias *aliases = NULL;
+	unsigned int alias_count = 0;
+	int ret;
+
+	/*
+	 * A new symlinkroot and the aliases resolved from it have to become
+	 * visible together, and the lookups sleep, so resolve them up front
+	 * and outside the lock the readers take.
+	 */
+	if (ctx->symlinkroot) {
+		ret = vmsmb_build_drive_aliases(ctx->symlinkroot, &aliases,
+						&alias_count);
+		if (ret)
+			return ret;
+	}
 
 	if (ctx->uid_set)
 		sbi->uid = ctx->uid;
@@ -4004,11 +4199,22 @@ static int vmsmb_reconfigure(struct fs_context *fc)
 	if (ctx->brl_set)
 		sbi->brl = ctx->brl;
 	if (ctx->symlinkroot) {
-		char *old = sbi->symlinkroot;
+		struct vmsmb_drive_alias *old_aliases;
+		unsigned int old_count;
+		char *old_root;
 
+		down_write(&sbi->symlinkroot_lock);
+		old_root = sbi->symlinkroot;
+		old_aliases = sbi->drive_aliases;
+		old_count = sbi->drive_alias_count;
 		sbi->symlinkroot = ctx->symlinkroot;
+		sbi->drive_aliases = aliases;
+		sbi->drive_alias_count = alias_count;
+		up_write(&sbi->symlinkroot_lock);
+
 		ctx->symlinkroot = NULL;
-		kfree(old);
+		kfree(old_root);
+		vmsmb_free_drive_aliases(old_aliases, old_count);
 	}
 
 	return 0;
@@ -4066,6 +4272,8 @@ static void vmsmb_kill_sb(struct super_block *sb)
 		if (sbi->sess && sbi->tree_id)
 			vmsmb_smb2_tree_disconnect(sbi->sess, sbi->tree_id);
 		kfree(sbi->share_name);
+		vmsmb_free_drive_aliases(sbi->drive_aliases,
+					 sbi->drive_alias_count);
 		kfree(sbi->symlinkroot);
 		kfree(sbi);
 	}
