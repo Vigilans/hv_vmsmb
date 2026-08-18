@@ -1930,6 +1930,95 @@ close:
 }
 
 /*
+ * Ask the server where this share's root sits on the host volume.
+ *
+ * Upstream has no counterpart: nothing in fs/smb/client reads the FileName
+ * that FILE_ALL_INFORMATION carries.  It is needed here because an absolute
+ * symlink target names a place on the volume while a CREATE names a place
+ * inside the share, so neither can be stated in the other's terms until the
+ * share root is known.  Despite the field's name, what arrives is a whole
+ * volume-relative path in NT form: backslash separators, a leading
+ * backslash, no drive letter.
+ *
+ * FILE_NAME_INFORMATION, the level named for exactly this, is answered with
+ * STATUS_NOT_SUPPORTED, so the path comes from the level that carries it
+ * alongside everything else.
+ *
+ * Sets *@out only on success; the caller owns the string.
+ */
+int vmsmb_smb2_query_share_root_path(struct vmsmb_session *sess, u32 tree_id,
+				     char **out)
+{
+	const u32 name_off = offsetof(struct smb2_file_all_info, FileName);
+	const struct smb2_file_all_info *all_info;
+	struct vmsmb_file_info info;
+	struct vmsmb_fid fid;
+	const void *rsp_out;
+	u8 *resp_buf;
+	u32 rsp_out_len, name_len;
+	char *path;
+	int ret;
+
+	ret = vmsmb_smb2_create(sess, tree_id, "", FILE_READ_ATTRIBUTES,
+				FILE_OPEN, 0, NULL, &fid, &info);
+	if (ret)
+		return ret;
+
+	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
+	if (!resp_buf) {
+		ret = -ENOMEM;
+		goto close;
+	}
+
+	ret = vmsmb_smb2_query_info(sess, tree_id, &fid, SMB2_O_INFO_FILE,
+				    FILE_ALL_INFORMATION,
+				    VMSMB_MAX_RESPONSE -
+				    sizeof(struct smb2_query_info_rsp),
+				    "QUERY_INFO(root path)", resp_buf,
+				    VMSMB_MAX_RESPONSE, &rsp_out, &rsp_out_len);
+	if (ret)
+		goto free_resp;
+
+	all_info = rsp_out;
+	if (rsp_out_len < name_off) {
+		ret = -EPROTO;
+		goto free_resp;
+	}
+
+	name_len = le32_to_cpu(all_info->FileNameLength);
+	if (name_len % sizeof(__le16) ||
+	    name_len > rsp_out_len - name_off) {
+		ret = -EPROTO;
+		goto free_resp;
+	}
+
+	/* Worst case is three UTF-8 bytes per UTF-16 unit. */
+	path = kmalloc(name_len / sizeof(__le16) * 3 + 1, GFP_KERNEL);
+	if (!path) {
+		ret = -ENOMEM;
+		goto free_resp;
+	}
+
+	ret = utf16s_to_utf8s((const wchar_t *)all_info->FileName,
+			      name_len / sizeof(__le16), UTF16_LITTLE_ENDIAN,
+			      path, name_len / sizeof(__le16) * 3);
+	if (ret < 0) {
+		kfree(path);
+		goto free_resp;
+	}
+
+	path[ret] = '\0';
+	*out = path;
+	ret = 0;
+
+free_resp:
+	kfree(resp_buf);
+close:
+	vmsmb_smb2_close(sess, tree_id, &fid);
+	return ret;
+}
+
+/*
  * SMB2 CREATE + SET_INFO 2-PDU compound — vmusrv requires SET_INFO to be
  * the terminal PDU in a compound chain.  SrvContinueSetInfo aliases the
  * response descriptor onto the request descriptor and truncates the

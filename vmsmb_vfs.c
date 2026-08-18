@@ -1552,33 +1552,91 @@ static bool vmsmb_collapse_path(char *path)
 }
 
 /*
+ * Restate an NT-form absolute target as a path inside this share.
+ *
+ * Upstream has no counterpart: CIFS detect_directory_symlink_target()
+ * (fs/smb/client/reparse.c) declares every absolute target undeterminable and
+ * stops.  Going further is possible here because the share reports where its
+ * root sits on the host volume, so a target under that root can be restated
+ * in the share-relative form a CREATE accepts.
+ *
+ * The drive letter is dropped rather than checked, because the server names
+ * the share root without one.  A target on another drive whose path also
+ * exists under this share root therefore probes the wrong object; choosing
+ * the wrong reparse type is the whole of that.
+ *
+ * Returns a pointer into @nt_target, or NULL for a target this share cannot
+ * name.
+ */
+static const char *vmsmb_share_relative_target(struct vmsmb_sb_info *sbi,
+					       const char *nt_target)
+{
+	const char *root = sbi->share_root_nt;
+	const char *rest;
+	size_t root_len;
+
+	if (!root)
+		return NULL;
+
+	/* \??\X: is the only absolute form vmsmb_symlink_target_to_nt() emits. */
+	if (strncmp(nt_target, "\\??\\", 4) || nt_target[4] < 'A' ||
+	    nt_target[4] > 'Z' || nt_target[5] != ':')
+		return NULL;
+
+	rest = nt_target + 6;
+
+	/* A share rooted at the volume root is named "\" and strips nothing. */
+	root_len = strlen(root);
+	if (root_len == 1 && root[0] == '\\')
+		root_len = 0;
+
+	if (root_len) {
+		/* The server spells the root canonically; NTFS is case-blind. */
+		if (strncasecmp(rest, root, root_len))
+			return NULL;
+		if (rest[root_len] != '\\' && rest[root_len] != '\0')
+			return NULL;
+		rest += root_len;
+	}
+
+	while (*rest == '\\')
+		rest++;
+
+	return rest;
+}
+
+/*
  * Decide whether a symlink target names a directory.
  *
  * Port of CIFS detect_directory_symlink_target() (fs/smb/client/reparse.c):
  * the type has to be chosen when the link is created, but Linux symlink(2)
- * only supplies a target string.  Three stages, in cost order:
+ * only supplies a target string.  The free answer first, then the two ways of
+ * naming the target to the server:
  *
  *   1. the target's last component is empty (trailing slash), "." or ".."
  *      → certainly a directory, no server round-trip;
- *   2. the target is absolute → undeterminable here, treat as file;
- *   3. otherwise resolve it against the link's parent, collapse the result,
- *      and probe the server with CREATE(CREATE_NOT_FILE); ENOTDIR settles it
- *      as a file, ENOENT leaves a dangling link as a file, and anything else
- *      falls back to a second CREATE(CREATE_NOT_DIR) probe whose EISDIR
- *      settles it as a directory.  A target that resolves outside the share
- *      is undeterminable, like an absolute one.
+ *   2. an absolute target is restated relative to the share root;
+ *   3. a relative target is resolved against the link's parent.
  *
- * An undeterminable target is not an error: it leaves *directory false,
- * matching upstream.
+ * Stages 2 and 3 both end at a share-relative path, which is collapsed and
+ * then probed with CREATE(CREATE_NOT_FILE); ENOTDIR settles it as a file,
+ * ENOENT leaves a dangling link as a file, and anything else falls back to a
+ * second CREATE(CREATE_NOT_DIR) probe whose EISDIR settles it as a directory.
+ *
+ * A target that cannot be named inside the share is undeterminable, which is
+ * not an error: it leaves *directory false, matching upstream.  Upstream
+ * stops at stage 1 for every absolute target, having no way to place one.
  */
 static int vmsmb_detect_directory_target(struct vmsmb_sb_info *sbi,
 					 const char *full_path,
-					 const char *target, bool *directory)
+					 const char *target,
+					 const char *nt_target,
+					 bool *directory)
 {
 	struct vmsmb_session *sess = sbi->sess;
 	const char *basename;
-	char *resolved_path, *path_sep;
-	int full_path_len, target_len, basename_len;
+	char *resolved_path;
+	int basename_len;
 	int ret;
 
 	/*
@@ -1593,30 +1651,44 @@ static int vmsmb_detect_directory_target(struct vmsmb_sb_info *sbi,
 		return 0;
 	}
 
-	/* Absolute targets leave the share, so the server cannot resolve them. */
-	if (target[0] == '/')
-		return 0;
+	if (target[0] == '/') {
+		const char *rel = vmsmb_share_relative_target(sbi, nt_target);
+		char *p;
 
-	full_path_len = strlen(full_path);
-	target_len = strlen(target);
+		if (!rel)
+			return 0;
 
-	resolved_path = kzalloc(full_path_len + target_len + 1, GFP_KERNEL);
-	if (!resolved_path)
-		return -ENOMEM;
+		resolved_path = kstrdup(rel, GFP_KERNEL);
+		if (!resolved_path)
+			return -ENOMEM;
 
-	/* Splice the relative target onto the link's parent directory. */
-	memcpy(resolved_path, full_path, full_path_len + 1);
-	path_sep = strrchr(resolved_path, '/');
-	if (path_sep)
-		path_sep++;
-	else
-		path_sep = resolved_path;
-	memcpy(path_sep, target, target_len + 1);
+		for (p = resolved_path; *p; p++)
+			if (*p == '\\')
+				*p = '/';
+	} else {
+		int full_path_len = strlen(full_path);
+		int target_len = strlen(target);
+		char *path_sep;
+
+		resolved_path = kzalloc(full_path_len + target_len + 1,
+					GFP_KERNEL);
+		if (!resolved_path)
+			return -ENOMEM;
+
+		/* Splice the relative target onto the link's parent directory. */
+		memcpy(resolved_path, full_path, full_path_len + 1);
+		path_sep = strrchr(resolved_path, '/');
+		if (path_sep)
+			path_sep++;
+		else
+			path_sep = resolved_path;
+		memcpy(path_sep, target, target_len + 1);
+	}
 
 	/*
-	 * The server resolves a CREATE path literally, so the spliced-in "."
-	 * and ".." have to be gone before it is sent.  A target that walks
-	 * above the share root is as undeterminable here as an absolute one.
+	 * The server resolves a CREATE path literally, so "." and ".." have to
+	 * be gone before it is sent.  A path that walks above the share root
+	 * names nothing this client can ask the server about.
 	 */
 	if (!vmsmb_collapse_path(resolved_path)) {
 		kfree(resolved_path);
@@ -1817,7 +1889,8 @@ static int vmsmb_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		return PTR_ERR(nt_target);
 	}
 
-	ret = vmsmb_detect_directory_target(sbi, path, target, &directory);
+	ret = vmsmb_detect_directory_target(sbi, path, target, nt_target,
+					    &directory);
 	if (ret) {
 		kfree(linux_target);
 		kfree(nt_target);
@@ -4136,6 +4209,17 @@ static int vmsmb_get_tree(struct fs_context *fc)
 		return ret;
 	}
 
+	/*
+	 * Where the share root sits on the host volume, so that an absolute
+	 * symlink target can be named inside the share.  A server that will
+	 * not say leaves those targets undeterminable, which is the symlink
+	 * type probe's own fallback, so the mount goes ahead without it.
+	 */
+	ret = vmsmb_smb2_query_share_root_path(sess, sbi->tree_id,
+					       &sbi->share_root_nt);
+	if (ret)
+		sbi->share_root_nt = NULL;
+
 	fc->s_fs_info = sbi;
 
 	return get_tree_nodev(fc, vmsmb_fill_super);
@@ -4272,6 +4356,7 @@ static void vmsmb_kill_sb(struct super_block *sb)
 		if (sbi->sess && sbi->tree_id)
 			vmsmb_smb2_tree_disconnect(sbi->sess, sbi->tree_id);
 		kfree(sbi->share_name);
+		kfree(sbi->share_root_nt);
 		vmsmb_free_drive_aliases(sbi->drive_aliases,
 					 sbi->drive_alias_count);
 		kfree(sbi->symlinkroot);

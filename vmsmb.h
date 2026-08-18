@@ -450,6 +450,7 @@ struct vmsmb_sb_info {
 	struct vmsmb_session *sess;
 	char *share_name;
 	u32 tree_id;
+	char *share_root_nt;	/* share root on the host volume, NT form, fixed at mount; NULL when the server would not say */
 	kuid_t uid;		/* owner uid for all inodes (mount-time) */
 	kgid_t gid;		/* owner gid for all inodes (mount-time) */
 	umode_t file_mode;	/* permission bits for files */
@@ -612,6 +613,8 @@ int vmsmb_smb2_create_symlink(struct vmsmb_session *sess, u32 tree_id,
 struct smb2_fs_full_size_info;
 int vmsmb_smb2_queryfs(struct vmsmb_session *sess, u32 tree_id,
 		       struct smb2_fs_full_size_info *out);
+int vmsmb_smb2_query_share_root_path(struct vmsmb_session *sess, u32 tree_id,
+				     char **out);
 int vmsmb_smb2_set_basic_info(struct vmsmb_session *sess, u32 tree_id,
 			      const char *path,
 			      const FILE_BASIC_INFO *binfo);
