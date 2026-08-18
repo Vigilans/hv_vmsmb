@@ -1812,6 +1812,72 @@ close:
 }
 
 /*
+ * SMB2 QUERY_INFO on an open handle.
+ *
+ * Port of CIFS query_info() (fs/smb/client/smb2pdu.c).  Upstream assembles
+ * the request into an smb_rqst/kvec and copies the answer into a buffer it
+ * sizes from the caller's minimum, allocating one when the caller has none.
+ * Ours takes the response buffer from the caller and reports where in it the
+ * server placed the output, because a caller reading a fixed-size structure
+ * and one reading a variable-length name need different checks on the same
+ * reply.
+ */
+static int vmsmb_smb2_query_info(struct vmsmb_session *sess, u32 tree_id,
+				 const struct vmsmb_fid *fid, u8 info_type,
+				 u8 info_class, u32 output_len,
+				 const char *cmd_name, u8 *resp_buf,
+				 u32 resp_buf_len, const void **out,
+				 u32 *out_len)
+{
+	struct smb2_query_info_req *req;
+	const struct smb2_query_info_rsp *rsp;
+	const struct smb2_hdr *hdr;
+	u32 resp_len, rsp_out_off, rsp_out_len;
+	int ret;
+
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	vmsmb_fill_hdr(&req->hdr, SMB2_QUERY_INFO_HE, sess, tree_id);
+	req->StructureSize = cpu_to_le16(41);
+	req->InfoType = info_type;
+	req->FileInfoClass = info_class;
+	req->OutputBufferLength = cpu_to_le32(output_len);
+	req->InputBufferOffset = 0;
+	req->InputBufferLength = 0;
+	req->AdditionalInformation = 0;
+	req->Flags = 0;
+	req->PersistentFileId = fid->persistent;
+	req->VolatileFileId = fid->volatile_id;
+
+	ret = vmsmb_smb2_transact(sess, req, sizeof(*req),
+				  resp_buf, resp_buf_len, &resp_len);
+	kfree(req);
+	if (ret)
+		return ret;
+
+	hdr = vmsmb_check_resp(resp_buf, resp_len);
+	if (!hdr)
+		return -EPROTO;
+
+	ret = vmsmb_check_status(hdr, cmd_name);
+	if (ret)
+		return ret;
+
+	rsp = (const struct smb2_query_info_rsp *)resp_buf;
+	rsp_out_off = le16_to_cpu(rsp->OutputBufferOffset);
+	rsp_out_len = le32_to_cpu(rsp->OutputBufferLength);
+
+	if (rsp_out_off + rsp_out_len > resp_len)
+		return -EPROTO;
+
+	*out = resp_buf + rsp_out_off;
+	*out_len = rsp_out_len;
+	return 0;
+}
+
+/*
  * SMB2 QUERY_INFO on filesystem — fetch FS_FULL_SIZE_INFORMATION.
  *
  * Simplified from CIFS SMB311_posix_qfs_info / smb2_queryfs
@@ -1823,11 +1889,9 @@ int vmsmb_smb2_queryfs(struct vmsmb_session *sess, u32 tree_id,
 {
 	struct vmsmb_fid fid;
 	struct vmsmb_file_info info;
-	struct smb2_query_info_req *req;
-	const struct smb2_query_info_rsp *rsp;
-	const struct smb2_hdr *hdr;
-	u8 *pdu_buf, *resp_buf;
-	u32 resp_len, rsp_out_off, rsp_out_len;
+	const void *rsp_out;
+	u8 *resp_buf;
+	u32 rsp_out_len;
 	int ret;
 
 	/* Open the share root with minimum access for FS info query */
@@ -1836,59 +1900,27 @@ int vmsmb_smb2_queryfs(struct vmsmb_session *sess, u32 tree_id,
 	if (ret)
 		return ret;
 
-	pdu_buf = kzalloc(sizeof(*req), GFP_KERNEL);
-	if (!pdu_buf) {
-		ret = -ENOMEM;
-		goto close;
-	}
-
 	resp_buf = kmalloc(VMSMB_MAX_RESPONSE, GFP_KERNEL);
 	if (!resp_buf) {
-		kfree(pdu_buf);
 		ret = -ENOMEM;
 		goto close;
 	}
 
-	req = (struct smb2_query_info_req *)pdu_buf;
-	vmsmb_fill_hdr(&req->hdr, SMB2_QUERY_INFO_HE, sess, tree_id);
-	req->StructureSize = cpu_to_le16(41);
-	req->InfoType = SMB2_O_INFO_FILESYSTEM;
-	req->FileInfoClass = FS_FULL_SIZE_INFORMATION;
-	req->OutputBufferLength = cpu_to_le32(sizeof(*out));
-	req->InputBufferOffset = 0;
-	req->InputBufferLength = 0;
-	req->AdditionalInformation = 0;
-	req->Flags = 0;
-	req->PersistentFileId = fid.persistent;
-	req->VolatileFileId = fid.volatile_id;
-
-	ret = vmsmb_smb2_transact(sess, pdu_buf, sizeof(*req),
-				  resp_buf, VMSMB_MAX_RESPONSE, &resp_len);
-	kfree(pdu_buf);
+	ret = vmsmb_smb2_query_info(sess, tree_id, &fid,
+				    SMB2_O_INFO_FILESYSTEM,
+				    FS_FULL_SIZE_INFORMATION, sizeof(*out),
+				    "QUERY_INFO(FS)", resp_buf,
+				    VMSMB_MAX_RESPONSE, &rsp_out,
+				    &rsp_out_len);
 	if (ret)
 		goto free_resp;
 
-	hdr = vmsmb_check_resp(resp_buf, resp_len);
-	if (!hdr) {
+	if (rsp_out_len < sizeof(*out)) {
 		ret = -EPROTO;
 		goto free_resp;
 	}
 
-	ret = vmsmb_check_status(hdr, "QUERY_INFO(FS)");
-	if (ret)
-		goto free_resp;
-
-	rsp = (const struct smb2_query_info_rsp *)resp_buf;
-	rsp_out_off = le16_to_cpu(rsp->OutputBufferOffset);
-	rsp_out_len = le32_to_cpu(rsp->OutputBufferLength);
-
-	if (rsp_out_len < sizeof(*out) ||
-	    rsp_out_off + rsp_out_len > resp_len) {
-		ret = -EPROTO;
-		goto free_resp;
-	}
-
-	memcpy(out, (const u8 *)resp_buf + rsp_out_off, sizeof(*out));
+	memcpy(out, rsp_out, sizeof(*out));
 
 free_resp:
 	kfree(resp_buf);

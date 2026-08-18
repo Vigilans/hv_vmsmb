@@ -57,6 +57,7 @@ projects use GPL-2.0-compatible licenses.
 | IOCTL | **Simplified** from CIFS `SMB2_ioctl()` | Single synchronous round-trip, no compound/async/credit |
 | `vmsmb_smb2_get_reparse` | **Ported** from CIFS `smb2_query_reparse_point()` | Same flags, separate CREATE+IOCTL+CLOSE |
 | `vmsmb_smb2_create_symlink` | **Ported** from CIFS `create_native_symlink()` payload build | Same PrintName/SubstituteName layout, with the `\??\` NT prefix kept only in SubstituteName; no compound requests or xattr contexts |
+| `vmsmb_smb2_query_info` | **Ported** from CIFS `query_info()` | Shared QUERY_INFO round-trip; the caller supplies the response buffer and receives the offset of the server output inside it, instead of upstream's smb_rqst/kvec pipeline and copy-out |
 | `vmsmb_smb2_queryfs` | **Simplified** from CIFS `smb2_queryfs()` | QUERY_INFO InfoType=FILESYSTEM, FileInfoClass=FS_FULL_SIZE_INFORMATION on share root; CIFS uses compound CREATE+QUERY+CLOSE, we use three round-trips |
 | `vmsmb_smb2_set_basic_info` | **Simplified** from CIFS `smb2_set_file_info_compound()` | SET_INFO InfoType=FILE, FileInfoClass=FILE_BASIC_INFORMATION; 2-PDU `CREATE+SET_INFO(final)` compound plus standalone CLOSE because vmusrv requires SET_INFO to be terminal |
 | `vmsmb_smb2_set_eof` | **Simplified** from CIFS `smb2_set_file_size()` | SET_INFO InfoType=FILE, FileInfoClass=FILE_END_OF_FILE_INFORMATION; same 2-PDU terminal SET_INFO compound plus standalone CLOSE shape |
