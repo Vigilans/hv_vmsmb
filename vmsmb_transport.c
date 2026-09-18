@@ -518,52 +518,63 @@ static void vmsmb_accumulate_grant(struct vmsmb_session *sess, u16 grant)
 }
 
 /*
- * Release a completed request: clear ALL mid_table slots written at
- * reserve time (one per PDU; chain wrote charge slots covering MIDs
- * [first..first+charge-1]), then if our first MID is at oldest_mid,
- * sweep oldest forward over consecutive NULLs and decrement mid_range_size.
+ * Retire @req's MID span from the credit transport.  Caller holds ct_lock.
  *
- * NOTE: clearing ALL slots (not just the first) is critical — for
- * compound chains (CC=1 per PDU but charge=N for an N-PDU chain) the
- * non-first slots also point at @req.  Leaving them with a stale
- * pointer to a stack-allocated request struct causes use-after-free
- * during the next vmsmb_grow_mid_table rehash (vmsmb_submit panic at
- * `mov rax, [rdi]` reading req->message_id from freed stack).
+ * Clears every mid_table slot the chain wrote at reserve time (one per
+ * PDU, covering MIDs [first..first+charge-1]; vmsmb_grow_mid_table
+ * rehashes whatever the table still points at, so no slot may keep a
+ * pointer to a retired request).  If @req sits at ct_oldest_mid, sweeps
+ * oldest forward over the run of already-cleared slots behind it and
+ * subtracts the whole swept span from ct_mid_range_size.  A request that
+ * completes out of order only clears its slots; its charge leaves the
+ * range when a later sweep crosses it.
  *
- * Same shape as vmsmb_unreserve, kept as a separate function because
- * release_mid additionally advances oldest_mid + drains pending_grant.
- *
- * Matches mrxsmb.sys credit release semantics.
+ * This is the only routine that advances ct_oldest_mid, so
+ * ct_mid_range_size == ct_next_mid - ct_oldest_mid holds across every
+ * release path (response and local rollback alike).  Mirrors
+ * mrxsmb.sys SmbCeApplyCreditGrantAndRelease, the single MID-release
+ * routine there.
  */
-static void vmsmb_release_mid(struct vmsmb_session *sess,
-			      struct vmsmb_request *req)
+static void vmsmb_release_slots_locked(struct vmsmb_session *sess,
+				       struct vmsmb_request *req)
 {
 	u64 mid;
 	u32 i, freed;
 
-	spin_lock(&sess->ct_lock);
-
-	/* Clear all slots this chain claimed at reserve time. */
 	for (i = 0; i < req->credit_charge; i++) {
 		mid = req->message_id + i;
 		if (sess->ct_mid_table[mid % sess->ct_max_credits] == req)
 			sess->ct_mid_table[mid % sess->ct_max_credits] = NULL;
 	}
 
-	if (req->message_id == sess->ct_oldest_mid) {
-		mid = req->message_id + req->credit_charge;
-		freed = req->credit_charge;
-		while (mid < sess->ct_next_mid &&
-		       sess->ct_mid_table[mid % sess->ct_max_credits] == NULL) {
-			mid++;
-			freed++;
-		}
-		sess->ct_oldest_mid = mid;
-		if (sess->ct_mid_range_size >= freed)
-			sess->ct_mid_range_size -= freed;
-		else
-			sess->ct_mid_range_size = 0;
+	if (req->message_id != sess->ct_oldest_mid)
+		return;
+
+	mid = req->message_id + req->credit_charge;
+	freed = req->credit_charge;
+	while (mid < sess->ct_next_mid &&
+	       sess->ct_mid_table[mid % sess->ct_max_credits] == NULL) {
+		mid++;
+		freed++;
 	}
+	sess->ct_oldest_mid = mid;
+	if (sess->ct_mid_range_size >= freed)
+		sess->ct_mid_range_size -= freed;
+	else
+		sess->ct_mid_range_size = 0;
+}
+
+/*
+ * Response-side release: retire the MID span, feed the response latency
+ * into the target_window EWMA, fold pending grants and wake senders.
+ * Called from channel_cb (softirq).
+ */
+static void vmsmb_release_mid(struct vmsmb_session *sess,
+			      struct vmsmb_request *req)
+{
+	spin_lock(&sess->ct_lock);
+
+	vmsmb_release_slots_locked(sess, req);
 
 	/*
 	 * EWMA latency feedback -> target_window adaptation.
@@ -591,10 +602,10 @@ static void vmsmb_release_mid(struct vmsmb_session *sess,
  * Rollback for local send-failure (vmbus_sendpacket -EAGAIN exhausted /
  * post-reserve OOM) and sync-transact timeout.  Atomically claims
  * ownership of @req via the same -EINPROGRESS → sentinel transition
- * that channel_cb uses, then clears all chain slots and decrements
- * mid_range_size.  If channel_cb already claimed the request (status was
- * something other than -EINPROGRESS at lock entry), we exit without
- * touching anything — channel_cb's complete_req path will run
+ * that channel_cb uses, then retires the MID span through
+ * vmsmb_release_slots_locked.  If channel_cb already claimed the request
+ * (status was something other than -EINPROGRESS at lock entry), we exit
+ * without touching anything — channel_cb's complete_req path will run
  * release_mid normally.
  *
  * Returns true if we successfully unreserved (caller may treat the
@@ -604,8 +615,6 @@ static void vmsmb_release_mid(struct vmsmb_session *sess,
 static bool vmsmb_unreserve(struct vmsmb_session *sess,
 			    struct vmsmb_request *req)
 {
-	u64 mid;
-	u32 i;
 	bool claimed;
 
 	spin_lock_bh(&sess->ct_lock);
@@ -617,23 +626,7 @@ static bool vmsmb_unreserve(struct vmsmb_session *sess,
 	}
 	req->status = -ETIMEDOUT;	/* mark unreserve-side claim */
 
-	/* Clear all slots this chain wrote (one per PDU; v1 CC=1). */
-	for (i = 0; i < req->credit_charge; i++) {
-		mid = req->message_id + i;
-		if (sess->ct_mid_table[mid % sess->ct_max_credits] == req)
-			sess->ct_mid_table[mid % sess->ct_max_credits] = NULL;
-	}
-
-	if (sess->ct_mid_range_size >= req->credit_charge)
-		sess->ct_mid_range_size -= req->credit_charge;
-	else
-		sess->ct_mid_range_size = 0;
-
-	/* Advance oldest_mid past now-empty leading slots. */
-	while (sess->ct_oldest_mid < sess->ct_next_mid &&
-	       sess->ct_mid_table[sess->ct_oldest_mid %
-				  sess->ct_max_credits] == NULL)
-		sess->ct_oldest_mid++;
+	vmsmb_release_slots_locked(sess, req);
 
 	spin_unlock_bh(&sess->ct_lock);
 	wake_up(&sess->ct_send_wait);
