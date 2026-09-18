@@ -74,6 +74,44 @@ static void vmsmb_async_work(struct work_struct *work)
 }
 
 /*
+ * Completion callbacks, run by vmsmb_release_mid under ct_lock once the
+ * MID span is retired (CIFS mid->callback: cifs_wake_up_task for a sync
+ * waiter, the business callback for async, cifs_cancelled_callback once
+ * the waiter has gone).  Holding ct_lock across the call orders the
+ * completion against the sync waiter's timeout path, which tests
+ * completion_done() under the same lock before swapping the callback.
+ */
+static void vmsmb_wake_up_waiter(struct vmsmb_request *req)
+{
+	complete(&req->done);
+}
+
+static void vmsmb_queue_async_cb(struct vmsmb_request *req)
+{
+	INIT_WORK(&req->work, vmsmb_async_work);
+	queue_work(system_unbound_wq, &req->work);
+}
+
+static void vmsmb_discard_work(struct work_struct *work)
+{
+	struct vmsmb_request *req = container_of(work, struct vmsmb_request, work);
+
+	kvfree(req->response_buf);
+	kfree(req);
+}
+
+/*
+ * Installed by vmsmb_smb2_transact when its waiter times out.  The server
+ * still owns the MessageId, so the request stays registered and is freed
+ * by the response that eventually retires its span.
+ */
+static void vmsmb_discard_response(struct vmsmb_request *req)
+{
+	INIT_WORK(&req->work, vmsmb_discard_work);
+	queue_work(system_unbound_wq, &req->work);
+}
+
+/*
  * SMB2 credit accounting — walks the (possibly compound) PDU chain in @buf
  * and sums CreditCharge (request side) or CreditRequest (response side).
  *
@@ -566,8 +604,9 @@ static void vmsmb_release_slots_locked(struct vmsmb_session *sess,
 
 /*
  * Response-side release: retire the MID span, feed the response latency
- * into the target_window EWMA, fold pending grants and wake senders.
- * Called from channel_cb (softirq).
+ * into the target_window EWMA, fold pending grants, run the completion
+ * callback and wake senders.  Called from channel_cb (softirq).  @req
+ * may be freed by its callback and must not be touched afterwards.
  */
 static void vmsmb_release_mid(struct vmsmb_session *sess,
 			      struct vmsmb_request *req)
@@ -593,6 +632,7 @@ static void vmsmb_release_mid(struct vmsmb_session *sess,
 	}
 
 	vmsmb_fold_pending_locked(sess);
+	req->callback(req);
 	spin_unlock(&sess->ct_lock);
 
 	wake_up(&sess->ct_send_wait);
@@ -600,53 +640,38 @@ static void vmsmb_release_mid(struct vmsmb_session *sess,
 
 /*
  * Rollback for local send-failure (vmbus_sendpacket -EAGAIN exhausted /
- * post-reserve OOM) and sync-transact timeout.  Atomically claims
- * ownership of @req via the same -EINPROGRESS → sentinel transition
- * that channel_cb uses, then retires the MID span through
- * vmsmb_release_slots_locked.  If channel_cb already claimed the request
- * (status was something other than -EINPROGRESS at lock entry), we exit
- * without touching anything — channel_cb's complete_req path will run
- * release_mid normally.
- *
- * Returns true if we successfully unreserved (caller may treat the
- * request as failed); false if a response was concurrently received
- * (caller should fall through and consume the response).
+ * post-reserve OOM): the PDU never reached the wire, so no response can
+ * retire the span.  Atomically claims ownership of @req via the same
+ * -EINPROGRESS → sentinel transition that channel_cb uses, then retires
+ * the MID span through vmsmb_release_slots_locked.  If channel_cb already
+ * claimed the request (status was something other than -EINPROGRESS at
+ * lock entry), we exit without touching anything — channel_cb's
+ * complete_req path will run release_mid normally.
  */
-static bool vmsmb_unreserve(struct vmsmb_session *sess,
+static void vmsmb_unreserve(struct vmsmb_session *sess,
 			    struct vmsmb_request *req)
 {
-	bool claimed;
-
 	spin_lock_bh(&sess->ct_lock);
 
-	claimed = (req->status == -EINPROGRESS);
-	if (!claimed) {
+	if (req->status != -EINPROGRESS) {
 		spin_unlock_bh(&sess->ct_lock);
-		return false;
+		return;
 	}
-	req->status = -ETIMEDOUT;	/* mark unreserve-side claim */
+	req->status = -ECANCELED;	/* mark unreserve-side claim */
 
 	vmsmb_release_slots_locked(sess, req);
 
 	spin_unlock_bh(&sess->ct_lock);
 	wake_up(&sess->ct_send_wait);
-	return true;
 }
 
 /*
  * Called from channel_cb (softirq) when a response for @req is complete.
- * Routes to either the sync completion (wakes wait_for_completion_timeout)
- * or the async workqueue (runs async_cb in process context).
  *
- * Before signaling, walks the response PDU chain and adds the granted
- * credits back to the session pool, waking any blocked senders.  This is
- * the protocol-correct mirror of vmsmb_acquire_credits() on send.
- *
- * Simplified from CIFS handle_mid() dispatch (fs/smb/client/connect.c):
- * CIFS invokes a uniform mid->callback(mid) — sync mids register
- * cifs_wake_up_task, async mids register the business callback. We collapse
- * that to a boolean (async_cb set / unset) since the sync path here always
- * wakes via struct completion.
+ * Walks the response PDU chain and adds the granted credits back to the
+ * session pool, then hands @req to vmsmb_release_mid, which retires its
+ * MID span and runs req->callback (CIFS handle_mid() → mid->callback,
+ * fs/smb/client/connect.c).
  */
 static inline void vmsmb_complete_req(struct vmsmb_request *req)
 {
@@ -663,17 +688,7 @@ static inline void vmsmb_complete_req(struct vmsmb_request *req)
 				       vmsmb_walk_pdu_grants(smb2, smb2_len));
 	}
 
-	/* Release mid_table slot + sweep oldest_mid forward + decrement
-	 * mid_range_size.  Must run before completing the waiter so a sender
-	 * woken by ct_send_wait sees the updated state. */
 	vmsmb_release_mid(req->sess, req);
-
-	if (req->async_cb) {
-		INIT_WORK(&req->work, vmsmb_async_work);
-		queue_work(system_unbound_wq, &req->work);
-	} else {
-		complete(&req->done);
-	}
 }
 
 /*
@@ -777,14 +792,9 @@ static void vmsmb_process_data(struct vmsmb_session *sess,
 			 *
 			 * Atomic claim transition: only proceed if status was
 			 * -EINPROGRESS, and flip it to -EOWNERDEAD (sentinel)
-			 * under ct_lock so that a concurrent timeout in the
-			 * sender path sees the claim taken and exits without
-			 * touching @req.  Without this, transact timeout's
-			 * unreserve would clear the slot + decrement
-			 * mid_range_size while channel_cb still holds @req,
-			 * dereferencing freed stack memory after the sender
-			 * returns -ETIMEDOUT (use-after-free, panic in
-			 * subsequent grow_mid_table rehash). */
+			 * under ct_lock so that a concurrent send-failure
+			 * rollback in the sender path (vmsmb_unreserve) sees
+			 * the claim taken and exits without touching @req. */
 			spin_lock(&sess->ct_lock);
 			if (sess->ct_max_credits)
 				req = sess->ct_mid_table[mid %
@@ -1480,6 +1490,7 @@ int vmsmb_smb2_submit_async(struct vmsmb_session *sess,
 	init_completion(&req->done);
 	req->status = -EINPROGRESS;
 	req->sess = sess;
+	req->callback = vmsmb_queue_async_cb;
 	req->async_cb = async_cb;
 	req->async_priv = async_priv;
 
@@ -1501,10 +1512,9 @@ int vmsmb_smb2_submit_async(struct vmsmb_session *sess,
  * Handles all transport framing (PipeHdr + StreamHdr) internally so the
  * SMB2 layer has no knowledge of VMBus pipe mode or stream framing.
  *
- * Multiple transacts can be in-flight concurrently. Each allocates a
- * per-request vmsmb_request on the stack, registers it in the pending
- * list, sends via vmbus_sendpacket (serialized by send_mutex), then
- * waits on its own completion.
+ * Multiple transacts can be in-flight concurrently.  Each allocates a
+ * vmsmb_request, registers it in mid_table, sends via vmbus_sendpacket
+ * (serialized by send_mutex), then waits on its own completion.
  *
  * Analogous to CIFS compound_send_recv() (fs/smb/client/transport.c)
  * for the single-PDU case: build request, queue mid, send, wait on
@@ -1522,33 +1532,33 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 			u32 *resp_len)
 {
 	const u32 stream_hdr_size = sizeof(struct smb2_stream_hdr);
-	struct vmsmb_request req = {};
+	struct vmsmb_request *req;
 	struct smb2_stream_hdr *sh;
-	void *recv_buf;
-	u32 recv_buf_size;
 	u32 smb2_size;
 	unsigned long remaining;
 	int ret;
 
-	/*
-	 * Allocate response buffer with room for StreamHdr.
-	 * channel_cb writes StreamHdr + SMB2 data here directly.
-	 */
-	recv_buf_size = stream_hdr_size + resp_buf_size;
-	recv_buf = kvmalloc(recv_buf_size, GFP_KERNEL);
-	if (!recv_buf)
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
 		return -ENOMEM;
 
-	init_completion(&req.done);
-	req.status = -EINPROGRESS;
-	req.response_buf = recv_buf;
-	req.response_buf_size = recv_buf_size;
-
-	ret = vmsmb_submit(sess, smb2_req, req_len, &req);
-	if (ret) {
-		kvfree(recv_buf);
-		return ret;
+	/*
+	 * Response buffer with room for StreamHdr; channel_cb writes
+	 * StreamHdr + SMB2 data here directly.
+	 */
+	req->response_buf_size = stream_hdr_size + resp_buf_size;
+	req->response_buf = kvmalloc(req->response_buf_size, GFP_KERNEL);
+	if (!req->response_buf) {
+		kfree(req);
+		return -ENOMEM;
 	}
+	init_completion(&req->done);
+	req->status = -EINPROGRESS;
+	req->callback = vmsmb_wake_up_waiter;
+
+	ret = vmsmb_submit(sess, smb2_req, req_len, req);
+	if (ret)
+		goto out;
 
 	/*
 	 * Adaptive spinning: busy-poll briefly before sleeping.
@@ -1559,7 +1569,7 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 	{
 		ktime_t spin_end = ktime_add_us(ktime_get(), VMSMB_SPIN_USEC);
 
-		while (!completion_done(&req.done)) {
+		while (!completion_done(&req->done)) {
 			if (ktime_after(ktime_get(), spin_end))
 				break;
 			cpu_relax();
@@ -1567,67 +1577,64 @@ int vmsmb_smb2_transact(struct vmsmb_session *sess,
 	}
 
 	/* Wait for channel_cb to complete this request (immediate if spun) */
-	remaining = wait_for_completion_timeout(&req.done,
+	remaining = wait_for_completion_timeout(&req->done,
 				msecs_to_jiffies(VMSMB_TIMEOUT_MS));
 	if (!remaining) {
 		/*
-		 * Timeout.  Race-safe via vmsmb_unreserve's atomic claim:
-		 * if channel_cb already took ownership (status != -EINPROGRESS
-		 * at lock entry), unreserve returns false and we fall through
-		 * to wait again briefly for the in-flight completion.  If we
-		 * win the claim, slots are cleared + mid_range_size decremented
-		 * inside ct_lock.
-		 *
-		 * We do NOT refund grants — server may still respond later,
-		 * and incoming CR will accrue via accumulate_grant + fold.
-		 * Refunding locally on timeout would let later responses advance
-		 * the credit window for MIDs whose slots were already released.
+		 * Timeout.  The server still owns this MessageId, so the
+		 * request stays in mid_table and its response, whenever it
+		 * lands, retires the span through the normal release path
+		 * and frees the request (CIFS cifs_cancelled_callback;
+		 * mrxsmb keeps the buffer context registered when the
+		 * exchange is cancelled).  The completion callback runs
+		 * under ct_lock, so checking completion_done() under the
+		 * lock decides cleanly between "still outstanding" and
+		 * "completed while the timer fired".
 		 */
-		if (vmsmb_unreserve(sess, &req)) {
+		spin_lock_bh(&sess->ct_lock);
+		if (!completion_done(&req->done)) {
+			req->callback = vmsmb_discard_response;
+			spin_unlock_bh(&sess->ct_lock);
 			pr_err("transact timeout (mid=%llu)\n",
-			       req.message_id);
-			kvfree(recv_buf);
+			       req->message_id);
 			return -ETIMEDOUT;
 		}
-		/* channel_cb claimed first; complete is imminent.  Wait
-		 * briefly for it to land.  This is purely race recovery —
-		 * status has been set to -EOWNERDEAD inside ct_lock, the
-		 * channel_cb is past the lock and will finish soon. */
-		wait_for_completion_timeout(&req.done,
-					    msecs_to_jiffies(100));
+		spin_unlock_bh(&sess->ct_lock);
 	}
 
-	if (req.status) {
-		kvfree(recv_buf);
-		return req.status;
-	}
+	ret = req->status;
+	if (ret)
+		goto out;
 
 	/* Validate StreamHdr */
-	if (req.response_len < stream_hdr_size) {
+	if (req->response_len < stream_hdr_size) {
 		pr_err("smb2_transact: response too short: %u\n",
-		       req.response_len);
-		kvfree(recv_buf);
-		return -EPROTO;
+		       req->response_len);
+		ret = -EPROTO;
+		goto out;
 	}
 
-	sh = (struct smb2_stream_hdr *)recv_buf;
+	sh = (struct smb2_stream_hdr *)req->response_buf;
 	if (sh->type != SMB2_STREAM_TYPE_SMB2) {
 		pr_err("smb2_transact: unexpected stream type: %u\n",
 		       sh->type);
-		kvfree(recv_buf);
-		return -EPROTO;
+		ret = -EPROTO;
+		goto out;
 	}
 
 	/* Copy SMB2 portion to caller's buffer */
-	smb2_size = req.response_len - stream_hdr_size;
+	smb2_size = req->response_len - stream_hdr_size;
 	if (smb2_size > resp_buf_size)
 		smb2_size = resp_buf_size;
 
-	memcpy(smb2_resp, (u8 *)recv_buf + stream_hdr_size, smb2_size);
+	memcpy(smb2_resp, (u8 *)req->response_buf + stream_hdr_size,
+	       smb2_size);
 	*resp_len = smb2_size;
-
-	kvfree(recv_buf);
-	return 0;
+	ret = 0;
+out:
+	kvfree(req->response_buf);
+	kfree(req);
+	return ret;
 }
 
 /*

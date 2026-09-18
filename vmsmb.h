@@ -261,9 +261,14 @@ struct vmsmb_file_info {
  * Each in-flight SMB2 request gets one of these; the channel callback
  * matches responses by MessageId and completes the right request.
  *
- * Completion model:
- *   - Sync path: caller waits on `done`; channel_cb calls complete().
- *   - Async path: caller sets `async_cb`; channel_cb schedules `work`,
+ * Completion model (CIFS mid->callback): channel_cb retires the MID span
+ * and then runs `callback` under ct_lock.
+ *   - Sync path (vmsmb_smb2_transact): the callback completes `done`; the
+ *     waiter copies the response out and frees the request.  A waiter
+ *     that times out swaps in vmsmb_discard_response instead; the request
+ *     stays registered and the server's response, whenever it lands,
+ *     retires the span and frees it.
+ *   - Async path (vmsmb_smb2_submit_async): the callback queues `work`,
  *     which invokes async_cb() in process context (safe to sleep,
  *     copy_to_iter, terminate netfs subreq, etc.). The async_cb owns
  *     the request lifetime — it must kfree(req) and kvfree(response_buf).
@@ -274,7 +279,7 @@ struct vmsmb_request {
 	struct vmsmb_session *sess;	/* back-pointer for async slot release */
 	ktime_t send_tick;		/* set in reserve_credits; used by EWMA */
 
-	/* Response buffer (caller-owned for sync, req-owned for async) */
+	/* Response buffer, owned by the request */
 	void *response_buf;
 	u32 response_buf_size;
 	u32 response_len;		/* actual bytes received */
@@ -284,12 +289,15 @@ struct vmsmb_request {
 	u32 recv_offset;		/* bytes accumulated so far */
 
 	int status;			/* 0 or -errno */
-	struct completion done;		/* signaled when response complete (sync) */
+	struct completion done;		/* completed by the sync waiter's callback */
 
-	/* Async completion (optional) */
+	/* Completion callback, run by channel_cb under ct_lock */
+	void (*callback)(struct vmsmb_request *req);
+
+	/* Async completion (vmsmb_smb2_submit_async) */
 	void (*async_cb)(struct vmsmb_request *req);
 	void *async_priv;		/* opaque for async_cb */
-	struct work_struct work;	/* scheduled by channel_cb if async_cb set */
+	struct work_struct work;	/* queued by the callback for process context */
 };
 
 /*
