@@ -46,6 +46,7 @@ static int vmsmb_probe(struct hv_device *dev,
 		       const struct hv_vmbus_device_id *id)
 {
 	struct vmsmb_session *sess;
+	bool parked = vmsmb_channel_parked(dev);
 	int ret, retries;
 
 	pr_info("probe: VSMB channel found\n");
@@ -57,10 +58,12 @@ static int vmsmb_probe(struct hv_device *dev,
 	sess->dev = dev;
 	hv_set_drvdata(dev, sess);
 
-	/* Step 1: Open VMBus channel */
+	/* Step 1: Open VMBus channel (or adopt the one a previous load parked) */
 	ret = vmsmb_open_channel(sess);
 	if (ret)
 		goto err_free;
+	if (parked)
+		goto ready;
 
 	/* Step 2: VSMB version negotiation */
 	ret = vmsmb_negotiate_version(sess);
@@ -91,6 +94,7 @@ static int vmsmb_probe(struct hv_device *dev,
 	if (ret)
 		goto err_close;
 
+ready:
 	pr_info("session ready: version=%u session=0x%llx MaxRead=%u\n",
 		sess->vsmb_version, sess->session_id, sess->max_read_size);
 
@@ -107,10 +111,11 @@ err_free:
 /*
  * VMBus remove — tear down the session and clear the global pointer.
  *
- * Analogous to hvsock hvs_remove() (net/vmw_vsock/hyperv_transport.c).
- * Cannot reconnect after this runs: vmbus_close puts vmwp.exe's VsmbPipe
- * in terminal state (see docs/vmbus-pipe-protocol.md), so module reload
- * requires VM restart.
+ * Analogous to hvsock hvs_remove() (net/vmw_vsock/hyperv_transport.c),
+ * except that the channel is only closed when the host rescinded it: the
+ * host cannot serve a reopened VSMB channel, so on module unload it is
+ * parked for the next load instead (see vmsmb_park_channel and
+ * docs/vmbus-pipe-protocol.md).
  */
 static void vmsmb_remove(struct hv_device *dev)
 {
@@ -122,7 +127,10 @@ static void vmsmb_remove(struct hv_device *dev)
 		vmsmb_global_session = NULL;
 
 	if (sess) {
-		vmsmb_close_channel(sess);
+		if (dev->channel->rescind)
+			vmsmb_close_channel(sess);
+		else
+			vmsmb_park_channel(sess);
 		kfree(sess);
 	}
 }

@@ -1045,21 +1045,19 @@ advance:
  * Analogous to hvsock hvs_open_connection() (net/vmw_vsock/hyperv_transport.c):
  * sets channel->max_pkt_size before vmbus_open so hv_ringbuffer_init allocates
  * a pkt_buffer that fits the largest expected response, then calls vmbus_open
- * with our channel callback. The force-reset of ch->state exists because
- * vmbus_close leaves the channel in a non-OPEN state that blocks reopening —
- * module reload path only (see docs/vmbus-pipe-protocol.md).
+ * with our channel callback.
+ *
+ * A channel left open by vmsmb_park_channel (module reload) is adopted
+ * instead: the caller checks vmsmb_channel_parked() to know the SMB2
+ * handshake must be skipped.
  */
+static int vmsmb_adopt_channel(struct vmsmb_session *sess);
+
 int vmsmb_open_channel(struct vmsmb_session *sess)
 {
 	struct vmbus_channel *ch = sess->dev->channel;
 	u32 actual_kb = ring_size_kb;
 	int ret;
-
-	if (ch->state != CHANNEL_OPEN_STATE) {
-		pr_info("channel state=%d, forcing to CHANNEL_OPEN_STATE\n",
-			ch->state);
-		ch->state = CHANNEL_OPEN_STATE;
-	}
 
 	sess->channel = ch;
 	mutex_init(&sess->send_mutex);
@@ -1092,6 +1090,9 @@ int vmsmb_open_channel(struct vmsmb_session *sess)
 	sess->skip_bytes = 0;
 	sess->recv_async = false;
 	init_completion(&sess->recv_done);
+
+	if (ch->state == CHANNEL_OPENED_STATE)
+		return vmsmb_adopt_channel(sess);
 
 	/*
 	 * Set max_pkt_size before vmbus_open so hv_ringbuffer_init
@@ -1172,6 +1173,124 @@ void vmsmb_close_channel(struct vmsmb_session *sess)
 		sess->ct_mid_table = NULL;
 		sess->ct_max_credits = 0;
 	}
+}
+
+/*
+ * Module reload without closing the channel.
+ *
+ * The host (vmusrv.dll) cannot re-accept a VSMB channel that was closed and
+ * reopened: its worker exits on the first receive after the reopen and no
+ * acceptor is ever re-armed, so a plain vmbus_close + vmbus_open needs a VM
+ * restart.  Instead the channel, its ring buffers and the host's SMB2
+ * connection stay up across the unbind: park detaches our callback and
+ * records the negotiated state in the hv_device, adopt re-attaches the
+ * callback of the reloaded module and continues the same SMB2 session at
+ * the same MID.  hv_vmbus tolerates an open channel with no callback
+ * (vmbus_on_event returns on a NULL onchannel_callback; the channel and
+ * its tasklet belong to the core, not to this module).
+ *
+ * Requires the session to be quiescent: no vsmb mounts, so no request is in
+ * flight and the host has nothing unsolicited to send.  The ring size and
+ * max_pkt_size chosen by the first open are kept.
+ */
+bool vmsmb_channel_parked(struct hv_device *dev)
+{
+	struct vmsmb_parked_state *st = dev->device.platform_data;
+
+	return st && st->magic == VMSMB_PARKED_MAGIC;
+}
+
+void vmsmb_park_channel(struct vmsmb_session *sess)
+{
+	struct vmbus_channel *ch = sess->channel;
+	struct vmsmb_parked_state *st;
+	unsigned long flags;
+
+	st = kzalloc(sizeof(*st), GFP_KERNEL);
+	if (!st) {
+		pr_err("cannot park channel, closing it instead\n");
+		vmsmb_close_channel(sess);
+		return;
+	}
+
+	wake_up_all(&sess->send_drain_wait);
+	wake_up_all(&sess->ct_send_wait);
+
+	/* Same detach sequence as the core's vmbus_reset_channel_cb. */
+	tasklet_disable(&ch->callback_event);
+	spin_lock_irqsave(&ch->sched_lock, flags);
+	ch->onchannel_callback = NULL;
+	ch->channel_callback_context = NULL;
+	spin_unlock_irqrestore(&ch->sched_lock, flags);
+	tasklet_enable(&ch->callback_event);
+
+	spin_lock_bh(&sess->ct_lock);
+	vmsmb_fold_pending_locked(sess);
+	if (sess->ct_mid_range_size)
+		pr_warn("parking with %u MIDs unreleased\n",
+			sess->ct_mid_range_size);
+	st->next_mid = sess->ct_next_mid;
+	st->live_window = sess->ct_live_window;
+	spin_unlock_bh(&sess->ct_lock);
+
+	st->magic = VMSMB_PARKED_MAGIC;
+	st->vsmb_version = sess->vsmb_version;
+	st->vsmb_caps = sess->vsmb_caps;
+	st->session_id = sess->session_id;
+	st->max_read_size = sess->max_read_size;
+	st->max_write_size = sess->max_write_size;
+	st->max_transact_size = sess->max_transact_size;
+	sess->dev->device.platform_data = st;
+
+	sess->channel = NULL;
+	kvfree(sess->ct_mid_table);
+	sess->ct_mid_table = NULL;
+	sess->ct_max_credits = 0;
+
+	pr_info("channel parked (session=0x%llx next_mid=%llu credits=%u)\n",
+		st->session_id, st->next_mid, st->live_window);
+}
+
+static int vmsmb_adopt_channel(struct vmsmb_session *sess)
+{
+	struct vmbus_channel *ch = sess->channel;
+	struct vmsmb_parked_state *st = sess->dev->device.platform_data;
+	unsigned long flags;
+
+	if (!vmsmb_channel_parked(sess->dev)) {
+		pr_err("channel is open but was not parked by hv_vmsmb\n");
+		return -EBUSY;
+	}
+
+	sess->vsmb_version = st->vsmb_version;
+	sess->vsmb_caps = st->vsmb_caps;
+	sess->session_id = st->session_id;
+	sess->max_read_size = st->max_read_size;
+	sess->max_write_size = st->max_write_size;
+	sess->max_transact_size = st->max_transact_size;
+	sess->ct_oldest_mid = st->next_mid;
+	sess->ct_next_mid = st->next_mid;
+	sess->ct_live_window = st->live_window;
+	sess->recv_async = true;
+
+	sess->dev->device.platform_data = NULL;
+	kfree(st);
+
+	spin_lock_irqsave(&ch->sched_lock, flags);
+	ch->onchannel_callback = vmsmb_channel_cb;
+	ch->channel_callback_context = sess;
+	spin_unlock_irqrestore(&ch->sched_lock, flags);
+
+	/*
+	 * An interrupt that fired while parked left the inbound ring masked
+	 * (vmbus_chan_sched's hv_begin_read with nobody to hv_end_read).
+	 * Running the tasklet once drains whatever arrived and unmasks.
+	 */
+	tasklet_schedule(&ch->callback_event);
+
+	pr_info("channel adopted (session=0x%llx next_mid=%llu credits=%u)\n",
+		sess->session_id, sess->ct_next_mid, sess->ct_live_window);
+	return 0;
 }
 
 /*

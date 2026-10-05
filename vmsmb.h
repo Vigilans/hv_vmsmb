@@ -537,9 +537,31 @@ extern struct workqueue_struct *vmsmb_put_wq;
 extern const struct netfs_request_ops vmsmb_netfs_ops;
 extern const struct address_space_operations vmsmb_aops;
 
+/*
+ * Session state a reloaded module needs to carry on with the host's existing
+ * SMB2 connection.  Written by vmsmb_park_channel on driver unbind, consumed
+ * by the next probe's vmsmb_open_channel.  Lives in the hv_device's
+ * platform_data because driver_data is cleared by the driver core on unbind.
+ */
+#define VMSMB_PARKED_MAGIC	0x4b525056	/* "VPRK" */
+
+struct vmsmb_parked_state {
+	u32 magic;
+	u32 vsmb_version;
+	u32 vsmb_caps;
+	u64 session_id;
+	u32 max_read_size;
+	u32 max_write_size;
+	u32 max_transact_size;
+	u64 next_mid;
+	u32 live_window;
+};
+
 /* vmsmb_transport.c */
+bool vmsmb_channel_parked(struct hv_device *dev);
 int vmsmb_open_channel(struct vmsmb_session *sess);
 void vmsmb_close_channel(struct vmsmb_session *sess);
+void vmsmb_park_channel(struct vmsmb_session *sess);
 void vmsmb_credit_reset(struct vmsmb_session *sess);
 int vmsmb_negotiate_version(struct vmsmb_session *sess);
 int vmsmb_smb2_transact(struct vmsmb_session *sess,

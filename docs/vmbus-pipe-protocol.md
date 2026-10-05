@@ -147,9 +147,9 @@ When the host's vmbusr.sys receives OPENCHANNEL for a pipe-mode channel, it comp
 
 ### Close Behavior
 
-Once `vmbus_close()` is called on the guest, the channel enters a terminal state and cannot be reopened without a VM restart. The host-side VMBusPipeIO does not handle reconnection.
+The host cannot serve a VSMB channel that the guest closed and reopened. vmusrv.dll re-accepts the reopened channel, but the worker's first receive fails with `ERROR_INVALID_PARAMETER` (its engine-global wait-completion packet is never dissociated on the broken-pipe path, so the re-association is rejected) and the worker exits without re-arming accept; a further open never gets an OPENCHANNEL_RESULT. A closed channel therefore stays dead until the VM restarts, and no host operation short of that (share add/remove, pause/resume) revives it. The Windows client never closes the channel either: mrxsmb.sys binds once and treats a broken pipe as fatal.
 
-This means module reload (`rmmod` + `insmod`) requires a VM restart. During development, changes are installed to `/lib/modules/` and tested on the next boot.
+hv_vmsmb calls `vmbus_close()` only when the host rescinds the channel. On module unload `vmsmb_park_channel` detaches the channel callback and stores the negotiated session state (version, session id, sizes, next MessageId, credits) in the hv_device; the next probe adopts the still-open channel and continues the same SMB2 session, so `rmmod` + `modprobe` works without a VM restart once every vsmb mount is unmounted. The ring size and `max_pkt_size` are fixed by the first open of the boot.
 
 ## References
 
